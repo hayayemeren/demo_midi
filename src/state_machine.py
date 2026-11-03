@@ -155,6 +155,9 @@ class DemoStateMachine:
 
     def _handle_waiting_for_leader(self, gp: GamepadState, now: float):
         """Base is locked; waiting for leader arm to be plugged in."""
+        # Actively hold electric brakes: wheels must not move
+        self.base.hold_lock()
+
         # Allow operator to cancel and go back to driving
         if self.gamepad.is_switch_pressed(gp):
             logger.info("\n[CANCEL] Button [Y] pressed -> Returning to BASE DRIVE.")
@@ -173,8 +176,12 @@ class DemoStateMachine:
 
     def _handle_syncing(self):
         """Base is locked; smoothly move follower arm to match leader arm pose."""
+        self.base.hold_lock()
         logger.info("\n[SYNC] Aligning Follower arm with Leader arm pose (zero-jerk transition)...")
-        self.arm.sync_to_leader(duration_s=self.arm.interpolation_time)
+        self.arm.sync_to_leader(
+            duration_s=self.arm.interpolation_time,
+            feedback_cb=lambda _: self.base.hold_lock(),
+        )
         logger.info(
             f"\n{COLOR_BOLD}{COLOR_MAGENTA}>>> TELEOPERATION ACTIVE! People can now play with the arm! <<<{COLOR_RESET}\n"
             f"Press {COLOR_YELLOW}[Y]{COLOR_RESET} anytime to park the arm and return to {COLOR_CYAN}BASE DRIVE{COLOR_RESET}.\n"
@@ -183,6 +190,9 @@ class DemoStateMachine:
 
     def _handle_arm_teleop(self, gp: GamepadState):
         """Mode 2: Follower arm mirrors Leader arm in real time."""
+        # Base MUST NOT turn in teleoperation mode: actively hold electric brakes every tick
+        self.base.hold_lock()
+
         # Check if user wants to switch back to Base Drive
         if self.gamepad.is_switch_pressed(gp):
             logger.info("\n[SWITCH] Button [Y] pressed -> Parking arm and returning to BASE DRIVE!")
@@ -200,8 +210,12 @@ class DemoStateMachine:
 
     def _handle_parking(self):
         """Base is locked; smoothly park follower arm back to safe stow pose."""
+        self.base.hold_lock()
         logger.info("\n[PARK] Returning Follower arm to safe Stow Pose...")
-        self.arm.move_to_stow(duration_s=self.arm.interpolation_time)
+        self.arm.move_to_stow(
+            duration_s=self.arm.interpolation_time,
+            feedback_cb=lambda _: self.base.hold_lock(),
+        )
         self.base.release_brakes()
         logger.info(
             f"\n{COLOR_BOLD}{COLOR_CYAN}>>> BASE DRIVE ACTIVE! Mobile base is ready to drive! <<<{COLOR_RESET}\n"

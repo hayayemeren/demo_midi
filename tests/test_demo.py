@@ -113,6 +113,14 @@ def test_state_machine_transitions_simulation():
     # 2. Complete syncing -> transitions to ARM_TELEOP
     sm._handle_syncing()
     assert sm.state == DemoState.ARM_TELEOP
+    assert base.is_locked is True
+
+    # Verify that moving the gamepad sticks during ARM_TELEOP does NOT turn the wheels!
+    stick_move_state = GamepadState(forward=1.0, turn=1.0, connected=True)
+    sm._handle_arm_teleop(stick_move_state)
+    assert base.is_locked is True
+    assert base.cur_left_rpm == 0.0
+    assert base.cur_right_rpm == 0.0
 
     # 3. Simulate button Y press in ARM_TELEOP -> transitions to PARKING
     gp_state = GamepadState(button_y_pressed=True, connected=True)

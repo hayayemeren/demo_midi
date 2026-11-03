@@ -63,7 +63,20 @@ class BaseController:
 
     def drive(self, forward: float, turn: float, max_rpm: float, dt: float, brake: bool = False):
         """Update motor velocities based on gamepad twist inputs and slew rates."""
-        if self.is_locked or brake:
+        if self.is_locked:
+            # Base is locked: ignore all stick inputs and actively enforce electric brake
+            self.cur_left_rpm = 0.0
+            self.cur_right_rpm = 0.0
+            self.last_fb_l = self.driver.set_velocity(
+                self.left_id, 0.0, acceleration=1, brake=True
+            )
+            time.sleep(0.002)
+            self.last_fb_r = self.driver.set_velocity(
+                self.right_id, 0.0, acceleration=1, brake=True
+            )
+            return
+
+        if brake:
             target_l = 0.0
             target_r = 0.0
             dec = self.brake_rate
@@ -79,19 +92,18 @@ class BaseController:
         self.cur_left_rpm = slew(self.cur_left_rpm, target_l, self.accel_rate, dec, dt)
         self.cur_right_rpm = slew(self.cur_right_rpm, target_r, self.accel_rate, dec, dt)
 
-        is_braking = self.is_locked or brake
         self.last_fb_l = self.driver.set_velocity(
             self.left_id,
             self.left_dir * self.cur_left_rpm,
             acceleration=1,
-            brake=is_braking,
+            brake=brake,
         )
         time.sleep(0.002)  # 2ms turnaround
         self.last_fb_r = self.driver.set_velocity(
             self.right_id,
             self.right_dir * self.cur_right_rpm,
             acceleration=1,
-            brake=is_braking,
+            brake=brake,
         )
 
     def lock_brakes(self):
@@ -103,6 +115,19 @@ class BaseController:
         time.sleep(0.002)
         self.driver.emergency_brake(self.right_id)
         logger.info("[BASE] Electric brakes locked.")
+
+    def hold_lock(self):
+        """Actively hold 0 RPM and electric brake command every tick."""
+        self.is_locked = True
+        self.cur_left_rpm = 0.0
+        self.cur_right_rpm = 0.0
+        self.last_fb_l = self.driver.set_velocity(
+            self.left_id, 0.0, acceleration=1, brake=True
+        )
+        time.sleep(0.002)
+        self.last_fb_r = self.driver.set_velocity(
+            self.right_id, 0.0, acceleration=1, brake=True
+        )
 
     def release_brakes(self):
         """Release electric brakes to allow driving."""

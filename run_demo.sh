@@ -19,7 +19,12 @@ else
     echo "[ENV] Using system python3..."
 fi
 
-# 2. Check Device Permissions
+# 2. Stop conflicting background services & ensure device permissions
+if systemctl is-active --quiet midi-robot.service 2>/dev/null; then
+    echo "[SERVICE] Stopping background midi-robot.service..."
+    sudo systemctl stop midi-robot.service 2>/dev/null || true
+fi
+
 sudo chmod 666 /dev/ttyUSB* /dev/ttyACM* /dev/input/event* /dev/input/js* 2>/dev/null || true
 
 # 3. Launch Demo Application
