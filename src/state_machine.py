@@ -19,6 +19,7 @@ from typing import Optional
 from src.arm_controller import ArmController
 from src.base_controller import BaseController
 from src.gamepad import F710Gamepad, GamepadState
+from src.network import RobotServer
 
 logger = logging.getLogger("demo.statemachine")
 
@@ -29,6 +30,7 @@ class DemoState(enum.Enum):
     SYNCING = "SYNCING"
     ARM_TELEOP_LEADER = "ARM_TELEOP_LEADER"
     ARM_TELEOP_GAMEPAD = "ARM_TELEOP_GAMEPAD"
+    NETWORK_SERVER = "NETWORK_SERVER"
     PARKING = "PARKING"
     STOPPING = "STOPPING"
 
@@ -54,6 +56,7 @@ class DemoStateMachine:
         demo_case: int = 1,
         loop_hz: float = 50.0,
         telemetry_interval: float = 0.20,
+        network_port: int = 8765,
     ):
         self.base = base
         self.arm = arm
@@ -61,12 +64,20 @@ class DemoStateMachine:
         self.demo_case = demo_case
         self.loop_hz = loop_hz
         self.telemetry_interval = telemetry_interval
+        self.network_port = network_port
 
-        self.state = DemoState.BASE_DRIVE
+        self.state = DemoState.NETWORK_SERVER if demo_case == 3 else DemoState.BASE_DRIVE
         self.running = False
         self.last_telemetry_time = 0.0
         self.last_leader_check_time = 0.0
         self.transition_start_time = 0.0
+
+        # Case 3 Network Server
+        self.server: Optional[RobotServer] = None
+        self._net_mode = "base"
+        self._net_arm_synced = False
+        if demo_case == 3:
+            self.server = RobotServer(host="0.0.0.0", port=network_port)
 
     def start(self):
         """Initial check and launch of the control loop."""
@@ -77,21 +88,23 @@ class DemoStateMachine:
         logger.info("Setting Follower Arm to safe Stow Pose...")
         self.arm.move_to_stow(duration_s=1.0)
 
-        # 2. Try connecting leader in background if Case 1 and available
+        # 2. Case-specific initialization
         if self.demo_case == 1 and self.arm.is_leader_port_available():
             self.arm.connect_leader()
+        elif self.demo_case == 3 and self.server is not None:
+            self.server.start()
 
-        case_desc = (
-            f"Case 1: {COLOR_MAGENTA}SO-100 LEADER ARM TELEOPERATION{COLOR_RESET}"
-            if self.demo_case == 1
-            else f"Case 2: {COLOR_MAGENTA}LOGITECH GAMEPAD ARM TELEOPERATION (All-in-One){COLOR_RESET}"
-        )
+        if self.demo_case == 1:
+            case_desc = f"Case 1: {COLOR_MAGENTA}SO-100 LEADER ARM TELEOPERATION (Pi Local){COLOR_RESET}"
+        elif self.demo_case == 2:
+            case_desc = f"Case 2: {COLOR_MAGENTA}LOGITECH GAMEPAD ARM TELEOPERATION (All-in-One){COLOR_RESET}"
+        else:
+            case_desc = f"Case 3: {COLOR_MAGENTA}REMOTE LEADER ARM TELEOPERATION (PC Client -> Pi Server){COLOR_RESET}"
 
         logger.info(
             f"{COLOR_BOLD}{COLOR_GREEN}=== MIDI DEMO READY (Case {self.demo_case}) ==={COLOR_RESET}\n"
-            f"Mode 1: {COLOR_CYAN}BASE DRIVE{COLOR_RESET} (Use Logitech sticks to drive base)\n"
-            f"Toggle Button: {COLOR_YELLOW}[Y]{COLOR_RESET} on Gamepad -> Switch to {case_desc}\n"
-            f"Brake: {COLOR_RED}[B]{COLOR_RESET} | Exit: {COLOR_RED}[START]{COLOR_RESET}\n"
+            f"Active: {case_desc}\n"
+            f"Exit: {COLOR_RED}[Ctrl+C] or Gamepad [START]{COLOR_RESET}\n"
         )
 
         self._run_loop()
@@ -105,7 +118,7 @@ class DemoStateMachine:
             dt = max(0.001, min(0.1, now - t_prev))
             t_prev = now
 
-            # Poll gamepad events
+            # Poll gamepad events (if connected)
             gp = self.gamepad.poll()
 
             # Global emergency exit
@@ -125,6 +138,8 @@ class DemoStateMachine:
                 self._handle_arm_teleop_leader(gp)
             elif self.state == DemoState.ARM_TELEOP_GAMEPAD:
                 self._handle_arm_teleop_gamepad(gp, dt)
+            elif self.state == DemoState.NETWORK_SERVER:
+                self._handle_network_server(gp, dt)
             elif self.state == DemoState.PARKING:
                 self._handle_parking()
 
@@ -243,6 +258,77 @@ class DemoStateMachine:
         # Rate-control teleoperation step from gamepad sticks/buttons
         self.arm.teleop_step_gamepad(gp, dt)
 
+    def _handle_network_server(self, gp: GamepadState, dt: float):
+        """Mode 3 (Case 3): Remote PC Client controls Base and Arm over TCP network."""
+        if self.server is None:
+            return
+
+        cmd, watchdog_trip = self.server.poll_commands()
+
+        # 1. If no client connected, actively hold base lock
+        if not self.server.is_connected:
+            self.base.hold_lock()
+            return
+
+        # 2. Watchdog timeout: silence/dropped packet -> emergency stop
+        if watchdog_trip:
+            self.base.drive(0.0, 0.0, 0.0, dt, brake=True)
+            return
+
+        if not cmd:
+            self.base.hold_lock()
+            return
+
+        mode = cmd.get("mode", "base")
+        self._net_mode = mode
+
+        # Handle explicit park request
+        if cmd.get("park", False):
+            self.base.hold_lock()
+            self.arm.move_to_stow(duration_s=1.0, feedback_cb=lambda _: self.base.hold_lock())
+            self._net_arm_synced = False
+            return
+
+        if mode == "base":
+            # Mobile base driving mode: release brakes if locked, wheels active, arm stowed
+            if self.base.is_locked:
+                self.base.release_brakes()
+            self._net_arm_synced = False
+            base_cmd = cmd.get("base", {})
+            fwd = float(base_cmd.get("forward", 0.0))
+            turn = float(base_cmd.get("turn", 0.0))
+            brake = bool(base_cmd.get("brake", False))
+            speed = float(base_cmd.get("speed_rpm", 100.0))
+            self.base.drive(fwd, turn, speed, dt, brake=brake)
+
+        elif mode == "arm":
+            # Arm teleoperation mode: base strictly locked with electric brakes
+            self.base.hold_lock()
+            arm_target = cmd.get("arm", {})
+
+            if arm_target:
+                # If first frame of arm mode, smoothly sync to target pose (zero-jerk transition)
+                if not self._net_arm_synced:
+                    logger.info("\n[NETWORK] First arm frame received: syncing follower to leader pose...")
+                    cur_pose = self.arm.get_follower_pose()
+                    self.arm.smooth_trajectory(cur_pose, arm_target, duration_s=1.0, feedback_cb=lambda _: self.base.hold_lock())
+                    self._net_arm_synced = True
+                else:
+                    self.arm.send_follower_action(arm_target)
+
+        # Send live telemetry frame to PC Client
+        if self.server.is_connected:
+            telemetry = {
+                "type": "telemetry",
+                "state": "NETWORK_SERVER",
+                "mode": mode,
+                "base_locked": self.base.is_locked,
+                "left_rpm": round(self.base.cur_left_rpm, 1),
+                "right_rpm": round(self.base.cur_right_rpm, 1),
+                "follower_pose": self.arm.get_follower_pose(),
+            }
+            self.server.send_telemetry(telemetry)
+
     def _handle_parking(self):
         """Base is locked; smoothly park follower arm back to safe stow pose."""
         self.base.hold_lock()
@@ -260,10 +346,10 @@ class DemoStateMachine:
     def _print_telemetry(self, gp: GamepadState):
         """Render a single-line dynamic terminal dashboard."""
         mode_color = COLOR_CYAN if self.state == DemoState.BASE_DRIVE else COLOR_MAGENTA
-        if self.state == DemoState.WAITING_FOR_LEADER:
+        if self.state in (DemoState.WAITING_FOR_LEADER, DemoState.SYNCING, DemoState.PARKING):
             mode_color = COLOR_YELLOW
-        elif self.state == DemoState.SYNCING or self.state == DemoState.PARKING:
-            mode_color = COLOR_YELLOW
+        elif self.state == DemoState.NETWORK_SERVER:
+            mode_color = COLOR_CYAN if self._net_mode == "base" else COLOR_MAGENTA
 
         state_tag = f"{mode_color}[{self.state.value:^18}]{COLOR_RESET}"
         conn_tag = f"{COLOR_GREEN}GP:OK{COLOR_RESET}" if gp.connected else f"{COLOR_RED}GP:DISC{COLOR_RESET}"
@@ -284,6 +370,16 @@ class DemoStateMachine:
             elbow = f_pose.get("elbow_flex.pos", 0.0)
             grip = f_pose.get("gripper.pos", 0.0)
             info = f"GP Arm | Pan:{pan:+4.0f}° Lift:{lift:+4.0f}° Elb:{elbow:+4.0f}° Grp:{grip:3.0f}% | Base: LOCKED"
+        elif self.state == DemoState.NETWORK_SERVER:
+            pc_ok = self.server and self.server.is_connected
+            conn_tag = f"{COLOR_GREEN}PC:OK{COLOR_RESET}" if pc_ok else f"{COLOR_YELLOW}PC:WAIT{COLOR_RESET}"
+            if self._net_mode == "base":
+                info = f"Net Base | Cmd: L={int(self.base.cur_left_rpm):+4d} R={int(self.base.cur_right_rpm):+4d} RPM"
+            else:
+                f_pose = self.arm.get_follower_pose()
+                pan = f_pose.get("shoulder_pan.pos", 0.0)
+                lift = f_pose.get("shoulder_lift.pos", 0.0)
+                info = f"Net Arm  | Pan:{pan:+5.1f}° Lift:{lift:+5.1f}° | Base: LOCKED"
         elif self.state == DemoState.WAITING_FOR_LEADER:
             info = f"{COLOR_YELLOW}Waiting for Leader Arm... Press [Y] to cancel{COLOR_RESET}"
         elif self.state == DemoState.SYNCING:
@@ -300,6 +396,11 @@ class DemoStateMachine:
         """Safely bring everything to a stop."""
         self.running = False
         print("\n\nShutting down demonstration...")
+        if self.server:
+            try:
+                self.server.close()
+            except Exception:
+                pass
         try:
             self.arm.move_to_stow(duration_s=1.0)
         except Exception:

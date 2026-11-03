@@ -81,11 +81,11 @@ def select_case_interactive(default_case: Optional[int] = None) -> int:
     print("\n" + "=" * 64)
     print("              SELECT DEMONSTRATION CASE")
     print("=" * 64)
-    print("  [1] Case 1: Base Drive + SO-100 Leader Arm Teleoperation")
+    print("  [1] Case 1: Base Drive + SO-100 Leader Arm Teleoperation (Local on Pi)")
     print("      - Base drive with Logitech F710 Gamepad")
     print("      - Press [Y] -> Lock wheels & mirror physical Leader Arm (1:1)")
     print()
-    print("  [2] Case 2: Base Drive + Logitech Gamepad Arm Teleoperation")
+    print("  [2] Case 2: Base Drive + Logitech Gamepad Arm Teleoperation (All-in-One)")
     print("      - Base drive with Logitech F710 Gamepad")
     print("      - Press [Y] -> Lock wheels & control SO-100 Arm with Gamepad")
     print("        * Right Stick: Pan (L/R) & Lift (U/D)")
@@ -94,28 +94,35 @@ def select_case_interactive(default_case: Optional[int] = None) -> int:
     print("        * Bumpers:     LB (Open Gripper), RB (Close Gripper)")
     print("        * Buttons:     [A] Toggle Gripper, [X] Move to Ready Pose")
     print()
+    print("  [3] Case 3: Remote Network Teleoperation (Leader Arm on PC -> Robot)")
+    print("      - Leader Arm is connected to PC; Pi runs Robot Server (port 8765)")
+    print("      - Operator controls both Base and Arm from PC using Leader Arm")
+    print("      - Press [SPACE] on computer to switch between Base Drive & Arm Teleop")
+    print()
     print("  [Q] Quit Demonstration")
     print("=" * 64)
 
-    default_prompt = f" [{default_case}]" if default_case in (1, 2) else " [1]"
+    default_prompt = f" [{default_case}]" if default_case in (1, 2, 3) else " [1]"
     while True:
         try:
-            choice = input(f"Enter choice (1, 2, or Q){default_prompt}: ").strip().lower()
+            choice = input(f"Enter choice (1, 2, 3, or Q){default_prompt}: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print("\nExiting.")
             sys.exit(0)
 
         if not choice:
-            return default_case if default_case in (1, 2) else 1
+            return default_case if default_case in (1, 2, 3) else 1
         if choice in ("1", "case 1", "c1"):
             return 1
         elif choice in ("2", "case 2", "c2"):
             return 2
+        elif choice in ("3", "case 3", "c3"):
+            return 3
         elif choice in ("q", "quit", "exit"):
             print("Exiting.")
             sys.exit(0)
         else:
-            print("Invalid selection. Please enter 1, 2, or Q.")
+            print("Invalid selection. Please enter 1, 2, 3, or Q.")
 
 
 def parse_args():
@@ -125,9 +132,9 @@ def parse_args():
     parser.add_argument(
         "-C", "--case",
         type=int,
-        choices=[1, 2],
+        choices=[1, 2, 3],
         default=None,
-        help="Demo case to run (1: Leader Arm Mirroring, 2: Gamepad Arm Rate Control). If omitted, displays interactive menu."
+        help="Demo case to run (1: Leader Arm Mirroring, 2: Gamepad Arm Rate Control, 3: Network Teleoperation Server). If omitted, displays interactive menu."
     )
     parser.add_argument(
         "-c", "--config",
@@ -164,16 +171,17 @@ def main():
     case = args.case
     if case is None:
         cfg_case = config.get("case")
-        if cfg_case in (1, 2):
+        if cfg_case in (1, 2, 3):
             case = cfg_case
         else:
             case = select_case_interactive(default_case=1)
 
-    case_name = (
-        "Case 1: Base Drive + SO-100 Leader Arm Teleoperation"
-        if case == 1
-        else "Case 2: Base Drive + Logitech Gamepad Arm Teleoperation"
-    )
+    case_names = {
+        1: "Case 1: Base Drive + SO-100 Leader Arm Teleoperation (Local on Pi)",
+        2: "Case 2: Base Drive + Logitech Gamepad Arm Teleoperation (All-in-One)",
+        3: "Case 3: Remote Network Teleoperation (Pi Robot Server <- PC Client)",
+    }
+    case_name = case_names.get(case, f"Case {case}")
     print(f"\n>>> Running {case_name} <<<\n")
 
     # 1. Initialize Base Controller
@@ -192,7 +200,7 @@ def main():
         default_speed_level=int(gp_cfg.get("default_speed_level", 1)),
         switch_button=gp_cfg.get("switch_button", "Y"),
     )
-    if not gamepad.connect() and not dry_run:
+    if not gamepad.connect() and not dry_run and case != 3:
         logging.warning("Logitech Gamepad not detected at startup. Will retry automatically.")
 
     # 3. Initialize Arm Controller
@@ -213,6 +221,7 @@ def main():
         demo_case=case,
         loop_hz=float(ctrl_cfg.get("loop_hz", 50.0)),
         telemetry_interval=float(ctrl_cfg.get("telemetry_interval", 0.20)),
+        network_port=int(ctrl_cfg.get("network_port", 8765)),
     )
 
     def handle_signal(sig, frame):

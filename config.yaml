@@ -5,10 +5,16 @@
 # ==============================================================================
 
 # Active Demo Case:
-# 1 = Base Drive + SO-100 Leader Arm Teleoperation
+# 1 = Base Drive + SO-100 Leader Arm Teleoperation (Local on Pi)
 # 2 = Base Drive + Logitech Gamepad Arm Teleoperation (All-in-One Gamepad)
+# 3 = Remote Network Teleoperation (Leader Arm on PC -> Pi Robot Server)
 # null = Interactive menu at startup
 case: null
+
+# Case 3 Network Teleoperation Server
+network:
+  port: 8765
+  watchdog_timeout_s: 0.50
 
 # RS485 Serial Bus for DDSM Hub Motors
 serial:

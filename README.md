@@ -6,21 +6,28 @@ Integrated demonstration suite for the **MIDI Mobile Manipulator**, seamlessly c
 
 ## 🎯 Demonstration Cases
 
-The system features two selectable demonstration workflows accessible via an interactive menu or command-line flags:
+The system features three selectable demonstration workflows accessible via an interactive menu or command-line flags:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │                   DEMONSTRATION CASE SELECTION MENU                     │
 ├────────────────────────────────────────────────────────────────────────┤
-│ [1] Case 1: Base Drive + SO-100 Leader Arm Teleoperation               │
+│ [1] Case 1: Base Drive + SO-100 Leader Arm Teleoperation (Local on Pi) │
 │     • Drive mobile base with Logitech F710 Gamepad                     │
 │     • Press [Y] -> Lock wheels with electric brakes                    │
 │     • 1:1 real-time mirror: Follower mirrors physical Leader Arm       │
 │                                                                        │
-│ [2] Case 2: Base Drive + Logitech Gamepad Arm Teleoperation            │
+│ [2] Case 2: Base Drive + Logitech Gamepad Arm Teleoperation (All-in-1) │
 │     • Drive mobile base with Logitech F710 Gamepad                     │
 │     • Press [Y] -> Lock wheels with electric brakes                    │
 │     • 6-DOF Rate control of SO-100 arm entirely from Logitech Gamepad  │
+│                                                                        │
+│ [3] Case 3: Remote Network Teleoperation (Leader Arm on PC -> Robot)   │
+│     • SO-100 Leader Arm is plugged into your PC                        │
+│     • PC communicates with Raspberry Pi over low-latency TCP network   │
+│     • Press [SPACE] on computer to switch between Base Drive and Arm!  │
+│       - In Base Drive: Tilt/turn leader arm like a joystick to drive   │
+│       - In Arm Teleop: Wheels locked; 1:1 real-time arm mirroring      │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -31,37 +38,33 @@ The system features two selectable demonstration workflows accessible via an int
 ```
                    ┌──────────────────────────────────────────────┐
                    │             Mode 1: BASE DRIVE               │
-                   │  • Logitech F710 Gamepad drives wheels       │
+                   │  • Logitech F710 Gamepad (Cases 1 & 2)       │
+                   │  • OR Leader Arm Joystick (Case 3 from PC)   │
                    │  • SO-100 Follower held in safe STOW pose    │
                    └──────────────────────┬───────────────────────┘
                                           │
-                         Press Button     │    [Y] on Gamepad
+                         Press Button     │    [Y] on Gamepad (Cases 1, 2)
+                                          │    OR [SPACE] on PC (Case 3)
                                           ▼
                    ┌──────────────────────────────────────────────┐
                    │               THE MODE SWITCH                │
                    │  • DDSM Base locks active electric brakes    │
                    │  • Wheels held at strictly 0 RPM             │
-                   └──────────────┬────────────────┬──────────────┘
-                                  │                │
-                      [Case 1]    │                │    [Case 2]
-                                  ▼                ▼
-         ┌──────────────────────────────┐    ┌──────────────────────────────┐
-         │  WAITING / SYNCING TO LEADER │    │  GAMEPAD ARM TELEOPERATION   │
-         │  • Auto-detects Leader arm   │    │  • Smooth rate-control       │
-         │  • S-curve zero-jerk sync    │    │  • 6-DOF joint positioning   │
-         └──────────────┬───────────────┘    │  • Dual bumpers for gripper  │
-                        │                    │  • Ready pose preset ([X])   │
-                        ▼                    └──────────────┬───────────────┘
-         ┌──────────────────────────────┐                   │
-         │   LEADER ARM TELEOPERATION   │                   │
-         │   • 1:1 Mirroring with       │                   │
-         │     physical Leader Arm      │                   │
-         └──────────────┬───────────────┘                   │
-                        │                                   │
-                        └─────────────────┬─────────────────┘
-                                          │
-                         Press Button     │    [Y] on Gamepad
-                                          ▼
+                   └──────┬───────────────┼───────────────┬───────┘
+                          │               │               │
+              [Case 1]    │   [Case 2]    │   [Case 3]    │
+                          ▼               ▼               ▼
+         ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+         │ LEADER ARM SYNC  │  │ GAMEPAD RATE CTL │  │ PC NETWORK ARM   │
+         │ • 1:1 Mirroring  │  │ • 6-DOF sticks   │  │ • 1:1 Mirroring  │
+         │   physical arm   │  │ • Presets & grip │  │   over TCP stream│
+         └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘
+                  │                     │                     │
+                  └─────────────────────┼─────────────────────┘
+                                        │
+                         Press Button   │    [Y] on Gamepad
+                                        │    OR [SPACE] on PC
+                                        ▼
                    ┌──────────────────────────────────────────────┐
                    │                State: PARKING                │
                    │  • Follower smoothly parks to STOW pose      │
@@ -115,46 +118,88 @@ The system features two selectable demonstration workflows accessible via an int
 
 ---
 
+#### Case 3: Remote Network Teleoperation (Leader Arm on PC -> Robot)
+
+In Case 3, the **SO-100 Leader Arm** is connected via USB directly to **your PC**, while the mobile robot runs the TCP Robot Server on the Raspberry Pi (`144.122.83.216:8765`).
+
+##### Computer Keyboard Controls:
+| Computer Key | Function | Description |
+| :--- | :--- | :--- |
+| **[SPACE]** or **[M]** | **MODE SWITCH** | **Toggle between Base Drive and Follower Arm Teleoperation** |
+| **[C]** | **Center Neutral** | Calibrate current leader arm position as the neutral center for Base driving |
+| **[1] - [4]** | **Speed Gear** | Select Base driving gear (`50` / `100` / `150` / `200` RPM) |
+| **[B]** | **Brake Toggle** | Toggle active electric brake lock on base |
+| **[Q]** or **[ESC]** | **Quit & Park** | Smoothly parks follower arm to stow pose and exits cleanly |
+
+##### Leader Arm Motion Mapping:
+* **In Base Drive Mode:**
+  * **Turn Base:** Turn leader arm's `shoulder_pan` left (CCW) or right (CW).
+  * **Drive Base:** Tilt leader arm's `shoulder_lift` forward (drive forward) or pull back (reverse).
+  * **Squeeze Brake:** Squeezing the leader gripper past 80% engages electric brakes.
+  * *Follower arm on the robot stays safely stowed in rest pose.*
+* **In Arm Teleoperation Mode:**
+  * **Base Wheels:** Firmly locked at 0 RPM with active electric brakes.
+  * **Follower Arm:** Tracks the leader arm 1:1 in real time with zero-jerk smoothing.
+
+---
+
 ## 🔌 Hardware Architecture & Ports
 
 | Subsystem | Device | Persistent by-id Port | Fallback Port |
 | :--- | :--- | :--- | :--- |
 | **Mobile Base** | Dual DDSM Hub Motors (RS485) | `/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BH002HMM-if00-port0` | `/dev/ttyUSB0` |
 | **Follower Arm** | SO-100 Follower (6x STS3215) | `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6084008-if00` | `/dev/ttyACM0` |
-| **Leader Arm** | SO-100 Leader (6x STS3215, Case 1) | `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6084621-if00` | `/dev/ttyACM1` |
+| **Leader Arm** | SO-100 Leader (6x STS3215) | `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6084621-if00` | `/dev/ttyACM1` |
 | **Controller** | Logitech F710 Wireless Gamepad | `/dev/input/by-id/usb-Logitech_Wireless_Gamepad_F710_DE659D52-event-joystick` | `/dev/input/js0` |
 
 ---
 
-## 🚀 How to Run the Demo on the Raspberry Pi
+## 🚀 How to Run the Demonstrations
 
-### 1. SSH into the Raspberry Pi
-```bash
-ssh midi@144.122.83.216
-```
-*(Password: `bekoromer`)*
+### Running Case 1 or Case 2 (Robot-side with Gamepad)
 
-### 2. Enter the Demo Directory
-```bash
-cd ~/demo_midi
-```
+1. **SSH into the Raspberry Pi:**
+   ```bash
+   ssh midi@144.122.83.216
+   ```
+   *(Password: `bekoromer`)*
 
-### 3. Launch the Demo
-Run with interactive case selection menu:
-```bash
-./run_demo.sh
-```
+2. **Launch the Demo:**
+   ```bash
+   cd ~/demo_midi
+   ./run_demo.sh         # Interactive menu
+   # OR:
+   ./run_demo.sh 1       # Case 1 (Base Drive + Leader Arm Teleop on Pi)
+   ./run_demo.sh 2       # Case 2 (Base Drive + Gamepad Arm Teleop)
+   ```
 
-Or run a specific case directly:
-```bash
-./run_demo.sh 1       # Launches Case 1 (Base Drive + Leader Arm Teleop)
-./run_demo.sh 2       # Launches Case 2 (Base Drive + Gamepad Arm Teleop)
-```
+---
 
-*(Additional options)*:
-* `./run_demo.sh --dry-run 2` : Run Case 2 in software simulation mode without physical hardware.
-* `./run_demo.sh --verbose 1` : Enable detailed debug logging.
-* `python3 tests/test_demo.py` : Run automated test suite verifying all kinematics, state machines, and rate controllers.
+### Running Case 3 (Remote Teleoperation: Leader Arm on PC -> Robot)
+
+1. **Plug the SO-100 Leader Arm into your PC** via USB.
+2. **Start the Robot Server on the Raspberry Pi:**
+   ```bash
+   ssh midi@144.122.83.216
+   cd ~/demo_midi
+   ./run_demo.sh 3
+   ```
+   *(The Raspberry Pi homes the follower arm to stow pose and listens on port 8765).*
+
+3. **Start the PC Teleoperation Client on your computer:**
+   ```bash
+   cd ~/demo_midi
+   ./run_pc_client.sh    # Automatically connects to 144.122.83.216:8765
+   ```
+4. **Control:**
+   * Tilt and turn the leader arm to drive the robot around!
+   * Press **[SPACE]** on your computer keyboard to switch into Arm Teleoperation and play with the arm.
+   * Press **[SPACE]** again to park the arm and resume driving.
+
+*(Testing & Simulation Options)*:
+* `./run_demo.sh --dry-run 3` : Run Robot Server in dry-run simulation mode.
+* `./run_pc_client.sh 127.0.0.1 --dry-run` : Run PC Client in simulation mode.
+* `python3 tests/test_demo.py` : Run automated test suite verifying all 3 cases.
 
 ---
 

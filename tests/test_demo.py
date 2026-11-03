@@ -10,6 +10,8 @@ from src.base_controller import BaseController
 from src.ddsm import calculate_crc8, MotorFeedback, DDSMDriver
 from src.diff_drive import DifferentialDrive, RobotDimensions, slew
 from src.gamepad import F710Gamepad, GamepadState
+from src.leader_reader import leader_to_base_drive, SO100LeaderReader, DEFAULT_NEUTRAL_POSE
+from src.network import RobotServer, RobotClient
 from src.state_machine import DemoStateMachine, DemoState
 
 
@@ -264,6 +266,128 @@ def test_arm_joint_standard_1to1():
     assert leader_pose["shoulder_lift.pos"] == -50.0
 
 
+def test_case3_leader_to_base_kinematics():
+    """Verify mapping from leader arm deflection to base drive commands."""
+    neutral = {"shoulder_pan.pos": 0.0, "shoulder_lift.pos": -45.0, "gripper.pos": 10.0}
+
+    # 1. At neutral -> zero motion
+    fwd, turn, brake = leader_to_base_drive(neutral, neutral)
+    assert fwd == 0.0
+    assert turn == 0.0
+    assert brake is False
+
+    # 2. Small deflection inside deadzone (<= 6 deg) -> zero motion
+    pose_dz = {"shoulder_pan.pos": 4.0, "shoulder_lift.pos": -42.0, "gripper.pos": 10.0}
+    fwd, turn, brake = leader_to_base_drive(pose_dz, neutral)
+    assert fwd == 0.0
+    assert turn == 0.0
+
+    # 3. Turn left (pan negative, e.g. -25 deg) with turn_dir=-1 -> positive turn (CCW)
+    pose_left = {"shoulder_pan.pos": -25.0, "shoulder_lift.pos": -45.0, "gripper.pos": 10.0}
+    fwd, turn, brake = leader_to_base_drive(pose_left, neutral)
+    assert turn > 0.0
+    assert fwd == 0.0
+
+    # 4. Turn right (pan positive, e.g. +25 deg) -> negative turn (CW)
+    pose_right = {"shoulder_pan.pos": 25.0, "shoulder_lift.pos": -45.0, "gripper.pos": 10.0}
+    fwd, turn, brake = leader_to_base_drive(pose_right, neutral)
+    assert turn < 0.0
+
+    # 5. Push forward (lift increases toward 0 deg, e.g. -20 deg) -> forward > 0
+    pose_fwd = {"shoulder_pan.pos": 0.0, "shoulder_lift.pos": -20.0, "gripper.pos": 10.0}
+    fwd, turn, brake = leader_to_base_drive(pose_fwd, neutral)
+    assert fwd > 0.0
+    assert turn == 0.0
+
+    # 6. Pull backward (lift decreases toward -90 deg, e.g. -75 deg) -> forward < 0
+    pose_rev = {"shoulder_pan.pos": 0.0, "shoulder_lift.pos": -75.0, "gripper.pos": 10.0}
+    fwd, turn, brake = leader_to_base_drive(pose_rev, neutral)
+    assert fwd < 0.0
+
+    # 7. Squeeze gripper (>80%) -> brake engaged
+    pose_grip = {"shoulder_pan.pos": 0.0, "shoulder_lift.pos": -45.0, "gripper.pos": 85.0}
+    fwd, turn, brake = leader_to_base_drive(pose_grip, neutral)
+    assert brake is True
+
+
+def test_case3_network_teleop_simulation():
+    """Verify Case 3: Remote Network Teleoperation between PC Client and Robot Server."""
+    import time
+
+    cfg = {
+        "dry_run": True,
+        "serial": {"port": "/dev/null"},
+        "motors": {"left_id": 1, "right_id": 2},
+        "arm": {
+            "follower_port": "/dev/null",
+            "interpolation_time_s": 0.01,
+        },
+    }
+
+    test_port = 18765
+    base = BaseController(cfg, dry_run=True)
+    arm = ArmController(cfg, dry_run=True)
+    gamepad = F710Gamepad()
+
+    base.connect()
+    arm.connect_follower()
+
+    sm = DemoStateMachine(base, arm, gamepad, demo_case=3, network_port=test_port)
+    assert sm.state == DemoState.NETWORK_SERVER
+    assert sm.server is not None
+    assert sm.server.start() is True
+
+    # Connect client
+    client = RobotClient(host="127.0.0.1", port=test_port)
+    assert client.connect() is True
+    time.sleep(0.05)
+
+    # Poll server to register connection
+    gp = GamepadState()
+    sm._handle_network_server(gp, dt=0.02)
+    assert sm.server.is_connected is True
+
+    # 1. Test Base Drive command over network
+    client.send_command({
+        "mode": "base",
+        "base": {"forward": 0.6, "turn": 0.0, "speed_rpm": 100.0, "brake": False}
+    })
+    time.sleep(0.02)
+    sm._handle_network_server(gp, dt=0.02)
+    assert base.cur_left_rpm > 0.0
+    assert base.cur_right_rpm > 0.0
+    assert base.is_locked is False
+
+    # 2. Test Arm Teleop command over network
+    arm_target = {
+        "shoulder_pan.pos": 25.0,
+        "shoulder_lift.pos": -35.0,
+        "elbow_flex.pos": 20.0,
+        "wrist_flex.pos": 40.0,
+        "wrist_roll.pos": 0.0,
+        "gripper.pos": 50.0,
+    }
+    client.send_command({"mode": "arm", "arm": arm_target})
+    time.sleep(0.02)
+    sm._handle_network_server(gp, dt=0.02)
+    # Base wheels MUST be locked in arm mode!
+    assert base.is_locked is True
+    assert base.cur_left_rpm == 0.0
+    assert base.cur_right_rpm == 0.0
+
+    # 3. Test telemetry exchange
+    time.sleep(0.02)
+    telem = client.poll_telemetry()
+    assert telem is not None
+    assert telem["state"] == "NETWORK_SERVER"
+    assert telem["mode"] == "arm"
+    assert telem["base_locked"] is True
+
+    # 4. Clean shutdown
+    client.disconnect()
+    sm.stop()
+
+
 if __name__ == "__main__":
     test_ddsm_crc8_spec()
     print("  [PASS] test_ddsm_crc8_spec")
@@ -283,6 +407,10 @@ if __name__ == "__main__":
     print("  [PASS] test_case1_leader_teleop_simulation")
     test_case2_gamepad_teleop_simulation()
     print("  [PASS] test_case2_gamepad_teleop_simulation")
+    test_case3_leader_to_base_kinematics()
+    print("  [PASS] test_case3_leader_to_base_kinematics")
+    test_case3_network_teleop_simulation()
+    print("  [PASS] test_case3_network_teleop_simulation")
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
 
 
