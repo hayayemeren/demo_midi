@@ -64,6 +64,8 @@ class ArmController:
         self.use_degrees = bool(arm_cfg.get("use_degrees", True))
         self.stow_pose = arm_cfg.get("stow_pose", DEFAULT_STOW_POSE)
         self.interpolation_time = float(arm_cfg.get("interpolation_time_s", 1.5))
+        self.invert_shoulder_pan = bool(arm_cfg.get("invert_shoulder_pan", True))
+        self.invert_wrist_roll = bool(arm_cfg.get("invert_wrist_roll", False))
 
         self.follower = None
         self.leader = None
@@ -159,16 +161,24 @@ class ArmController:
             return dict(self.sim_follower_pose)
 
     def get_leader_pose(self) -> Dict[str, float]:
-        """Read current Leader joint angles."""
+        """Read current Leader joint angles, applying joint inversions if configured."""
         if self.dry_run or self.leader is None:
-            return dict(self.sim_leader_pose)
+            pose = dict(self.sim_leader_pose)
+        else:
+            try:
+                act = self.leader.get_action()
+                pose = {k: float(v) for k, v in act.items()}
+            except Exception as e:
+                logger.warning("Error reading leader pose: %s", e)
+                pose = dict(self.sim_leader_pose)
 
-        try:
-            act = self.leader.get_action()
-            return {k: float(v) for k, v in act.items()}
-        except Exception as e:
-            logger.warning("Error reading leader pose: %s", e)
-            return dict(self.sim_leader_pose)
+        # Invert joints (e.g. left/right pan direction matching)
+        if self.invert_shoulder_pan and "shoulder_pan.pos" in pose:
+            pose["shoulder_pan.pos"] = -pose["shoulder_pan.pos"]
+        if self.invert_wrist_roll and "wrist_roll.pos" in pose:
+            pose["wrist_roll.pos"] = -pose["wrist_roll.pos"]
+
+        return pose
 
     def send_follower_action(self, action: Dict[str, float]):
         """Send joint position command to Follower arm."""

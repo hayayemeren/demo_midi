@@ -50,6 +50,8 @@ arm:
   leader_id: "so100_leader"
 
   use_degrees: true             # Joint positions in degrees
+  invert_shoulder_pan: true     # Invert left/right (pan) direction so leader and follower match
+  invert_wrist_roll: false      # Invert wrist rotation if needed
   interpolation_time_s: 1.5     # Seconds for smooth S-curve stow / sync transitions
 
   # Safe resting / stowed travel pose when driving the mobile base

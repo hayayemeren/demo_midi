@@ -141,6 +141,23 @@ def test_state_machine_transitions_simulation():
     assert base.is_locked is True
 
 
+def test_arm_joint_inversion():
+    """Verify that invert_shoulder_pan reverses the pan angle correctly."""
+    cfg = {
+        "dry_run": True,
+        "arm": {
+            "invert_shoulder_pan": True,
+            "invert_wrist_roll": False,
+        },
+    }
+    arm = ArmController(cfg, dry_run=True)
+    # Simulate leader moved +35 degrees to the left
+    arm.sim_leader_pose = {"shoulder_pan.pos": 35.0, "shoulder_lift.pos": -50.0}
+    leader_pose = arm.get_leader_pose()
+    assert leader_pose["shoulder_pan.pos"] == -35.0
+    assert leader_pose["shoulder_lift.pos"] == -50.0
+
+
 if __name__ == "__main__":
     test_ddsm_crc8_spec()
     print("  [PASS] test_ddsm_crc8_spec")
@@ -152,6 +169,8 @@ if __name__ == "__main__":
     print("  [PASS] test_differential_drive_pivot")
     test_slew_rate_acceleration()
     print("  [PASS] test_slew_rate_acceleration")
+    test_arm_joint_inversion()
+    print("  [PASS] test_arm_joint_inversion")
     test_state_machine_transitions_simulation()
     print("  [PASS] test_state_machine_transitions_simulation")
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
