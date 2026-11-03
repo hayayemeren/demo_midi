@@ -1,6 +1,10 @@
-"""Unit Tests for MIDI Mobile Manipulator Demo."""
-
 import math
+import os
+import sys
+
+# Add project root to sys.path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from src.arm_controller import cosine_interpolate, ArmController, DEFAULT_STOW_POSE
 from src.base_controller import BaseController
 from src.ddsm import calculate_crc8, MotorFeedback, DDSMDriver
