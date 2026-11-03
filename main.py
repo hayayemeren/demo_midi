@@ -11,6 +11,7 @@ import logging
 import os
 import signal
 import sys
+from typing import Optional
 import yaml
 
 # Add project root to sys.path
@@ -72,9 +73,61 @@ def load_config(config_path: str) -> dict:
     return cfg
 
 
+def select_case_interactive(default_case: Optional[int] = None) -> int:
+    """Display interactive menu to choose demonstration case."""
+    if not sys.stdin.isatty():
+        return default_case if default_case in (1, 2) else 1
+
+    print("\n" + "=" * 64)
+    print("              SELECT DEMONSTRATION CASE")
+    print("=" * 64)
+    print("  [1] Case 1: Base Drive + SO-100 Leader Arm Teleoperation")
+    print("      - Base drive with Logitech F710 Gamepad")
+    print("      - Press [Y] -> Lock wheels & mirror physical Leader Arm (1:1)")
+    print()
+    print("  [2] Case 2: Base Drive + Logitech Gamepad Arm Teleoperation")
+    print("      - Base drive with Logitech F710 Gamepad")
+    print("      - Press [Y] -> Lock wheels & control SO-100 Arm with Gamepad")
+    print("        * Right Stick: Pan (L/R) & Lift (U/D)")
+    print("        * Left Stick:  Wrist Roll (L/R) & Elbow Flex (U/D)")
+    print("        * D-Pad:       Wrist Flex Pitch (U/D) & Fine Roll (L/R)")
+    print("        * Bumpers:     LB (Open Gripper), RB (Close Gripper)")
+    print("        * Buttons:     [A] Toggle Gripper, [X] Move to Ready Pose")
+    print()
+    print("  [Q] Quit Demonstration")
+    print("=" * 64)
+
+    default_prompt = f" [{default_case}]" if default_case in (1, 2) else " [1]"
+    while True:
+        try:
+            choice = input(f"Enter choice (1, 2, or Q){default_prompt}: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            sys.exit(0)
+
+        if not choice:
+            return default_case if default_case in (1, 2) else 1
+        if choice in ("1", "case 1", "c1"):
+            return 1
+        elif choice in ("2", "case 2", "c2"):
+            return 2
+        elif choice in ("q", "quit", "exit"):
+            print("Exiting.")
+            sys.exit(0)
+        else:
+            print("Invalid selection. Please enter 1, 2, or Q.")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="MIDI Mobile Manipulator: Base Drive & Arm Teleop Switch"
+    )
+    parser.add_argument(
+        "-C", "--case",
+        type=int,
+        choices=[1, 2],
+        default=None,
+        help="Demo case to run (1: Leader Arm Mirroring, 2: Gamepad Arm Rate Control). If omitted, displays interactive menu."
     )
     parser.add_argument(
         "-c", "--config",
@@ -106,6 +159,22 @@ def main():
     dry_run = args.dry_run or config.get("dry_run", False)
     if dry_run:
         logging.warning("[MODE] Running in DRY-RUN SIMULATION mode.")
+
+    # Determine demonstration case
+    case = args.case
+    if case is None:
+        cfg_case = config.get("case")
+        if cfg_case in (1, 2):
+            case = cfg_case
+        else:
+            case = select_case_interactive(default_case=1)
+
+    case_name = (
+        "Case 1: Base Drive + SO-100 Leader Arm Teleoperation"
+        if case == 1
+        else "Case 2: Base Drive + Logitech Gamepad Arm Teleoperation"
+    )
+    print(f"\n>>> Running {case_name} <<<\n")
 
     # 1. Initialize Base Controller
     base = BaseController(config, dry_run=dry_run)
@@ -141,6 +210,7 @@ def main():
         base=base,
         arm=arm,
         gamepad=gamepad,
+        demo_case=case,
         loop_hz=float(ctrl_cfg.get("loop_hz", 50.0)),
         telemetry_interval=float(ctrl_cfg.get("telemetry_interval", 0.20)),
     )

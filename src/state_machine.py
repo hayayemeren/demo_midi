@@ -27,7 +27,8 @@ class DemoState(enum.Enum):
     BASE_DRIVE = "BASE_DRIVE"
     WAITING_FOR_LEADER = "WAITING_FOR_LEADER"
     SYNCING = "SYNCING"
-    ARM_TELEOP = "ARM_TELEOP"
+    ARM_TELEOP_LEADER = "ARM_TELEOP_LEADER"
+    ARM_TELEOP_GAMEPAD = "ARM_TELEOP_GAMEPAD"
     PARKING = "PARKING"
     STOPPING = "STOPPING"
 
@@ -50,12 +51,14 @@ class DemoStateMachine:
         base: BaseController,
         arm: ArmController,
         gamepad: F710Gamepad,
+        demo_case: int = 1,
         loop_hz: float = 50.0,
         telemetry_interval: float = 0.20,
     ):
         self.base = base
         self.arm = arm
         self.gamepad = gamepad
+        self.demo_case = demo_case
         self.loop_hz = loop_hz
         self.telemetry_interval = telemetry_interval
 
@@ -68,20 +71,26 @@ class DemoStateMachine:
     def start(self):
         """Initial check and launch of the control loop."""
         self.running = True
-        logger.info("Initializing Demonstration State Machine...")
+        logger.info("Initializing Demonstration State Machine for Case %d...", self.demo_case)
 
         # 1. Start Follower at stow pose
         logger.info("Setting Follower Arm to safe Stow Pose...")
         self.arm.move_to_stow(duration_s=1.0)
 
-        # 2. Try connecting leader in background if available
-        if self.arm.is_leader_port_available():
+        # 2. Try connecting leader in background if Case 1 and available
+        if self.demo_case == 1 and self.arm.is_leader_port_available():
             self.arm.connect_leader()
 
+        case_desc = (
+            f"Case 1: {COLOR_MAGENTA}SO-100 LEADER ARM TELEOPERATION{COLOR_RESET}"
+            if self.demo_case == 1
+            else f"Case 2: {COLOR_MAGENTA}LOGITECH GAMEPAD ARM TELEOPERATION (All-in-One){COLOR_RESET}"
+        )
+
         logger.info(
-            f"{COLOR_BOLD}{COLOR_GREEN}=== MIDI DEMO READY ==={COLOR_RESET}\n"
+            f"{COLOR_BOLD}{COLOR_GREEN}=== MIDI DEMO READY (Case {self.demo_case}) ==={COLOR_RESET}\n"
             f"Mode 1: {COLOR_CYAN}BASE DRIVE{COLOR_RESET} (Use Logitech sticks to drive base)\n"
-            f"Toggle Button: {COLOR_YELLOW}[Y]{COLOR_RESET} on Gamepad -> Switch to {COLOR_MAGENTA}ARM TELEOPERATION{COLOR_RESET}\n"
+            f"Toggle Button: {COLOR_YELLOW}[Y]{COLOR_RESET} on Gamepad -> Switch to {case_desc}\n"
             f"Brake: {COLOR_RED}[B]{COLOR_RESET} | Exit: {COLOR_RED}[START]{COLOR_RESET}\n"
         )
 
@@ -112,8 +121,10 @@ class DemoStateMachine:
                 self._handle_waiting_for_leader(gp, now)
             elif self.state == DemoState.SYNCING:
                 self._handle_syncing()
-            elif self.state == DemoState.ARM_TELEOP:
-                self._handle_arm_teleop(gp)
+            elif self.state == DemoState.ARM_TELEOP_LEADER:
+                self._handle_arm_teleop_leader(gp)
+            elif self.state == DemoState.ARM_TELEOP_GAMEPAD:
+                self._handle_arm_teleop_gamepad(gp, dt)
             elif self.state == DemoState.PARKING:
                 self._handle_parking()
 
@@ -131,20 +142,32 @@ class DemoStateMachine:
         """Mode 1: Base driving with F710; Arm is stowed."""
         # Check for mode switch trigger
         if self.gamepad.is_switch_pressed(gp):
-            logger.info("\n[SWITCH] Button [Y] pressed -> Switching from BASE DRIVE to ARM TELEOPERATION!")
             # 1. Lock base immediately
             self.base.lock_brakes()
 
-            # 2. Check if leader arm is connected
-            if not self.arm.is_leader_connected():
-                # Attempt connection
-                if self.arm.is_leader_port_available() and self.arm.connect_leader():
-                    self.state = DemoState.SYNCING
+            # Case 1: Switch to Leader Arm Teleoperation
+            if self.demo_case == 1:
+                logger.info("\n[SWITCH] Button [Y] pressed -> Switching to LEADER ARM TELEOPERATION!")
+                if not self.arm.is_leader_connected():
+                    if self.arm.is_leader_port_available() and self.arm.connect_leader():
+                        self.state = DemoState.SYNCING
+                    else:
+                        logger.info("\n[STATUS] Waiting for Leader Arm to be connected and turned on...")
+                        self.state = DemoState.WAITING_FOR_LEADER
                 else:
-                    logger.info("\n[STATUS] Waiting for Leader Arm to be connected and turned on...")
-                    self.state = DemoState.WAITING_FOR_LEADER
+                    self.state = DemoState.SYNCING
+
+            # Case 2: Switch to Logitech Gamepad Arm Teleoperation
             else:
-                self.state = DemoState.SYNCING
+                logger.info("\n[SWITCH] Button [Y] pressed -> Switching to GAMEPAD ARM TELEOPERATION (Case 2)!")
+                self.arm.init_gamepad_teleop()
+                logger.info(
+                    f"\n{COLOR_BOLD}{COLOR_MAGENTA}>>> GAMEPAD ARM TELEOPERATION ACTIVE! <<<{COLOR_RESET}\n"
+                    f"Right Stick: Pan (L/R) & Lift (U/D) | Left Stick: Elbow (U/D) & Roll (L/R)\n"
+                    f"D-Pad: Wrist Flex (U/D) | RB: Close Grip | LB: Open Grip | A: Toggle Grip | X: Ready Pose\n"
+                    f"Press {COLOR_YELLOW}[Y]{COLOR_RESET} anytime to park the arm and return to {COLOR_CYAN}BASE DRIVE{COLOR_RESET}.\n"
+                )
+                self.state = DemoState.ARM_TELEOP_GAMEPAD
             return
 
         # Drive the base
@@ -154,8 +177,7 @@ class DemoStateMachine:
             self.base.drive(0.0, 0.0, 0.0, dt, brake=True)
 
     def _handle_waiting_for_leader(self, gp: GamepadState, now: float):
-        """Base is locked; waiting for leader arm to be plugged in."""
-        # Actively hold electric brakes: wheels must not move
+        """Base is locked; waiting for leader arm to be plugged in (Case 1)."""
         self.base.hold_lock()
 
         # Allow operator to cancel and go back to driving
@@ -175,7 +197,7 @@ class DemoStateMachine:
                     self.state = DemoState.SYNCING
 
     def _handle_syncing(self):
-        """Base is locked; smoothly move follower arm to match leader arm pose."""
+        """Base is locked; smoothly move follower arm to match leader arm pose (Case 1)."""
         self.base.hold_lock()
         logger.info("\n[SYNC] Aligning Follower arm with Leader arm pose (zero-jerk transition)...")
         self.arm.sync_to_leader(
@@ -186,11 +208,10 @@ class DemoStateMachine:
             f"\n{COLOR_BOLD}{COLOR_MAGENTA}>>> TELEOPERATION ACTIVE! People can now play with the arm! <<<{COLOR_RESET}\n"
             f"Press {COLOR_YELLOW}[Y]{COLOR_RESET} anytime to park the arm and return to {COLOR_CYAN}BASE DRIVE{COLOR_RESET}.\n"
         )
-        self.state = DemoState.ARM_TELEOP
+        self.state = DemoState.ARM_TELEOP_LEADER
 
-    def _handle_arm_teleop(self, gp: GamepadState):
-        """Mode 2: Follower arm mirrors Leader arm in real time."""
-        # Base MUST NOT turn in teleoperation mode: actively hold electric brakes every tick
+    def _handle_arm_teleop_leader(self, gp: GamepadState):
+        """Mode 2 (Case 1): Follower arm mirrors Leader arm in real time."""
         self.base.hold_lock()
 
         # Check if user wants to switch back to Base Drive
@@ -207,6 +228,20 @@ class DemoStateMachine:
 
         # Stream teleoperation action (1:1 mirror)
         self.arm.teleop_step()
+
+    def _handle_arm_teleop_gamepad(self, gp: GamepadState, dt: float):
+        """Mode 2 (Case 2): Follower arm controlled directly from Logitech Gamepad."""
+        # Wheels strictly locked in teleop mode
+        self.base.hold_lock()
+
+        # Check if user wants to switch back to Base Drive
+        if self.gamepad.is_switch_pressed(gp):
+            logger.info("\n[SWITCH] Button [Y] pressed -> Parking arm and returning to BASE DRIVE!")
+            self.state = DemoState.PARKING
+            return
+
+        # Rate-control teleoperation step from gamepad sticks/buttons
+        self.arm.teleop_step_gamepad(gp, dt)
 
     def _handle_parking(self):
         """Base is locked; smoothly park follower arm back to safe stow pose."""
@@ -236,12 +271,19 @@ class DemoStateMachine:
 
         if self.state == DemoState.BASE_DRIVE:
             info = f"Cmd: L={int(self.base.cur_left_rpm):+4d} R={int(self.base.cur_right_rpm):+4d} RPM | Gear: {gp.speed_rpm:.0f} RPM"
-        elif self.state == DemoState.ARM_TELEOP:
+        elif self.state == DemoState.ARM_TELEOP_LEADER:
             f_pose = self.arm.get_follower_pose()
             pan = f_pose.get("shoulder_pan.pos", 0.0)
             lift = f_pose.get("shoulder_lift.pos", 0.0)
             grip = f_pose.get("gripper.pos", 0.0)
-            info = f"Arm Pan:{pan:+5.1f}° Lift:{lift:+5.1f}° Grip:{grip:4.1f}% | Base: LOCKED"
+            info = f"Leader Mirror | Pan:{pan:+5.1f}° Lift:{lift:+5.1f}° Grip:{grip:4.1f}% | Base: LOCKED"
+        elif self.state == DemoState.ARM_TELEOP_GAMEPAD:
+            f_pose = self.arm.get_follower_pose()
+            pan = f_pose.get("shoulder_pan.pos", 0.0)
+            lift = f_pose.get("shoulder_lift.pos", 0.0)
+            elbow = f_pose.get("elbow_flex.pos", 0.0)
+            grip = f_pose.get("gripper.pos", 0.0)
+            info = f"GP Arm | Pan:{pan:+4.0f}° Lift:{lift:+4.0f}° Elb:{elbow:+4.0f}° Grp:{grip:3.0f}% | Base: LOCKED"
         elif self.state == DemoState.WAITING_FOR_LEADER:
             info = f"{COLOR_YELLOW}Waiting for Leader Arm... Press [Y] to cancel{COLOR_RESET}"
         elif self.state == DemoState.SYNCING:

@@ -1,8 +1,14 @@
 # ==============================================================================
 # MIDI Mobile Manipulator Demo Configuration
 # Mode 1: Logitech F710 Gamepad Base Drive (Arm Stowed)
-# Mode 2: 1:1 SO-100 Live Arm Teleoperation (Base Locked with Electric Brakes)
+# Mode 2: Arm Teleoperation (Case 1: Leader Arm Mirroring | Case 2: Gamepad Rate Control)
 # ==============================================================================
+
+# Active Demo Case:
+# 1 = Base Drive + SO-100 Leader Arm Teleoperation
+# 2 = Base Drive + Logitech Gamepad Arm Teleoperation (All-in-One Gamepad)
+# null = Interactive menu at startup
+case: null
 
 # RS485 Serial Bus for DDSM Hub Motors
 serial:
@@ -62,6 +68,15 @@ arm:
     wrist_flex.pos: 95.0
     wrist_roll.pos: 0.0
     gripper.pos: 5.0
+
+# Gamepad Arm Teleoperation (Case 2) Speeds & Rate Limits
+arm_gamepad_teleop:
+  pan_speed_dps: 50.0           # Shoulder pan speed (deg/s)
+  lift_speed_dps: 45.0          # Shoulder lift speed (deg/s)
+  elbow_speed_dps: 50.0         # Elbow flex speed (deg/s)
+  flex_speed_dps: 45.0          # Wrist flex speed (deg/s)
+  roll_speed_dps: 60.0          # Wrist roll speed (deg/s)
+  gripper_speed_pct_s: 60.0     # Gripper speed (%/s)
 
 # Control Loop Timing
 control:

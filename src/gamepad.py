@@ -42,9 +42,19 @@ class GamepadState:
     forward: float = 0.0          # -1.0 (Reverse) to +1.0 (Forward)
     turn: float = 0.0             # -1.0 (Right/CW) to +1.0 (Left/CCW)
     brake: bool = False           # True if B is held
+    # Extended 6-DOF Stick & D-Pad inputs for Arm Teleoperation
+    left_stick_x: float = 0.0     # -1.0 (Left) to +1.0 (Right)
+    left_stick_y: float = 0.0     # -1.0 (Down) to +1.0 (Up)
+    right_stick_x: float = 0.0    # -1.0 (Left) to +1.0 (Right)
+    right_stick_y: float = 0.0    # -1.0 (Down) to +1.0 (Up)
+    dpad_x: int = 0               # -1 (Left), +1 (Right), 0 (Neutral)
+    dpad_y: int = 0               # +1 (Up), -1 (Down), 0 (Neutral)
+    button_lb_held: bool = False  # Continuous LB hold (Gripper Open)
+    button_rb_held: bool = False  # Continuous RB hold (Gripper Close)
     button_y_pressed: bool = False      # Switch mode toggle (Y)
-    button_x_pressed: bool = False      # Secondary toggle (X)
-    button_a_pressed: bool = False      # Confirm button (A)
+    button_x_pressed: bool = False      # Work pose toggle (X)
+    button_a_pressed: bool = False      # Confirm / Gripper toggle (A)
+    button_b_held: bool = False         # Emergency stop / freeze (B)
     button_lb_pressed: bool = False     # Speed UP
     button_rb_pressed: bool = False     # Speed DOWN
     button_start_pressed: bool = False  # Exit program
@@ -208,12 +218,29 @@ class F710Gamepad:
                 logger.info("[GAMEPAD] Speed DOWN (RB): Level %d (%.0f RPM)", self.speed_level + 1, self.speed_levels[self.speed_level])
 
         # Compute analog stick values:
-        # Left Stick Y: Push Forward = positive (+1), Pull Back = negative (-1)
-        raw_fwd = -self.norm(E.ABS_Y)
-        # Right Stick X: Push Left = positive (+1 CCW turn), Push Right = negative (-1 CW turn)
-        raw_turn = -self.norm(self.turn_code) if self.turn_code else 0.0
+        # Left Stick Y: Push Up = +1.0, Pull Down = -1.0
+        ls_y = -self.norm(E.ABS_Y)
+        # Left Stick X: Push Right = +1.0, Push Left = -1.0
+        ls_x = self.norm(E.ABS_X)
 
+        # Right Stick X: Push Right = +1.0, Push Left = -1.0
+        rs_x = self.norm(self.turn_code) if self.turn_code else 0.0
+        # Right Stick Y: Push Up = +1.0, Pull Down = -1.0
+        ry_code = E.ABS_RY if E.ABS_RY in self.ax else E.ABS_RZ
+        rs_y = -self.norm(ry_code) if ry_code in self.ax else 0.0
+
+        # D-pad (POV Hat)
+        dpad_x = int(self.val.get(E.ABS_HAT0X, 0))
+        dpad_y = -int(self.val.get(E.ABS_HAT0Y, 0))  # Up = +1, Down = -1
+
+        # Base driving inputs
+        raw_fwd = ls_y
+        raw_turn = -rs_x  # Push Left = +1.0, Push Right = -1.0
+
+        # Buttons held and pressed
         brake_active = bool(BTN_CODE_BRAKE & self.btn)
+        lb_held = bool(BTN_CODE_LB & self.btn)
+        rb_held = bool(BTN_CODE_RB & self.btn)
         start_pressed = bool(BTN_CODE_START & set(self.pressed))
         y_pressed = bool(BTN_CODE_Y & set(self.pressed))
         x_pressed = bool(BTN_CODE_X & set(self.pressed))
@@ -224,9 +251,18 @@ class F710Gamepad:
             forward=raw_fwd,
             turn=raw_turn,
             brake=brake_active,
+            left_stick_x=ls_x,
+            left_stick_y=ls_y,
+            right_stick_x=rs_x,
+            right_stick_y=rs_y,
+            dpad_x=dpad_x,
+            dpad_y=dpad_y,
+            button_lb_held=lb_held,
+            button_rb_held=rb_held,
             button_y_pressed=y_pressed,
             button_x_pressed=x_pressed,
             button_a_pressed=a_pressed,
+            button_b_held=brake_active,
             button_lb_pressed=bool(BTN_CODE_LB & set(self.pressed)),
             button_rb_pressed=bool(BTN_CODE_RB & set(self.pressed)),
             button_start_pressed=start_pressed,

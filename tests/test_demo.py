@@ -79,8 +79,8 @@ def test_slew_rate_acceleration():
     assert abs(cur - 10.0) < 1e-4
 
 
-def test_state_machine_transitions_simulation():
-    """Verify demo state transitions in dry-run simulation mode."""
+def test_case1_leader_teleop_simulation():
+    """Verify Case 1: Base Drive + SO-100 Leader Arm Teleoperation."""
     cfg = {
         "dry_run": True,
         "serial": {"port": "/dev/null"},
@@ -100,7 +100,7 @@ def test_state_machine_transitions_simulation():
     base.connect()
     arm.connect_follower()
 
-    sm = DemoStateMachine(base, arm, gamepad, loop_hz=100.0)
+    sm = DemoStateMachine(base, arm, gamepad, demo_case=1, loop_hz=100.0)
     assert sm.state == DemoState.BASE_DRIVE
 
     # 1. Simulate button Y press when leader is connected
@@ -110,21 +110,21 @@ def test_state_machine_transitions_simulation():
     assert sm.state == DemoState.SYNCING
     assert base.is_locked is True
 
-    # 2. Complete syncing -> transitions to ARM_TELEOP
+    # 2. Complete syncing -> transitions to ARM_TELEOP_LEADER
     sm._handle_syncing()
-    assert sm.state == DemoState.ARM_TELEOP
+    assert sm.state == DemoState.ARM_TELEOP_LEADER
     assert base.is_locked is True
 
-    # Verify that moving the gamepad sticks during ARM_TELEOP does NOT turn the wheels!
+    # Verify that moving the gamepad sticks during ARM_TELEOP_LEADER does NOT turn the wheels!
     stick_move_state = GamepadState(forward=1.0, turn=1.0, connected=True)
-    sm._handle_arm_teleop(stick_move_state)
+    sm._handle_arm_teleop_leader(stick_move_state)
     assert base.is_locked is True
     assert base.cur_left_rpm == 0.0
     assert base.cur_right_rpm == 0.0
 
-    # 3. Simulate button Y press in ARM_TELEOP -> transitions to PARKING
+    # 3. Simulate button Y press in ARM_TELEOP_LEADER -> transitions to PARKING
     gp_state = GamepadState(button_y_pressed=True, connected=True)
-    sm._handle_arm_teleop(gp_state)
+    sm._handle_arm_teleop_leader(gp_state)
     assert sm.state == DemoState.PARKING
 
     # 4. Complete parking -> transitions back to BASE_DRIVE and unlocks brakes
@@ -139,6 +139,97 @@ def test_state_machine_transitions_simulation():
     sm._handle_base_drive(gp_state, dt=0.02)
     assert sm.state == DemoState.WAITING_FOR_LEADER
     assert base.is_locked is True
+
+
+def test_case2_gamepad_teleop_simulation():
+    """Verify Case 2: Base Drive + Logitech Gamepad rate-controlled arm teleoperation."""
+    cfg = {
+        "dry_run": True,
+        "serial": {"port": "/dev/null"},
+        "motors": {"left_id": 1, "right_id": 2},
+        "arm": {
+            "follower_port": "/dev/null",
+            "leader_port": "/dev/null",
+            "interpolation_time_s": 0.01,
+        },
+        "arm_gamepad_teleop": {
+            "pan_speed_dps": 50.0,
+            "lift_speed_dps": 45.0,
+            "elbow_speed_dps": 50.0,
+            "flex_speed_dps": 45.0,
+            "roll_speed_dps": 60.0,
+            "gripper_speed_pct_s": 60.0,
+        },
+        "gamepad": {"switch_button": "Y"},
+    }
+
+    base = BaseController(cfg, dry_run=True)
+    arm = ArmController(cfg, dry_run=True)
+    gamepad = F710Gamepad()
+
+    base.connect()
+    arm.connect_follower()
+
+    sm = DemoStateMachine(base, arm, gamepad, demo_case=2, loop_hz=100.0)
+    assert sm.state == DemoState.BASE_DRIVE
+
+    # 1. Drive base
+    gp_drive = GamepadState(forward=0.8, turn=0.0, connected=True)
+    sm._handle_base_drive(gp_drive, dt=0.02)
+    assert base.cur_left_rpm > 0.0
+    assert base.cur_right_rpm > 0.0
+    assert base.is_locked is False
+
+    # 2. Press Y -> Switches immediately to ARM_TELEOP_GAMEPAD (No leader arm required)
+    gp_switch = GamepadState(button_y_pressed=True, connected=True)
+    sm._handle_base_drive(gp_switch, dt=0.02)
+    assert sm.state == DemoState.ARM_TELEOP_GAMEPAD
+    assert base.is_locked is True
+
+    # 3. Base wheels MUST be locked in ARM_TELEOP_GAMEPAD even if sticks are pushed
+    gp_arm_move = GamepadState(
+        forward=1.0, turn=1.0,
+        right_stick_x=1.0,  # Pan right
+        right_stick_y=0.5,  # Lift up
+        connected=True
+    )
+    sm._handle_arm_teleop_gamepad(gp_arm_move, dt=0.1)
+    assert base.is_locked is True
+    assert base.cur_left_rpm == 0.0
+    assert base.cur_right_rpm == 0.0
+
+    # Arm target should have moved according to speeds and dt
+    target = arm.current_gamepad_target
+    assert target["shoulder_pan.pos"] > 0.0   # Moved positive (right)
+    assert target["shoulder_lift.pos"] > -95.0 # Lifted upward from stow pose (-95.0)
+
+    # 4. Gripper control: hold RB to close gripper
+    prev_grip = target["gripper.pos"]
+    gp_close_grip = GamepadState(button_rb_held=True, connected=True)
+    sm._handle_arm_teleop_gamepad(gp_close_grip, dt=0.1)
+    assert arm.current_gamepad_target["gripper.pos"] > prev_grip
+
+    # 5. Gripper toggle: Button A
+    gp_toggle_grip = GamepadState(button_a_pressed=True, connected=True)
+    sm._handle_arm_teleop_gamepad(gp_toggle_grip, dt=0.1)
+    assert arm.current_gamepad_target["gripper.pos"] in (0.0, 85.0)
+
+    # 6. Button X: Ready pose
+    gp_ready = GamepadState(button_x_pressed=True, connected=True)
+    sm._handle_arm_teleop_gamepad(gp_ready, dt=0.1)
+    for k, v in arm.ready_pose.items():
+        assert abs(arm.current_gamepad_target[k] - v) < 1e-4
+
+    # 7. Press Y -> Switches to PARKING
+    gp_park = GamepadState(button_y_pressed=True, connected=True)
+    sm._handle_arm_teleop_gamepad(gp_park, dt=0.1)
+    assert sm.state == DemoState.PARKING
+    assert base.is_locked is True
+
+    # 8. Parking finishes -> Back to BASE_DRIVE, brakes released
+    sm._handle_parking()
+    assert sm.state == DemoState.BASE_DRIVE
+    assert base.is_locked is False
 
 
 def test_base_steering_direction():
@@ -188,8 +279,10 @@ if __name__ == "__main__":
     print("  [PASS] test_base_steering_direction")
     test_arm_joint_standard_1to1()
     print("  [PASS] test_arm_joint_standard_1to1")
-    test_state_machine_transitions_simulation()
-    print("  [PASS] test_state_machine_transitions_simulation")
+    test_case1_leader_teleop_simulation()
+    print("  [PASS] test_case1_leader_teleop_simulation")
+    test_case2_gamepad_teleop_simulation()
+    print("  [PASS] test_case2_gamepad_teleop_simulation")
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
 
 

@@ -27,6 +27,16 @@ fi
 
 sudo chmod 666 /dev/ttyUSB* /dev/ttyACM* /dev/input/event* /dev/input/js* 2>/dev/null || true
 
-# 3. Launch Demo Application
+# 3. Parse arguments: convert positional '1' or '2' into '--case 1/2'
+ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "1" ] || [ "$arg" = "2" ]; then
+        ARGS+=("--case" "$arg")
+    else
+        ARGS+=("$arg")
+    fi
+done
+
+# 4. Launch Demo Application
 echo "Starting MIDI Mobile Manipulator Demo..."
-python3 main.py "$@"
+python3 main.py "${ARGS[@]}"

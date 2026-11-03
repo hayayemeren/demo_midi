@@ -23,6 +23,24 @@ DEFAULT_STOW_POSE = {
     "gripper.pos": 5.0,
 }
 
+DEFAULT_READY_POSE = {
+    "shoulder_pan.pos": 0.0,
+    "shoulder_lift.pos": -45.0,
+    "elbow_flex.pos": 15.0,
+    "wrist_flex.pos": 45.0,
+    "wrist_roll.pos": 0.0,
+    "gripper.pos": 50.0,
+}
+
+DEFAULT_JOINT_LIMITS = {
+    "shoulder_pan.pos": (-110.0, 110.0),
+    "shoulder_lift.pos": (-110.0, 85.0),
+    "elbow_flex.pos": (-100.0, 100.0),
+    "wrist_flex.pos": (-100.0, 100.0),
+    "wrist_roll.pos": (-180.0, 180.0),
+    "gripper.pos": (0.0, 100.0),
+}
+
 
 def cosine_interpolate(
     start_pose: Dict[str, float],
@@ -66,6 +84,18 @@ class ArmController:
         self.interpolation_time = float(arm_cfg.get("interpolation_time_s", 1.5))
         self.invert_shoulder_pan = bool(arm_cfg.get("invert_shoulder_pan", False))
         self.invert_wrist_roll = bool(arm_cfg.get("invert_wrist_roll", False))
+
+        # Gamepad Arm Teleoperation Speeds & Limits (Case 2)
+        gp_arm_cfg = config.get("arm_gamepad_teleop", {})
+        self.pan_speed_dps = float(gp_arm_cfg.get("pan_speed_dps", 50.0))
+        self.lift_speed_dps = float(gp_arm_cfg.get("lift_speed_dps", 45.0))
+        self.elbow_speed_dps = float(gp_arm_cfg.get("elbow_speed_dps", 50.0))
+        self.flex_speed_dps = float(gp_arm_cfg.get("flex_speed_dps", 45.0))
+        self.roll_speed_dps = float(gp_arm_cfg.get("roll_speed_dps", 60.0))
+        self.gripper_speed_pct_s = float(gp_arm_cfg.get("gripper_speed_pct_s", 60.0))
+        self.ready_pose = arm_cfg.get("ready_pose", DEFAULT_READY_POSE)
+        self.joint_limits = arm_cfg.get("joint_limits", DEFAULT_JOINT_LIMITS)
+        self.current_gamepad_target: Dict[str, float] = dict(self.stow_pose)
 
         self.follower = None
         self.leader = None
@@ -236,6 +266,93 @@ class ArmController:
         action = self.get_leader_pose()
         self.send_follower_action(action)
         return action
+
+    def init_gamepad_teleop(self):
+        """Initialize gamepad target pose from current follower observation."""
+        cur = self.get_follower_pose()
+        self.current_gamepad_target = {
+            k: cur.get(k, self.stow_pose.get(k, 0.0))
+            for k in self.stow_pose
+        }
+        logger.info("[ARM] Gamepad teleop initialized at: %s",
+                    {k: round(v, 1) for k, v in self.current_gamepad_target.items()})
+
+    def move_to_ready(self, duration_s: Optional[float] = None, feedback_cb = None):
+        """Smoothly move follower arm to ready/work pose."""
+        duration = duration_s or self.interpolation_time
+        start_pose = self.get_follower_pose()
+        logger.info("[ARM] Moving Follower to Ready Pose over %.1fs...", duration)
+        self.smooth_trajectory(start_pose, self.ready_pose, duration, feedback_cb=feedback_cb)
+        self.current_gamepad_target = dict(self.ready_pose)
+        logger.info("[ARM] Follower is ready for manipulation.")
+
+    def teleop_step_gamepad(self, gp: Any, dt: float) -> Dict[str, float]:
+        """Perform one rate-control teleoperation step from Gamepad inputs.
+        
+        Controls:
+          - Right Stick X: Shoulder Pan (Left / Right)
+          - Right Stick Y: Shoulder Lift (Up / Down)
+          - Left Stick Y: Elbow Flex (Reach / Pull back)
+          - Left Stick X: Wrist Roll (Roll CW / CCW)
+          - D-Pad Y: Wrist Flex (Pitch Up / Down)
+          - RB (held): Close Gripper
+          - LB (held): Open Gripper
+          - Button A: Toggle Gripper (Open <-> Close)
+          - Button X: Move to Ready Pose
+        """
+        # 1. Preset shortcut: Button X moves to Ready Pose
+        if gp.button_x_pressed:
+            logger.info("[ARM] Button [X] pressed -> Moving to Ready Pose...")
+            self.move_to_ready(duration_s=1.0)
+            return dict(self.current_gamepad_target)
+
+        # 2. Right stick: Pan (X) and Lift (Y)
+        # Push Right (+rs_x) -> Pan Right (+), Push Left (-rs_x) -> Pan Left (-)
+        pan_delta = gp.right_stick_x * self.pan_speed_dps * dt
+        # Push Up (+rs_y) -> Lift Up (+), Pull Down (-rs_y) -> Lift Down (-)
+        lift_delta = gp.right_stick_y * self.lift_speed_dps * dt
+
+        # 3. Left stick: Elbow Flex (Y) and Wrist Roll (X)
+        # Push Up (+ls_y) -> Extend (+), Pull Down (-ls_y) -> Flex (-)
+        elbow_delta = gp.left_stick_y * self.elbow_speed_dps * dt
+        # Push Right (+ls_x) -> Roll CW (+), Push Left (-ls_x) -> Roll CCW (-)
+        roll_delta = gp.left_stick_x * self.roll_speed_dps * dt
+
+        # 4. D-Pad: Wrist Flex pitch (Up / Down) and fine roll (Left / Right)
+        flex_delta = float(gp.dpad_y) * self.flex_speed_dps * dt
+        if gp.dpad_x != 0:
+            roll_delta += float(gp.dpad_x) * (self.roll_speed_dps * 0.5) * dt
+
+        # 5. Integrate joint targets
+        self.current_gamepad_target["shoulder_pan.pos"] += pan_delta
+        self.current_gamepad_target["shoulder_lift.pos"] += lift_delta
+        self.current_gamepad_target["elbow_flex.pos"] += elbow_delta
+        self.current_gamepad_target["wrist_flex.pos"] += flex_delta
+        self.current_gamepad_target["wrist_roll.pos"] += roll_delta
+
+        # 6. Gripper rate control: RB closes, LB opens
+        if gp.button_rb_held:
+            self.current_gamepad_target["gripper.pos"] += self.gripper_speed_pct_s * dt
+        elif gp.button_lb_held:
+            self.current_gamepad_target["gripper.pos"] -= self.gripper_speed_pct_s * dt
+
+        # Button A toggles gripper
+        if gp.button_a_pressed:
+            if self.current_gamepad_target["gripper.pos"] > 40.0:
+                self.current_gamepad_target["gripper.pos"] = 0.0
+            else:
+                self.current_gamepad_target["gripper.pos"] = 85.0
+
+        # 7. Clamp to safe calibrated joint limits
+        for joint, (j_min, j_max) in self.joint_limits.items():
+            if joint in self.current_gamepad_target:
+                self.current_gamepad_target[joint] = max(
+                    j_min, min(j_max, self.current_gamepad_target[joint])
+                )
+
+        # 8. Command follower arm
+        self.send_follower_action(self.current_gamepad_target)
+        return dict(self.current_gamepad_target)
 
     def disconnect(self):
         """Safely disconnect arms and disable torque."""
