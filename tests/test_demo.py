@@ -1,7 +1,6 @@
 """Unit Tests for MIDI Mobile Manipulator Demo."""
 
 import math
-import pytest
 from src.arm_controller import cosine_interpolate, ArmController, DEFAULT_STOW_POSE
 from src.base_controller import BaseController
 from src.ddsm import calculate_crc8, MotorFeedback, DDSMDriver
@@ -128,3 +127,20 @@ def test_state_machine_transitions_simulation():
     sm._handle_base_drive(gp_state, dt=0.02)
     assert sm.state == DemoState.WAITING_FOR_LEADER
     assert base.is_locked is True
+
+
+if __name__ == "__main__":
+    test_ddsm_crc8_spec()
+    print("  [PASS] test_ddsm_crc8_spec")
+    test_cosine_interpolation()
+    print("  [PASS] test_cosine_interpolation")
+    test_differential_drive_straight()
+    print("  [PASS] test_differential_drive_straight")
+    test_differential_drive_pivot()
+    print("  [PASS] test_differential_drive_pivot")
+    test_slew_rate_acceleration()
+    print("  [PASS] test_slew_rate_acceleration")
+    test_state_machine_transitions_simulation()
+    print("  [PASS] test_state_machine_transitions_simulation")
+    print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
+
