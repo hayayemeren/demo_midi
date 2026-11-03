@@ -1,0 +1,67 @@
+# ==============================================================================
+# MIDI Mobile Manipulator Demo Configuration
+# Mode 1: Logitech F710 Gamepad Base Drive (Arm Stowed)
+# Mode 2: 1:1 SO-100 Live Arm Teleoperation (Base Locked with Electric Brakes)
+# ==============================================================================
+
+# RS485 Serial Bus for DDSM Hub Motors
+serial:
+  port: "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BH002HMM-if00-port0"
+  fallback_port: "/dev/ttyUSB0"
+  baudrate: 115200
+  timeout: 0.02
+
+# DDSM Motors Configuration
+motors:
+  type: "ddsm115"               # ddsm115 or ddsm210
+  left_id: 1                    # RS485 ID of Left Motor
+  right_id: 2                   # RS485 ID of Right Motor
+  invert_left: false            # Invert direction if mounted mirrored
+  invert_right: true
+
+# Mobile Base Dynamics & Kinematics
+robot:
+  turn_ratio: 0.65              # Pivot turn speed ratio
+  turn_dir: 1                   # Turn direction (+1 or -1)
+  accel_rate: 1500.0            # Acceleration in RPM/s (smooth takeoff)
+  decel_rate: 1000.0            # Deceleration in RPM/s on releasing stick
+  brake_rate: 3000.0            # Emergency brake rate in RPM/s
+  wheel_radius: 0.0575          # meters (115mm diameter / 2)
+  wheel_base: 0.350             # meters (track width)
+
+# Logitech F710 Wireless Gamepad (evdev)
+gamepad:
+  device_path: null             # null = auto-detect (/dev/input/by-id/*F710*)
+  deadzone: 0.10                # Analog stick center deadzone
+  speed_levels: [50.0, 100.0, 150.0, 200.0]  # RPM levels (LB = speed up, RB = speed down)
+  default_speed_level: 1        # Starting index (Level 2 = 100 RPM)
+  switch_button: "Y"            # Button to toggle modes ("Y", "X", "A", "BACK")
+
+# SO-100 Robotic Arms (LeRobot)
+arm:
+  # Follower arm mounted on the mobile chassis
+  follower_port: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6084008-if00"
+  follower_fallback_port: "/dev/ttyACM0"
+  follower_id: "so100_follower"
+
+  # Leader arm used by people for teleoperation
+  leader_port: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6084621-if00"
+  leader_fallback_port: "/dev/ttyACM1"
+  leader_id: "so100_leader"
+
+  use_degrees: true             # Joint positions in degrees
+  interpolation_time_s: 1.5     # Seconds for smooth S-curve stow / sync transitions
+
+  # Safe resting / stowed travel pose when driving the mobile base
+  stow_pose:
+    shoulder_pan.pos: 0.0
+    shoulder_lift.pos: -95.0
+    elbow_flex.pos: 25.0
+    wrist_flex.pos: 95.0
+    wrist_roll.pos: 0.0
+    gripper.pos: 5.0
+
+# Control Loop Timing
+control:
+  loop_hz: 50.0                 # Control loop frequency (50 Hz = 20ms)
+  telemetry_interval: 0.20      # Dashboard print interval in seconds
