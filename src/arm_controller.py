@@ -64,7 +64,7 @@ class ArmController:
         self.use_degrees = bool(arm_cfg.get("use_degrees", True))
         self.stow_pose = arm_cfg.get("stow_pose", DEFAULT_STOW_POSE)
         self.interpolation_time = float(arm_cfg.get("interpolation_time_s", 1.5))
-        self.invert_shoulder_pan = bool(arm_cfg.get("invert_shoulder_pan", True))
+        self.invert_shoulder_pan = bool(arm_cfg.get("invert_shoulder_pan", False))
         self.invert_wrist_roll = bool(arm_cfg.get("invert_wrist_roll", False))
 
         self.follower = None

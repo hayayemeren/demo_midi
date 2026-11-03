@@ -37,7 +37,7 @@ class BaseController:
 
         robot_cfg = config.get("robot", {})
         self.turn_ratio = float(robot_cfg.get("turn_ratio", 0.65))
-        self.turn_dir = int(robot_cfg.get("turn_dir", 1))
+        self.turn_dir = int(robot_cfg.get("turn_dir", -1))
         self.accel_rate = float(robot_cfg.get("accel_rate", 1500.0))    # RPM / s
         self.decel_rate = float(robot_cfg.get("decel_rate", 1000.0))   # RPM / s on release
         self.brake_rate = float(robot_cfg.get("brake_rate", 3000.0))   # RPM / s on brake

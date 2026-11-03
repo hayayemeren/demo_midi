@@ -141,20 +141,35 @@ def test_state_machine_transitions_simulation():
     assert base.is_locked is True
 
 
-def test_arm_joint_inversion():
-    """Verify that invert_shoulder_pan reverses the pan angle correctly."""
+def test_base_steering_direction():
+    """Verify that pushing stick left with turn_dir=-1 turns robot left (CCW)."""
+    cfg = {
+        "dry_run": True,
+        "serial": {"port": "/dev/null"},
+        "motors": {"left_id": 1, "right_id": 2},
+        "robot": {"turn_ratio": 0.65, "turn_dir": -1},
+    }
+    base = BaseController(cfg, dry_run=True)
+    base.connect()
+    # Pushing stick left (turn = +1.0)
+    base.drive(forward=0.0, turn=1.0, max_rpm=100.0, dt=0.02)
+    # Left wheel should turn backward (negative), right wheel forward (positive) -> Turn Left!
+    assert base.cur_left_rpm < 0.0
+    assert base.cur_right_rpm > 0.0
+
+
+def test_arm_joint_standard_1to1():
+    """Verify that default arm rotation is standard 1:1 (unaltered)."""
     cfg = {
         "dry_run": True,
         "arm": {
-            "invert_shoulder_pan": True,
-            "invert_wrist_roll": False,
+            "invert_shoulder_pan": False,
         },
     }
     arm = ArmController(cfg, dry_run=True)
-    # Simulate leader moved +35 degrees to the left
     arm.sim_leader_pose = {"shoulder_pan.pos": 35.0, "shoulder_lift.pos": -50.0}
     leader_pose = arm.get_leader_pose()
-    assert leader_pose["shoulder_pan.pos"] == -35.0
+    assert leader_pose["shoulder_pan.pos"] == 35.0
     assert leader_pose["shoulder_lift.pos"] == -50.0
 
 
@@ -169,9 +184,12 @@ if __name__ == "__main__":
     print("  [PASS] test_differential_drive_pivot")
     test_slew_rate_acceleration()
     print("  [PASS] test_slew_rate_acceleration")
-    test_arm_joint_inversion()
-    print("  [PASS] test_arm_joint_inversion")
+    test_base_steering_direction()
+    print("  [PASS] test_base_steering_direction")
+    test_arm_joint_standard_1to1()
+    print("  [PASS] test_arm_joint_standard_1to1")
     test_state_machine_transitions_simulation()
     print("  [PASS] test_state_machine_transitions_simulation")
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
+
 

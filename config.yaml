@@ -22,7 +22,7 @@ motors:
 # Mobile Base Dynamics & Kinematics
 robot:
   turn_ratio: 0.65              # Pivot turn speed ratio
-  turn_dir: 1                   # Turn direction (+1 or -1)
+  turn_dir: -1                  # Turn direction multiplier (-1 = Left stick left -> turn CCW/Left)
   accel_rate: 1500.0            # Acceleration in RPM/s (smooth takeoff)
   decel_rate: 1000.0            # Deceleration in RPM/s on releasing stick
   brake_rate: 3000.0            # Emergency brake rate in RPM/s
@@ -50,8 +50,8 @@ arm:
   leader_id: "so100_leader"
 
   use_degrees: true             # Joint positions in degrees
-  invert_shoulder_pan: true     # Invert left/right (pan) direction so leader and follower match
-  invert_wrist_roll: false      # Invert wrist rotation if needed
+  invert_shoulder_pan: false    # Do not alter robot arm rotation (standard 1:1)
+  invert_wrist_roll: false
   interpolation_time_s: 1.5     # Seconds for smooth S-curve stow / sync transitions
 
   # Safe resting / stowed travel pose when driving the mobile base
