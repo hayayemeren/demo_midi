@@ -128,20 +128,28 @@ class SockDetector:
     def __init__(
         self,
         mode: str = "auto",
-        min_area: float = 600.0,
-        max_area: float = 80000.0,
+        min_area: float = 1000.0,
+        max_area: float = 60000.0,
+        contrast_threshold: float = 38.0,
+        border_margin: int = 12,
         save_debug_image: bool = True,
         debug_image_path: str = "/tmp/sock_detection.jpg",
         roi_top_pct: float = 0.10,
-        roi_bottom_pct: float = 0.78,
+        roi_bottom_pct: float = 0.68,
+        roi_left_pct: float = 0.12,
+        roi_right_pct: float = 0.88,
     ):
         self.mode = mode.lower()
         self.min_area = min_area
         self.max_area = max_area
+        self.contrast_threshold = contrast_threshold
+        self.border_margin = border_margin
         self.save_debug_image = save_debug_image
         self.debug_image_path = debug_image_path
         self.roi_top_pct = roi_top_pct
         self.roi_bottom_pct = roi_bottom_pct
+        self.roi_left_pct = roi_left_pct
+        self.roi_right_pct = roi_right_pct
 
     def detect(self, frame: np.ndarray) -> DetectionResult:
         """Process image frame to locate the sock on the floor."""
@@ -152,40 +160,42 @@ class SockDetector:
         center_x = w / 2.0
         center_y = h / 2.0
 
-        # 1. Define active floor Region of Interest (ROI) to exclude arm base and cyan finger tips
+        # 1. Define active floor Region of Interest (ROI)
+        # Excludes lens edge vignetting (left/right) and cyan gripper finger tips (bottom)
+        x_min = int(w * self.roi_left_pct)
+        x_max = int(w * self.roi_right_pct)
         y_min = int(h * self.roi_top_pct)
         y_max = int(h * self.roi_bottom_pct)
 
-        roi = frame[y_min:y_max, :]
+        roi = frame[y_min:y_max, x_min:x_max]
         roi_h, roi_w = roi.shape[:2]
 
-        # 2. Mask out Cyan/Teal gripper fingers (Hue 80-110 in OpenCV HSV)
+        # 2. Mask out Cyan/Teal gripper fingers (Hue 75-115 in OpenCV HSV)
         hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         cyan_mask = cv2.inRange(hsv_roi, np.array([75, 70, 70]), np.array([115, 255, 255]))
 
         # 3. Create foreground candidate mask
         if self.mode == "contrast" or self.mode == "auto":
-            # Grayscale saliency / Otsu thresholding against floor
             gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+            blurred = cv2.GaussianBlur(gray, (9, 9), 0)
             
-            # Detect objects darker or brighter than average floor background
-            floor_mean = np.median(blurred)
-            diff = np.abs(blurred.astype(np.float32) - floor_mean).astype(np.uint8)
-            _, thresh = cv2.threshold(diff, 28, 255, cv2.THRESH_BINARY)
+            # Detect objects darker or brighter than median floor background
+            floor_median = np.median(blurred)
+            diff = np.abs(blurred.astype(np.float32) - floor_median).astype(np.uint8)
+            _, thresh = cv2.threshold(diff, self.contrast_threshold, 255, cv2.THRESH_BINARY)
         else:
             # Color mode: general dark / colored object mask
             sat = hsv_roi[:, :, 1]
             val = hsv_roi[:, :, 2]
             thresh = cv2.bitwise_or(
-                cv2.inRange(sat, 45, 255),        # Chromatic / colored socks
-                cv2.inRange(val, 0, 75)           # Dark / black socks
+                cv2.inRange(sat, 50, 255),        # Chromatic / colored socks
+                cv2.inRange(val, 0, 70)           # Dark / black socks
             )
 
         # Exclude cyan gripper areas
         thresh = cv2.bitwise_and(thresh, cv2.bitwise_not(cyan_mask))
 
-        # Morphological filtering to remove dust specks and bridge cloth folds
+        # Morphological filtering to clean noise and bridge cloth folds
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -201,26 +211,46 @@ class SockDetector:
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if self.min_area <= area <= self.max_area:
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+
+                # RULE A: Discard contours touching the ROI boundary (vignetting, lens borders, background objects)
+                if (
+                    bx <= self.border_margin
+                    or by <= self.border_margin
+                    or (bx + bw) >= (roi_w - self.border_margin)
+                    or (by + bh) >= (roi_h - self.border_margin)
+                ):
+                    continue
+
+                # RULE B: Discard abnormal aspect ratios (thin vertical/horizontal edge shadows or scratches)
+                aspect = float(bw) / max(1, bh)
+                if aspect < 0.25 or aspect > 4.0:
+                    continue
+
+                # RULE C: Discard non-compact contours (stringy noise or floor seams)
+                extent = area / float(max(1, bw * bh))
+                if extent < 0.25:
+                    continue
+
                 # Find centroid using image moments
                 M = cv2.moments(cnt)
                 if M["m00"] > 0:
-                    cx = float(M["m10"] / M["m00"])
+                    cx = float(M["m10"] / M["m00"]) + x_min
                     cy = float(M["m01"] / M["m00"]) + y_min
-                    bx, by, bw, bh = cv2.boundingRect(cnt)
-                    by += y_min
+                    global_bx = bx + x_min
+                    global_by = by + y_min
 
                     # Prioritize larger valid cloth contours
                     if area > best_area:
                         best_area = area
                         best_contour = cnt
                         best_center = (cx, cy)
-                        best_bbox = (bx, by, bw, bh)
+                        best_bbox = (global_bx, global_by, bw, bh)
 
         # 5. Build annotation overlay
         annotated = frame.copy()
         # Draw search ROI bounds
-        cv2.line(annotated, (0, y_min), (w, y_min), (100, 100, 100), 1, cv2.LINE_AA)
-        cv2.line(annotated, (0, y_max), (w, y_max), (100, 100, 100), 1, cv2.LINE_AA)
+        cv2.rectangle(annotated, (x_min, y_min), (x_max, y_max), (100, 100, 100), 1, cv2.LINE_AA)
         # Draw central grasp reticle
         cv2.drawMarker(annotated, (int(center_x), int(center_y)), (0, 255, 255), cv2.MARKER_CROSS, 20, 1)
 
@@ -251,7 +281,7 @@ class SockDetector:
                 annotated_frame=annotated,
             )
         else:
-            cv2.putText(annotated, "SEARCHING FOR SOCK...", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(annotated, "NO SOCK DETECTED", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             result = DetectionResult(found=False, annotated_frame=annotated)
 
         # Save debug inspection snapshot
@@ -273,7 +303,8 @@ class VisionGraspPlanner:
         self.pan_gain = float(serv.get("pan_gain", 22.0))
         self.lift_gain = float(serv.get("lift_gain", 15.0))
         self.align_tolerance = float(serv.get("align_tolerance", 0.12))
-        self.grasp_verification_threshold = float(c4.get("grasp_verification_threshold_pct", 10.0))
+        self.grasp_verification_threshold = float(c4.get("grasp_verification_threshold_pct", 12.0))
+        self.scan_sweep_angles = c4.get("scan_sweep_angles", [0.0, -28.0, 28.0])
 
         # Default poses
         self.scan_pose = c4.get("scan_pose", {
@@ -284,11 +315,12 @@ class VisionGraspPlanner:
             "wrist_roll.pos": 0.0,
             "gripper.pos": 10.0,
         })
+        # Basket is mounted directly behind the gripper centerline and slightly elevated
         self.basket_pose = c4.get("basket_pose", {
-            "shoulder_pan.pos": -95.0,
-            "shoulder_lift.pos": -45.0,
-            "elbow_flex.pos": 30.0,
-            "wrist_flex.pos": 60.0,
+            "shoulder_pan.pos": 0.0,
+            "shoulder_lift.pos": -80.0,
+            "elbow_flex.pos": 20.0,
+            "wrist_flex.pos": 50.0,
             "wrist_roll.pos": 0.0,
             "gripper.pos": 85.0,
         })
@@ -321,20 +353,25 @@ class VisionGraspPlanner:
         is_aligned = abs(detection.error_x) <= self.align_tolerance
         return aligned, is_aligned
 
-    def compute_grasp_pose(self, aligned_pose: Dict[str, float]) -> Dict[str, float]:
-        """Compute final downward descent pose to clamp the sock on the floor."""
+    def compute_grasp_pose(
+        self,
+        aligned_pose: Dict[str, float],
+        descent_lift_deg: float = 16.0,
+        descent_elbow_deg: float = 12.0,
+    ) -> Dict[str, float]:
+        """Compute final downward descent pose to hover right at floor level."""
         grasp = dict(aligned_pose)
-        # Open gripper and lower down to floor
-        grasp["shoulder_lift.pos"] = float(np.clip(grasp.get("shoulder_lift.pos", -50.0) + 20.0, -90.0, 10.0))
-        grasp["elbow_flex.pos"] = float(np.clip(grasp.get("elbow_flex.pos", 35.0) + 15.0, -20.0, 80.0))
+        grasp["shoulder_lift.pos"] = float(np.clip(grasp.get("shoulder_lift.pos", -50.0) + descent_lift_deg, -90.0, 0.0))
+        grasp["elbow_flex.pos"] = float(np.clip(grasp.get("elbow_flex.pos", 35.0) + descent_elbow_deg, -20.0, 70.0))
         grasp["wrist_flex.pos"] = float(np.clip(grasp.get("wrist_flex.pos", 70.0) + 10.0, 0.0, 100.0))
-        grasp["gripper.pos"] = 0.0  # Clamp firmly
+        grasp["gripper.pos"] = 0.0  # Clamp target
         return grasp
 
     def verify_grasp(self, measured_gripper_pct: float) -> bool:
-        """Verify if sock is caught between jaws (Suggestion 2).
+        """Verify if sock is caught between jaws while elevated off floor.
         
-        If gripper closed fully (e.g. < 10%), jaws are empty.
-        If gripper stopped at > 10%, cloth is trapped inside.
+        When elevated:
+        - If empty, jaws close fully to < 8%.
+        - If holding cloth, jaws are blocked at >= 12%.
         """
         return measured_gripper_pct >= self.grasp_verification_threshold

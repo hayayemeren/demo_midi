@@ -111,8 +111,10 @@ class DemoStateMachine:
             det_cfg = c4.get("detection", {})
             self.detector = SockDetector(
                 mode=det_cfg.get("mode", "auto"),
-                min_area=float(det_cfg.get("min_area", 600.0)),
+                min_area=float(det_cfg.get("min_area", 1000.0)),
                 max_area=float(det_cfg.get("max_area", 80000.0)),
+                contrast_threshold=float(det_cfg.get("contrast_threshold", 38.0)),
+                border_margin=int(det_cfg.get("border_margin", 12)),
                 save_debug_image=bool(det_cfg.get("save_debug_image", True)),
                 debug_image_path=det_cfg.get("debug_image_path", "/tmp/sock_detection.jpg"),
             )
@@ -400,7 +402,7 @@ class DemoStateMachine:
             self.server.send_telemetry(telemetry)
 
     def _handle_autonomous_scan(self, gp: GamepadState):
-        """Case 4: Locks base, moves arm to scan pose, and inspects floor for socks with wrist camera."""
+        """Case 4: Locks base, sweeps wrist camera across floor (center, left, right), detects sock."""
         self.base.hold_lock()
 
         # Allow user to abort with B or switch button
@@ -414,43 +416,53 @@ class DemoStateMachine:
             self.state = DemoState.PARKING
             return
 
-        logger.info("\n[CASE 4] Moving Follower to Scan Pose to inspect floor...")
-        self.arm.move_to_pose(
-            self.planner.scan_pose,
-            duration_s=1.2,
-            feedback_cb=lambda _: self.base.hold_lock(),
+        sweep_angles = getattr(self.planner, "scan_sweep_angles", [0.0, -28.0, 28.0])
+        logger.info(
+            f"\n{COLOR_BOLD}{COLOR_MAGENTA}>>> [CASE 4] EXECUTING FULL FLOOR SCAN SWEEP (Angles: {sweep_angles}) <<<{COLOR_RESET}"
         )
 
-        # Brief pause for frame stabilization
-        time.sleep(0.15)
-        self.base.hold_lock()
+        detected_sock = None
+        for angle in sweep_angles:
+            if (not self.running and not self.arm.dry_run) or gp.brake or gp.button_b_held:
+                break
 
-        ok, frame = self.camera.capture_frame()
-        if not ok or frame is None:
-            logger.warning("[CASE 4] Camera capture failed. Retrying...")
-            self.scan_retries += 1
-            if self.scan_retries >= self.max_scan_retries:
-                self.state = DemoState.PARKING
-            return
-
-        det = self.detector.detect(frame)
-        if det.found:
-            self.last_detection = det
-            logger.info(
-                f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [VISION] SOCK DETECTED! <<<{COLOR_RESET}\n"
-                f"Position: ({det.cx:.0f}, {det.cy:.0f}) | Offset: eX={det.error_x:+.2f}, eY={det.error_y:+.2f} | Area: {det.area:.0f}px\n"
-                f"Debug image saved to: {self.detector.debug_image_path}\n"
+            logger.info(f"[SCAN] Sweeping camera to pan angle: {angle:+.1f}°...")
+            scan_target = dict(self.planner.scan_pose)
+            scan_target["shoulder_pan.pos"] = float(angle)
+            self.arm.move_to_pose(
+                scan_target,
+                duration_s=0.9,
+                feedback_cb=lambda _: self.base.hold_lock(),
             )
+            time.sleep(0.20)
+            self.base.hold_lock()
+
+            ok, frame = self.camera.capture_frame()
+            if not ok or frame is None:
+                continue
+
+            det = self.detector.detect(frame)
+            if det.found:
+                detected_sock = det
+                logger.info(
+                    f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [VISION] SOCK DETECTED AT {angle:+.1f}° SWEEP! <<<{COLOR_RESET}\n"
+                    f"Position: ({det.cx:.0f}, {det.cy:.0f}) | Offset: eX={det.error_x:+.2f}, eY={det.error_y:+.2f} | Area: {det.area:.0f}px\n"
+                    f"Debug image saved to: {self.detector.debug_image_path}\n"
+                )
+                break
+            else:
+                logger.info(f"[SCAN] No sock at {angle:+.1f}°. Continuing sweep...")
+
+        if detected_sock is not None:
+            self.last_detection = detected_sock
             self.align_iterations = 0
             self.state = DemoState.AUTONOMOUS_PICK_ALIGN
         else:
-            self.scan_retries += 1
             logger.warning(
-                f"\n{COLOR_YELLOW}[VISION] No sock detected in view (Attempt {self.scan_retries}/{self.max_scan_retries}).{COLOR_RESET}"
+                f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [SCAN COMPLETE] NO SOCK DETECTED ON FLOOR! <<<{COLOR_RESET}\n"
+                f"Halting autonomous sequence. Returning to BASE DRIVE mode.\n"
             )
-            if self.scan_retries >= self.max_scan_retries:
-                logger.info("[VISION] Search timeout. Parking arm and returning to BASE DRIVE.")
-                self.state = DemoState.PARKING
+            self.state = DemoState.PARKING
 
     def _handle_autonomous_align(self, gp: GamepadState):
         """Case 4: Adjusts pan and reach to center the sock in the gripper's line of approach."""
@@ -495,7 +507,7 @@ class DemoStateMachine:
         self.state = DemoState.AUTONOMOUS_PICK_GRASP
 
     def _handle_autonomous_grasp(self, gp: GamepadState):
-        """Case 4: Opens gripper, descends to floor height, and firmly clamps the sock."""
+        """Case 4: Opens gripper, descends to floor height, clamps the sock, and elevates off floor."""
         self.base.hold_lock()
 
         if gp.brake or gp.button_b_held:
@@ -511,82 +523,83 @@ class DemoStateMachine:
         cur_pose = self.arm.get_follower_pose()
         open_pose = dict(cur_pose)
         open_pose["gripper.pos"] = 85.0
-        self.arm.move_to_pose(open_pose, duration_s=0.5, feedback_cb=lambda _: self.base.hold_lock())
+        self.arm.move_to_pose(open_pose, duration_s=0.6, feedback_cb=lambda _: self.base.hold_lock())
 
         logger.info("[GRASP] 2. Lowering arm down to floor grasp pose...")
         grasp_pose = self.planner.compute_grasp_pose(open_pose)
-        # Keep open while descending
         grasp_descend = dict(grasp_pose)
         grasp_descend["gripper.pos"] = 85.0
         self.arm.move_to_pose(grasp_descend, duration_s=1.0, feedback_cb=lambda _: self.base.hold_lock())
 
-        logger.info("[GRASP] 3. Clamping gripper jaws onto sock...")
+        logger.info("[GRASP] 3. Clamping gripper jaws onto sock (0%)...")
         grasp_clamp = dict(grasp_descend)
         grasp_clamp["gripper.pos"] = 0.0
-        self.arm.send_follower_action(grasp_clamp)
-        time.sleep(0.6)
+        self.arm.move_to_pose(grasp_clamp, duration_s=0.8, feedback_cb=lambda _: self.base.hold_lock())
+        time.sleep(0.3)
+        self.base.hold_lock()
+
+        logger.info("[GRASP] 4. Elevating arm off floor to verify grasp...")
+        lift_verify_pose = dict(grasp_clamp)
+        lift_verify_pose["shoulder_lift.pos"] -= 15.0  # elevate shoulder
+        lift_verify_pose["elbow_flex.pos"] -= 10.0     # pull up elbow
+        self.arm.move_to_pose(lift_verify_pose, duration_s=0.6, feedback_cb=lambda _: self.base.hold_lock())
+        time.sleep(0.3)
         self.base.hold_lock()
 
         self.state = DemoState.AUTONOMOUS_PICK_VERIFY
 
     def _handle_autonomous_verify(self, gp: GamepadState):
-        """Case 4 (Suggestion 2): Checks gripper position to verify that cloth was caught."""
+        """Case 4 (Suggestion 2): Checks gripper position while elevated to verify that cloth was caught."""
         self.base.hold_lock()
 
         cur_pose = self.arm.get_follower_pose()
         measured_grip = cur_pose.get("gripper.pos", 0.0)
         if self.arm.dry_run:
-            measured_grip = 25.0  # Simulate successful cloth grip in dry-run mode
+            measured_grip = 25.0
 
         is_caught = self.planner.verify_grasp(measured_grip) if self.planner else False
 
         if is_caught:
             logger.info(
-                f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [GRASP VERIFIED] SUCCESS! Sock securely held (Grip: {measured_grip:.1f}% > {self.planner.grasp_verification_threshold:.1f}%). <<<{COLOR_RESET}\n"
-                f"Proceeding to Basket Deposit routine..."
+                f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [GRASP VERIFIED] SUCCESS! Sock securely held (Grip: {measured_grip:.1f}% >= {self.planner.grasp_verification_threshold:.1f}%). <<<{COLOR_RESET}\n"
+                f"Transporting sock to basket..."
             )
             self.state = DemoState.AUTONOMOUS_BASKET_DUMP
         else:
             logger.warning(
-                f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP MISSED] Gripper closed empty (Grip: {measured_grip:.1f}% <= {self.planner.grasp_verification_threshold:.1f}%). <<<{COLOR_RESET}\n"
-                f"Aborting pickup and returning to driving."
+                f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP MISSED] Gripper is empty (Grip: {measured_grip:.1f}% < {self.planner.grasp_verification_threshold:.1f}%). <<<{COLOR_RESET}\n"
+                f"No sock was caught. Returning to driving."
             )
-            # Reopen slightly to prevent floor pinching
             cur_pose["gripper.pos"] = 40.0
             self.arm.move_to_pose(cur_pose, duration_s=0.5, feedback_cb=lambda _: self.base.hold_lock())
             self.state = DemoState.PARKING
 
     def _handle_autonomous_basket(self, gp: GamepadState):
-        """Case 4: Smoothly lifts sock, moves over chassis-mounted basket, opens gripper, and parks."""
+        """Case 4: Smoothly moves arm over chassis-mounted basket (behind and a little up), drops sock, and parks."""
         self.base.hold_lock()
 
         if self.planner is None:
             self.state = DemoState.PARKING
             return
 
-        logger.info("\n[BASKET] 1. Lifting arm to safe travel height...")
-        cur_pose = self.arm.get_follower_pose()
-        lift_pose = dict(cur_pose)
-        lift_pose["shoulder_lift.pos"] = -40.0
-        lift_pose["elbow_flex.pos"] = 25.0
-        self.arm.move_to_pose(lift_pose, duration_s=0.8, feedback_cb=lambda _: self.base.hold_lock())
-
-        logger.info("[BASKET] 2. Swiveling arm to chassis collection basket...")
+        logger.info("\n[BASKET] 1. Moving arm over collection basket (behind gripper, elevated)...")
+        transit_pose = dict(self.planner.basket_pose)
+        transit_pose["gripper.pos"] = 0.0  # Hold sock firmly during transit
         self.arm.move_to_pose(
-            self.planner.basket_pose,
-            duration_s=1.5,
+            transit_pose,
+            duration_s=1.2,
             feedback_cb=lambda _: self.base.hold_lock(),
         )
 
-        logger.info("[BASKET] 3. Releasing sock into basket...")
-        drop_pose = dict(self.planner.basket_pose)
+        logger.info("[BASKET] 2. Releasing sock into basket (opening gripper to 85%)...")
+        drop_pose = dict(transit_pose)
         drop_pose["gripper.pos"] = 85.0
-        self.arm.send_follower_action(drop_pose)
-        time.sleep(0.7)
+        self.arm.move_to_pose(drop_pose, duration_s=0.5, feedback_cb=lambda _: self.base.hold_lock())
+        time.sleep(0.5)
         self.base.hold_lock()
 
         logger.info(
-            f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [BASKET COMPLETE] Sock deposited successfully! <<<{COLOR_RESET}\n"
+            f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [BASKET COMPLETE] Sock deposited successfully into basket! <<<{COLOR_RESET}\n"
         )
         self.state = DemoState.PARKING
 

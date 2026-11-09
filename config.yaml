@@ -110,24 +110,29 @@ case4:
     wrist_roll.pos: 0.0
     gripper.pos: 10.0
 
+  # Multi-angle floor search sweep (shoulder_pan angles in degrees)
+  scan_sweep_angles: [0.0, -28.0, 28.0]
+
   # Basket Pose: Chassis-mounted collection basket on the mobile base
+  # Located directly behind the gripper centerline and elevated
   basket_pose:
-    shoulder_pan.pos: -95.0
-    shoulder_lift.pos: -45.0
-    elbow_flex.pos: 30.0
-    wrist_flex.pos: 60.0
+    shoulder_pan.pos: 0.0
+    shoulder_lift.pos: -80.0
+    elbow_flex.pos: 20.0
+    wrist_flex.pos: 50.0
     wrist_roll.pos: 0.0
     gripper.pos: 85.0
-
   # Suggestion 2: Tactile / Position grasp verification threshold (%)
-  # If measured gripper > 10.0%, cloth is caught between jaws (Success!)
-  grasp_verification_threshold_pct: 10.0
+  # Checked while elevated: empty jaws close < 8%; trapped cloth holds jaws >= 12%
+  grasp_verification_threshold_pct: 12.0
 
   # Vision Detection Settings
   detection:
     mode: "auto"                # "auto", "contrast", or "color"
-    min_area: 600.0             # minimum contour area (pixels)
+    min_area: 1000.0            # minimum contour area (pixels)
     max_area: 80000.0           # maximum contour area (pixels)
+    contrast_threshold: 38.0    # threshold against median floor background
+    border_margin: 12           # pixels from ROI edge to reject border vignetting
     save_debug_image: true      # save annotated frame for live operator inspection
     debug_image_path: "/tmp/sock_detection.jpg"
 

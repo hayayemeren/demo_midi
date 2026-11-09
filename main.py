@@ -134,6 +134,106 @@ def select_case_interactive(default_case: Optional[int] = None) -> int:
             print("Invalid selection. Please enter 1, 2, 3, 4, or Q.")
 
 
+def update_config_basket_pose(config_path: str, pose: dict) -> bool:
+    """Save calibrated basket pose into config.yaml, preserving file comments and formatting."""
+    import re
+    if not os.path.exists(config_path):
+        logging.error("Config file %s does not exist!", config_path)
+        return False
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    new_basket_block = (
+        "  basket_pose:\n"
+        f"    shoulder_pan.pos: {pose.get('shoulder_pan.pos', 0.0):.1f}\n"
+        f"    shoulder_lift.pos: {pose.get('shoulder_lift.pos', -80.0):.1f}\n"
+        f"    elbow_flex.pos: {pose.get('elbow_flex.pos', 20.0):.1f}\n"
+        f"    wrist_flex.pos: {pose.get('wrist_flex.pos', 50.0):.1f}\n"
+        f"    wrist_roll.pos: {pose.get('wrist_roll.pos', 0.0):.1f}\n"
+        f"    gripper.pos: 85.0"
+    )
+
+    pattern = r"  basket_pose:\n(?:    [a-z_.]+: -?[0-9.]+\n?)+"
+    if re.search(pattern, content):
+        new_content = re.sub(pattern, new_basket_block, content, count=1)
+    else:
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            cfg.setdefault("case4", {})["basket_pose"] = {
+                "shoulder_pan.pos": round(float(pose.get("shoulder_pan.pos", 0.0)), 1),
+                "shoulder_lift.pos": round(float(pose.get("shoulder_lift.pos", -80.0)), 1),
+                "elbow_flex.pos": round(float(pose.get("elbow_flex.pos", 20.0)), 1),
+                "wrist_flex.pos": round(float(pose.get("wrist_flex.pos", 50.0)), 1),
+                "wrist_roll.pos": round(float(pose.get("wrist_roll.pos", 0.0)), 1),
+                "gripper.pos": 85.0,
+            }
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+            return True
+        except Exception as e:
+            logging.error("Failed to update config.yaml: %s", e)
+            return False
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+    return True
+
+
+def teach_basket(config_path: str, dry_run: bool = False):
+    """Interactive utility to teach and record the chassis basket drop-off pose."""
+    print("\n" + "=" * 64)
+    print("         TEACH CHASSIS BASKET POSE (CASE 4 CALIBRATION)")
+    print("=" * 64)
+    print("1. Connecting to SO-100 Follower arm...")
+    config = load_config(config_path)
+    arm = ArmController(config, dry_run=dry_run)
+
+    if not arm.connect_follower():
+        print(f"Error: Could not connect to Follower Arm on {arm.follower_port}")
+        return
+
+    print("2. Disabling motor torque so you can move the arm freely by hand...")
+    if not dry_run and arm.follower is not None:
+        try:
+            arm.follower.bus.disable_torque()
+            print("   >>> TORQUE DISABLED! Arm is now limp. <<<")
+        except Exception as e:
+            print(f"   Warning: Could not disable torque automatically: {e}")
+    else:
+        print("   [DRY RUN] Simulation mode.")
+
+    print("\n3. Instructions:")
+    print("   - Physically guide the follower arm over your chassis basket.")
+    print("   - Make sure it is centered over the basket and elevated enough.")
+    print("   - Press [ENTER] when the arm is in the desired release position.")
+    print("   - Or press [Ctrl+C] to cancel.\n")
+
+    try:
+        input("Press [ENTER] to capture current arm pose... ")
+    except (KeyboardInterrupt, EOFError):
+        print("\nTeaching cancelled.")
+        return
+
+    pose = arm.get_follower_pose()
+    print("\n>>> CAPTURED BASKET POSE: <<<")
+    for joint in ["shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos", "wrist_flex.pos", "wrist_roll.pos"]:
+        val = round(float(pose.get(joint, 0.0)), 1)
+        print(f"  {joint}: {val:+.1f}°")
+    print("  gripper.pos: 85.0% (Open for release)")
+
+    confirm = input("\nSave this pose to config.yaml as case4.basket_pose? [Y/n]: ").strip().lower()
+    if confirm in ("", "y", "yes"):
+        if update_config_basket_pose(config_path, pose):
+            print(f"\n[SUCCESS] New basket pose saved to '{config_path}'!")
+            print("The autonomous sequence in Case 4 will now drop socks at this location.\n")
+        else:
+            print(f"\n[ERROR] Failed to save pose to '{config_path}'.")
+    else:
+        print("\nPose was NOT saved.")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="MIDI Mobile Manipulator: Base Drive & Arm Teleop Switch"
@@ -156,6 +256,11 @@ def parse_args():
         help="Run in simulation mode without physical hardware connected"
     )
     parser.add_argument(
+        "--teach-basket",
+        action="store_true",
+        help="Interactively calibrate and save the chassis basket drop-off pose in config.yaml"
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging output"
@@ -175,6 +280,10 @@ def main():
     dry_run = args.dry_run or config.get("dry_run", False)
     if dry_run:
         logging.warning("[MODE] Running in DRY-RUN SIMULATION mode.")
+
+    if args.teach_basket:
+        teach_basket(args.config, dry_run=dry_run)
+        return
 
     # Determine demonstration case
     case = args.case

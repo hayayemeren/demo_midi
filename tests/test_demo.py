@@ -445,7 +445,7 @@ def test_case4_autonomous_state_machine_simulation():
         "case4": {
             "camera": {"device": "/dev/null"},
             "scan_pose": {"shoulder_pan.pos": 0.0, "shoulder_lift.pos": -50.0, "gripper.pos": 10.0},
-            "basket_pose": {"shoulder_pan.pos": -95.0, "shoulder_lift.pos": -45.0, "gripper.pos": 85.0},
+            "basket_pose": {"shoulder_pan.pos": 0.0, "shoulder_lift.pos": -80.0, "elbow_flex.pos": 20.0, "wrist_flex.pos": 50.0, "wrist_roll.pos": 0.0, "gripper.pos": 85.0},
             "detection": {"mode": "auto", "save_debug_image": False},
         }
     }
@@ -465,6 +465,7 @@ def test_case4_autonomous_state_machine_simulation():
         loop_hz=50.0,
         config=cfg,
     )
+    sm.running = True
     if sm.camera:
         sm.camera.connect()
     assert sm.state == DemoState.BASE_DRIVE
