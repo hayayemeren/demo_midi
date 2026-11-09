@@ -25,12 +25,12 @@ if systemctl is-active --quiet midi-robot.service 2>/dev/null; then
     sudo systemctl stop midi-robot.service 2>/dev/null || true
 fi
 
-sudo chmod 666 /dev/ttyUSB* /dev/ttyACM* /dev/input/event* /dev/input/js* 2>/dev/null || true
+sudo chmod 666 /dev/ttyUSB* /dev/ttyACM* /dev/input/event* /dev/input/js* /dev/video* 2>/dev/null || true
 
-# 3. Parse arguments: convert positional '1', '2', or '3' into '--case 1/2/3'
+# 3. Parse arguments: convert positional '1', '2', '3', or '4' into '--case 1/2/3/4'
 ARGS=()
 for arg in "$@"; do
-    if [ "$arg" = "1" ] || [ "$arg" = "2" ] || [ "$arg" = "3" ]; then
+    if [ "$arg" = "1" ] || [ "$arg" = "2" ] || [ "$arg" = "3" ] || [ "$arg" = "4" ]; then
         ARGS+=("--case" "$arg")
     else
         ARGS+=("$arg")

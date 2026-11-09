@@ -28,6 +28,13 @@ The system features three selectable demonstration workflows accessible via an i
 │     • Press [SPACE] on computer to switch between Base Drive and Arm!  │
 │       - In Base Drive: Tilt/turn leader arm like a joystick to drive   │
 │       - In Arm Teleop: Wheels locked; 1:1 real-time arm mirroring      │
+│                                                                        │
+│ [4] Case 4: Vision-Guided Autonomous Sock Collection & Basket Tidy     │
+│     • Drive mobile base with Logitech F710 Gamepad                     │
+│     • Press [Y] -> Lock wheels, wrist camera locates sock on floor     │
+│     • Visual servoing centers gripper, descends & grasps sock          │
+│     • Grasp verification check -> Deposits into chassis-mounted basket!│
+│     • Press [X] -> Direct manual 'Deposit to Basket' macro             │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -141,6 +148,29 @@ In Case 3, the **SO-100 Leader Arm** is connected via USB directly to **your PC*
   * **Base Wheels:** Firmly locked at 0 RPM with active electric brakes.
   * **Follower Arm:** Tracks the leader arm 1:1 in real time with zero-jerk smoothing.
 
+#### Case 4: Vision-Guided Autonomous Sock Collection & Basket Tidy
+
+In Case 4, you drive the mobile base with the Logitech F710. When you approach a sock on the floor, press **[Y]** to trigger the autonomous visual pickup sequence:
+
+##### Case 4 Gamepad Controls:
+| Gamepad Input | Function | Action |
+| :--- | :--- | :--- |
+| **Button Y** | **TRIGGER AUTONOMOUS PICKUP** | **Locks wheels -> Moves to scan pose -> Wrist camera detects sock -> Aligns & grasps -> Drops into basket** |
+| **Button X** | **DIRECT BASKET DEPOSIT** | Smoothly lifts arm and runs deposit-to-basket routine |
+| **Button B** | **EMERGENCY CANCEL** | Aborts autonomous sequence, opens gripper, and returns to stow |
+| **Left Stick** | **Drive Base Forward / Reverse** | Push forward / pull back (in Drive Mode) |
+| **Right Stick** | **Steer Base Left / Right** | Turn CCW / CW (in Drive Mode) |
+| **Bumpers (LB / RB)** | **Gear Shift** | Step speed up (`LB`) or down (`RB`) |
+
+##### Autonomous Execution Pipeline:
+1. **Active Brake Lock:** Brakes mobile base wheels at 0 RPM to guarantee zero chassis slip.
+2. **Scan Pose:** Arm smoothly moves to `scan_pose`, positioning the wrist camera looking down at the floor.
+3. **Vision Detection:** Open-loop CV detector locates the sock contour/centroid in the camera frame and saves a real-time debug visualization to `/tmp/sock_detection.jpg`.
+4. **Visual Servoing:** Centering controller adjusts `shoulder_pan` and reach to align the gripper jaws with the target sock.
+5. **Grasp Descent:** Gripper opens wide (85%), descends to floor grasp height, and clamps onto the sock.
+6. **Grasp Verification (Suggestion 2):** Checks measured gripper opening percentage. If cloth is caught (`gripper > 10%`), proceeds to basket. If empty (`gripper <= 10%`), aborts and returns to drive mode.
+7. **Basket Deposit:** Arm lifts to clear ground, swivels over the collection basket mounted on the chassis, opens gripper to release the sock, and parks safely into stow pose.
+
 ---
 
 ## 🔌 Hardware Architecture & Ports
@@ -150,6 +180,7 @@ In Case 3, the **SO-100 Leader Arm** is connected via USB directly to **your PC*
 | **Mobile Base** | Dual DDSM Hub Motors (RS485) | `/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BH002HMM-if00-port0` | `/dev/ttyUSB0` |
 | **Follower Arm** | SO-100 Follower (6x STS3215) | `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6084008-if00` | `/dev/ttyACM0` |
 | **Leader Arm** | SO-100 Leader (6x STS3215) | `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6084621-if00` | `/dev/ttyACM1` |
+| **Wrist Camera** | USB 2.0 End-Effector Camera | `/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._USB2.0_CAM1_USB2.0_CAM1-video-index0` | `/dev/video0` |
 | **Controller** | Logitech F710 Wireless Gamepad | `/dev/input/by-id/usb-Logitech_Wireless_Gamepad_F710_DE659D52-event-joystick` | `/dev/input/js0` |
 
 ---
@@ -171,6 +202,7 @@ In Case 3, the **SO-100 Leader Arm** is connected via USB directly to **your PC*
    # OR:
    ./run_demo.sh 1       # Case 1 (Base Drive + Leader Arm Teleop on Pi)
    ./run_demo.sh 2       # Case 2 (Base Drive + Gamepad Arm Teleop)
+   ./run_demo.sh 4       # Case 4 (Base Drive + Vision Autonomous Sock Collection)
    ```
 
 ---

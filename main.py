@@ -99,30 +99,39 @@ def select_case_interactive(default_case: Optional[int] = None) -> int:
     print("      - Operator controls both Base and Arm from PC using Leader Arm")
     print("      - Press [SPACE] on computer to switch between Base Drive & Arm Teleop")
     print()
+    print("  [4] Case 4: Vision-Guided Autonomous Sock Collection & Basket Tidy (Wrist Cam)")
+    print("      - Base drive with Logitech F710 Gamepad")
+    print("      - Press [Y] -> Lock wheels, wrist camera locates sock on floor")
+    print("      - Visual servoing aligns gripper, descends & grasps sock")
+    print("      - Verifies grasp & deposits sock into chassis-mounted basket!")
+    print("      - Press [X] -> Direct manual 'Deposit to Basket' macro")
+    print()
     print("  [Q] Quit Demonstration")
     print("=" * 64)
 
-    default_prompt = f" [{default_case}]" if default_case in (1, 2, 3) else " [1]"
+    default_prompt = f" [{default_case}]" if default_case in (1, 2, 3, 4) else " [1]"
     while True:
         try:
-            choice = input(f"Enter choice (1, 2, 3, or Q){default_prompt}: ").strip().lower()
+            choice = input(f"Enter choice (1, 2, 3, 4, or Q){default_prompt}: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print("\nExiting.")
             sys.exit(0)
 
         if not choice:
-            return default_case if default_case in (1, 2, 3) else 1
+            return default_case if default_case in (1, 2, 3, 4) else 1
         if choice in ("1", "case 1", "c1"):
             return 1
         elif choice in ("2", "case 2", "c2"):
             return 2
         elif choice in ("3", "case 3", "c3"):
             return 3
+        elif choice in ("4", "case 4", "c4"):
+            return 4
         elif choice in ("q", "quit", "exit"):
             print("Exiting.")
             sys.exit(0)
         else:
-            print("Invalid selection. Please enter 1, 2, 3, or Q.")
+            print("Invalid selection. Please enter 1, 2, 3, 4, or Q.")
 
 
 def parse_args():
@@ -132,9 +141,9 @@ def parse_args():
     parser.add_argument(
         "-C", "--case",
         type=int,
-        choices=[1, 2, 3],
+        choices=[1, 2, 3, 4],
         default=None,
-        help="Demo case to run (1: Leader Arm Mirroring, 2: Gamepad Arm Rate Control, 3: Network Teleoperation Server). If omitted, displays interactive menu."
+        help="Demo case to run (1: Leader Arm Mirroring, 2: Gamepad Arm Rate Control, 3: Network Teleop Server, 4: Vision Autonomous Grasp). If omitted, displays interactive menu."
     )
     parser.add_argument(
         "-c", "--config",
@@ -171,7 +180,7 @@ def main():
     case = args.case
     if case is None:
         cfg_case = config.get("case")
-        if cfg_case in (1, 2, 3):
+        if cfg_case in (1, 2, 3, 4):
             case = cfg_case
         else:
             case = select_case_interactive(default_case=1)
@@ -180,6 +189,7 @@ def main():
         1: "Case 1: Base Drive + SO-100 Leader Arm Teleoperation (Local on Pi)",
         2: "Case 2: Base Drive + Logitech Gamepad Arm Teleoperation (All-in-One)",
         3: "Case 3: Remote Network Teleoperation (Pi Robot Server <- PC Client)",
+        4: "Case 4: Vision-Guided Autonomous Sock Collection & Basket Tidy (Wrist Cam)",
     }
     case_name = case_names.get(case, f"Case {case}")
     print(f"\n>>> Running {case_name} <<<\n")
@@ -222,6 +232,7 @@ def main():
         loop_hz=float(ctrl_cfg.get("loop_hz", 50.0)),
         telemetry_interval=float(ctrl_cfg.get("telemetry_interval", 0.20)),
         network_port=int(ctrl_cfg.get("network_port", 8765)),
+        config=config,
     )
 
     def handle_signal(sig, frame):

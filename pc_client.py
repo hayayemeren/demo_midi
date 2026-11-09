@@ -84,8 +84,8 @@ def parse_args():
     )
     parser.add_argument(
         "-R", "--robot",
-        default="144.122.83.216",
-        help="Raspberry Pi IP address (default: 144.122.83.216)",
+        default="144.122.196.165",
+        help="Raspberry Pi IP address (default: 144.122.196.165)",
     )
     parser.add_argument(
         "-P", "--port",

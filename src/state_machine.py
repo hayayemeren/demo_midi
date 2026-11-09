@@ -14,12 +14,13 @@ import enum
 import logging
 import sys
 import time
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from src.arm_controller import ArmController
 from src.base_controller import BaseController
 from src.gamepad import F710Gamepad, GamepadState
 from src.network import RobotServer
+from src.vision_grasp import WristCamera, SockDetector, VisionGraspPlanner, DetectionResult
 
 logger = logging.getLogger("demo.statemachine")
 
@@ -31,6 +32,11 @@ class DemoState(enum.Enum):
     ARM_TELEOP_LEADER = "ARM_TELEOP_LEADER"
     ARM_TELEOP_GAMEPAD = "ARM_TELEOP_GAMEPAD"
     NETWORK_SERVER = "NETWORK_SERVER"
+    AUTONOMOUS_PICK_SCAN = "AUTONOMOUS_PICK_SCAN"
+    AUTONOMOUS_PICK_ALIGN = "AUTONOMOUS_PICK_ALIGN"
+    AUTONOMOUS_PICK_GRASP = "AUTONOMOUS_PICK_GRASP"
+    AUTONOMOUS_PICK_VERIFY = "AUTONOMOUS_PICK_VERIFY"
+    AUTONOMOUS_BASKET_DUMP = "AUTONOMOUS_BASKET_DUMP"
     PARKING = "PARKING"
     STOPPING = "STOPPING"
 
@@ -57,6 +63,7 @@ class DemoStateMachine:
         loop_hz: float = 50.0,
         telemetry_interval: float = 0.20,
         network_port: int = 8765,
+        config: Optional[Dict[str, Any]] = None,
     ):
         self.base = base
         self.arm = arm
@@ -65,6 +72,7 @@ class DemoStateMachine:
         self.loop_hz = loop_hz
         self.telemetry_interval = telemetry_interval
         self.network_port = network_port
+        self.config = config or getattr(base, "config", {}) or {}
 
         self.state = DemoState.NETWORK_SERVER if demo_case == 3 else DemoState.BASE_DRIVE
         self.running = False
@@ -78,6 +86,37 @@ class DemoStateMachine:
         self._net_arm_synced = False
         if demo_case == 3:
             self.server = RobotServer(host="0.0.0.0", port=network_port)
+
+        # Case 4 Autonomous Vision & Grasp Planner
+        self.camera: Optional[WristCamera] = None
+        self.detector: Optional[SockDetector] = None
+        self.planner: Optional[VisionGraspPlanner] = None
+        self.last_detection: Optional[DetectionResult] = None
+        self.scan_retries = 0
+        self.max_scan_retries = 3
+        self.align_iterations = 0
+        self.max_align_iterations = 2
+
+        if demo_case == 4:
+            c4 = self.config.get("case4", {})
+            cam_cfg = c4.get("camera", {})
+            self.camera = WristCamera(
+                device_path=cam_cfg.get("device", "/dev/video0"),
+                fallback_index=int(cam_cfg.get("fallback", 0)),
+                width=int(cam_cfg.get("width", 640)),
+                height=int(cam_cfg.get("height", 480)),
+                fps=int(cam_cfg.get("fps", 30)),
+                dry_run=self.base.dry_run,
+            )
+            det_cfg = c4.get("detection", {})
+            self.detector = SockDetector(
+                mode=det_cfg.get("mode", "auto"),
+                min_area=float(det_cfg.get("min_area", 600.0)),
+                max_area=float(det_cfg.get("max_area", 80000.0)),
+                save_debug_image=bool(det_cfg.get("save_debug_image", True)),
+                debug_image_path=det_cfg.get("debug_image_path", "/tmp/sock_detection.jpg"),
+            )
+            self.planner = VisionGraspPlanner(self.config)
 
     def start(self):
         """Initial check and launch of the control loop."""
@@ -93,13 +132,17 @@ class DemoStateMachine:
             self.arm.connect_leader()
         elif self.demo_case == 3 and self.server is not None:
             self.server.start()
+        elif self.demo_case == 4 and self.camera is not None:
+            self.camera.connect()
 
         if self.demo_case == 1:
             case_desc = f"Case 1: {COLOR_MAGENTA}SO-100 LEADER ARM TELEOPERATION (Pi Local){COLOR_RESET}"
         elif self.demo_case == 2:
             case_desc = f"Case 2: {COLOR_MAGENTA}LOGITECH GAMEPAD ARM TELEOPERATION (All-in-One){COLOR_RESET}"
-        else:
+        elif self.demo_case == 3:
             case_desc = f"Case 3: {COLOR_MAGENTA}REMOTE LEADER ARM TELEOPERATION (PC Client -> Pi Server){COLOR_RESET}"
+        else:
+            case_desc = f"Case 4: {COLOR_MAGENTA}VISION-GUIDED AUTONOMOUS SOCK COLLECTION & BASKET TIDY{COLOR_RESET}"
 
         logger.info(
             f"{COLOR_BOLD}{COLOR_GREEN}=== MIDI DEMO READY (Case {self.demo_case}) ==={COLOR_RESET}\n"
@@ -140,6 +183,16 @@ class DemoStateMachine:
                 self._handle_arm_teleop_gamepad(gp, dt)
             elif self.state == DemoState.NETWORK_SERVER:
                 self._handle_network_server(gp, dt)
+            elif self.state == DemoState.AUTONOMOUS_PICK_SCAN:
+                self._handle_autonomous_scan(gp)
+            elif self.state == DemoState.AUTONOMOUS_PICK_ALIGN:
+                self._handle_autonomous_align(gp)
+            elif self.state == DemoState.AUTONOMOUS_PICK_GRASP:
+                self._handle_autonomous_grasp(gp)
+            elif self.state == DemoState.AUTONOMOUS_PICK_VERIFY:
+                self._handle_autonomous_verify(gp)
+            elif self.state == DemoState.AUTONOMOUS_BASKET_DUMP:
+                self._handle_autonomous_basket(gp)
             elif self.state == DemoState.PARKING:
                 self._handle_parking()
 
@@ -173,7 +226,7 @@ class DemoStateMachine:
                     self.state = DemoState.SYNCING
 
             # Case 2: Switch to Logitech Gamepad Arm Teleoperation
-            else:
+            elif self.demo_case == 2:
                 logger.info("\n[SWITCH] Button [Y] pressed -> Switching to GAMEPAD ARM TELEOPERATION (Case 2)!")
                 self.arm.init_gamepad_teleop()
                 logger.info(
@@ -183,6 +236,23 @@ class DemoStateMachine:
                     f"Press {COLOR_YELLOW}[Y]{COLOR_RESET} anytime to park the arm and return to {COLOR_CYAN}BASE DRIVE{COLOR_RESET}.\n"
                 )
                 self.state = DemoState.ARM_TELEOP_GAMEPAD
+
+            # Case 4: Switch to Vision-Guided Autonomous Sock Collection
+            elif self.demo_case == 4:
+                logger.info(
+                    f"\n{COLOR_BOLD}{COLOR_MAGENTA}>>> [CASE 4] INITIATING AUTONOMOUS SOCK COLLECTION! <<<{COLOR_RESET}\n"
+                    f"Base wheels locked with electric brakes. Starting vision inspection...\n"
+                )
+                self.scan_retries = 0
+                self.align_iterations = 0
+                self.state = DemoState.AUTONOMOUS_PICK_SCAN
+            return
+
+        # Case 4 shortcut: Button X triggers manual direct basket dump macro
+        if self.demo_case == 4 and gp.button_x_pressed:
+            self.base.lock_brakes()
+            logger.info("\n[CASE 4] Button [X] pressed -> Initiating Direct Basket Deposit macro!")
+            self.state = DemoState.AUTONOMOUS_BASKET_DUMP
             return
 
         # Drive the base
@@ -329,6 +399,197 @@ class DemoStateMachine:
             }
             self.server.send_telemetry(telemetry)
 
+    def _handle_autonomous_scan(self, gp: GamepadState):
+        """Case 4: Locks base, moves arm to scan pose, and inspects floor for socks with wrist camera."""
+        self.base.hold_lock()
+
+        # Allow user to abort with B or switch button
+        if gp.brake or gp.button_b_held or self.gamepad.is_switch_pressed(gp):
+            logger.info("\n[ABORT] Aborting autonomous scan -> Returning to BASE DRIVE.")
+            self.state = DemoState.PARKING
+            return
+
+        if self.planner is None or self.detector is None or self.camera is None:
+            logger.error("Case 4 components not initialized!")
+            self.state = DemoState.PARKING
+            return
+
+        logger.info("\n[CASE 4] Moving Follower to Scan Pose to inspect floor...")
+        self.arm.move_to_pose(
+            self.planner.scan_pose,
+            duration_s=1.2,
+            feedback_cb=lambda _: self.base.hold_lock(),
+        )
+
+        # Brief pause for frame stabilization
+        time.sleep(0.15)
+        self.base.hold_lock()
+
+        ok, frame = self.camera.capture_frame()
+        if not ok or frame is None:
+            logger.warning("[CASE 4] Camera capture failed. Retrying...")
+            self.scan_retries += 1
+            if self.scan_retries >= self.max_scan_retries:
+                self.state = DemoState.PARKING
+            return
+
+        det = self.detector.detect(frame)
+        if det.found:
+            self.last_detection = det
+            logger.info(
+                f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [VISION] SOCK DETECTED! <<<{COLOR_RESET}\n"
+                f"Position: ({det.cx:.0f}, {det.cy:.0f}) | Offset: eX={det.error_x:+.2f}, eY={det.error_y:+.2f} | Area: {det.area:.0f}px\n"
+                f"Debug image saved to: {self.detector.debug_image_path}\n"
+            )
+            self.align_iterations = 0
+            self.state = DemoState.AUTONOMOUS_PICK_ALIGN
+        else:
+            self.scan_retries += 1
+            logger.warning(
+                f"\n{COLOR_YELLOW}[VISION] No sock detected in view (Attempt {self.scan_retries}/{self.max_scan_retries}).{COLOR_RESET}"
+            )
+            if self.scan_retries >= self.max_scan_retries:
+                logger.info("[VISION] Search timeout. Parking arm and returning to BASE DRIVE.")
+                self.state = DemoState.PARKING
+
+    def _handle_autonomous_align(self, gp: GamepadState):
+        """Case 4: Adjusts pan and reach to center the sock in the gripper's line of approach."""
+        self.base.hold_lock()
+
+        if gp.brake or gp.button_b_held or self.gamepad.is_switch_pressed(gp):
+            logger.info("\n[ABORT] Aborting autonomous align -> Returning to BASE DRIVE.")
+            self.state = DemoState.PARKING
+            return
+
+        if self.planner is None or self.last_detection is None:
+            self.state = DemoState.PARKING
+            return
+
+        cur_pose = self.arm.get_follower_pose()
+        aligned_pose, is_aligned = self.planner.compute_aligned_pose(cur_pose, self.last_detection)
+
+        logger.info(
+            f"[ALIGN] Servoing arm to center sock: pan={aligned_pose.get('shoulder_pan.pos', 0.0):.1f}°, "
+            f"lift={aligned_pose.get('shoulder_lift.pos', 0.0):.1f}°..."
+        )
+        self.arm.move_to_pose(
+            aligned_pose,
+            duration_s=0.8,
+            feedback_cb=lambda _: self.base.hold_lock(),
+        )
+
+        self.align_iterations += 1
+
+        # Check alignment with fresh frame if iterations remain
+        if self.camera is not None and self.detector is not None and not is_aligned and self.align_iterations < self.max_align_iterations:
+            time.sleep(0.1)
+            ok, frame = self.camera.capture_frame()
+            if ok and frame is not None:
+                det = self.detector.detect(frame)
+                if det.found:
+                    self.last_detection = det
+
+        logger.info(
+            f"\n{COLOR_BOLD}{COLOR_CYAN}>>> [ALIGN] Sock aligned with gripper center! Initiating Grasp... <<<{COLOR_RESET}\n"
+        )
+        self.state = DemoState.AUTONOMOUS_PICK_GRASP
+
+    def _handle_autonomous_grasp(self, gp: GamepadState):
+        """Case 4: Opens gripper, descends to floor height, and firmly clamps the sock."""
+        self.base.hold_lock()
+
+        if gp.brake or gp.button_b_held:
+            logger.info("\n[ABORT] Aborting autonomous grasp.")
+            self.state = DemoState.PARKING
+            return
+
+        if self.planner is None:
+            self.state = DemoState.PARKING
+            return
+
+        logger.info("\n[GRASP] 1. Opening gripper wide (85%)...")
+        cur_pose = self.arm.get_follower_pose()
+        open_pose = dict(cur_pose)
+        open_pose["gripper.pos"] = 85.0
+        self.arm.move_to_pose(open_pose, duration_s=0.5, feedback_cb=lambda _: self.base.hold_lock())
+
+        logger.info("[GRASP] 2. Lowering arm down to floor grasp pose...")
+        grasp_pose = self.planner.compute_grasp_pose(open_pose)
+        # Keep open while descending
+        grasp_descend = dict(grasp_pose)
+        grasp_descend["gripper.pos"] = 85.0
+        self.arm.move_to_pose(grasp_descend, duration_s=1.0, feedback_cb=lambda _: self.base.hold_lock())
+
+        logger.info("[GRASP] 3. Clamping gripper jaws onto sock...")
+        grasp_clamp = dict(grasp_descend)
+        grasp_clamp["gripper.pos"] = 0.0
+        self.arm.send_follower_action(grasp_clamp)
+        time.sleep(0.6)
+        self.base.hold_lock()
+
+        self.state = DemoState.AUTONOMOUS_PICK_VERIFY
+
+    def _handle_autonomous_verify(self, gp: GamepadState):
+        """Case 4 (Suggestion 2): Checks gripper position to verify that cloth was caught."""
+        self.base.hold_lock()
+
+        cur_pose = self.arm.get_follower_pose()
+        measured_grip = cur_pose.get("gripper.pos", 0.0)
+        if self.arm.dry_run:
+            measured_grip = 25.0  # Simulate successful cloth grip in dry-run mode
+
+        is_caught = self.planner.verify_grasp(measured_grip) if self.planner else False
+
+        if is_caught:
+            logger.info(
+                f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [GRASP VERIFIED] SUCCESS! Sock securely held (Grip: {measured_grip:.1f}% > {self.planner.grasp_verification_threshold:.1f}%). <<<{COLOR_RESET}\n"
+                f"Proceeding to Basket Deposit routine..."
+            )
+            self.state = DemoState.AUTONOMOUS_BASKET_DUMP
+        else:
+            logger.warning(
+                f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP MISSED] Gripper closed empty (Grip: {measured_grip:.1f}% <= {self.planner.grasp_verification_threshold:.1f}%). <<<{COLOR_RESET}\n"
+                f"Aborting pickup and returning to driving."
+            )
+            # Reopen slightly to prevent floor pinching
+            cur_pose["gripper.pos"] = 40.0
+            self.arm.move_to_pose(cur_pose, duration_s=0.5, feedback_cb=lambda _: self.base.hold_lock())
+            self.state = DemoState.PARKING
+
+    def _handle_autonomous_basket(self, gp: GamepadState):
+        """Case 4: Smoothly lifts sock, moves over chassis-mounted basket, opens gripper, and parks."""
+        self.base.hold_lock()
+
+        if self.planner is None:
+            self.state = DemoState.PARKING
+            return
+
+        logger.info("\n[BASKET] 1. Lifting arm to safe travel height...")
+        cur_pose = self.arm.get_follower_pose()
+        lift_pose = dict(cur_pose)
+        lift_pose["shoulder_lift.pos"] = -40.0
+        lift_pose["elbow_flex.pos"] = 25.0
+        self.arm.move_to_pose(lift_pose, duration_s=0.8, feedback_cb=lambda _: self.base.hold_lock())
+
+        logger.info("[BASKET] 2. Swiveling arm to chassis collection basket...")
+        self.arm.move_to_pose(
+            self.planner.basket_pose,
+            duration_s=1.5,
+            feedback_cb=lambda _: self.base.hold_lock(),
+        )
+
+        logger.info("[BASKET] 3. Releasing sock into basket...")
+        drop_pose = dict(self.planner.basket_pose)
+        drop_pose["gripper.pos"] = 85.0
+        self.arm.send_follower_action(drop_pose)
+        time.sleep(0.7)
+        self.base.hold_lock()
+
+        logger.info(
+            f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [BASKET COMPLETE] Sock deposited successfully! <<<{COLOR_RESET}\n"
+        )
+        self.state = DemoState.PARKING
+
     def _handle_parking(self):
         """Base is locked; smoothly park follower arm back to safe stow pose."""
         self.base.hold_lock()
@@ -350,6 +611,14 @@ class DemoStateMachine:
             mode_color = COLOR_YELLOW
         elif self.state == DemoState.NETWORK_SERVER:
             mode_color = COLOR_CYAN if self._net_mode == "base" else COLOR_MAGENTA
+        elif self.state in (
+            DemoState.AUTONOMOUS_PICK_SCAN,
+            DemoState.AUTONOMOUS_PICK_ALIGN,
+            DemoState.AUTONOMOUS_PICK_GRASP,
+            DemoState.AUTONOMOUS_PICK_VERIFY,
+            DemoState.AUTONOMOUS_BASKET_DUMP,
+        ):
+            mode_color = COLOR_GREEN
 
         state_tag = f"{mode_color}[{self.state.value:^18}]{COLOR_RESET}"
         conn_tag = f"{COLOR_GREEN}GP:OK{COLOR_RESET}" if gp.connected else f"{COLOR_RED}GP:DISC{COLOR_RESET}"
@@ -380,6 +649,17 @@ class DemoStateMachine:
                 pan = f_pose.get("shoulder_pan.pos", 0.0)
                 lift = f_pose.get("shoulder_lift.pos", 0.0)
                 info = f"Net Arm  | Pan:{pan:+5.1f}° Lift:{lift:+5.1f}° | Base: LOCKED"
+        elif self.state in (
+            DemoState.AUTONOMOUS_PICK_SCAN,
+            DemoState.AUTONOMOUS_PICK_ALIGN,
+            DemoState.AUTONOMOUS_PICK_GRASP,
+            DemoState.AUTONOMOUS_PICK_VERIFY,
+            DemoState.AUTONOMOUS_BASKET_DUMP,
+        ):
+            f_pose = self.arm.get_follower_pose()
+            grip = f_pose.get("gripper.pos", 0.0)
+            det_str = f"SOCK@({self.last_detection.cx:.0f},{self.last_detection.cy:.0f})" if (self.last_detection and self.last_detection.found) else "SEARCHING"
+            info = f"Auton: {det_str} | Grip:{grip:3.0f}% | Base: LOCKED"
         elif self.state == DemoState.WAITING_FOR_LEADER:
             info = f"{COLOR_YELLOW}Waiting for Leader Arm... Press [Y] to cancel{COLOR_RESET}"
         elif self.state == DemoState.SYNCING:
@@ -399,6 +679,11 @@ class DemoStateMachine:
         if self.server:
             try:
                 self.server.close()
+            except Exception:
+                pass
+        if self.camera:
+            try:
+                self.camera.release()
             except Exception:
                 pass
         try:

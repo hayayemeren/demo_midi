@@ -286,6 +286,20 @@ class ArmController:
         self.current_gamepad_target = dict(self.ready_pose)
         logger.info("[ARM] Follower is ready for manipulation.")
 
+    def move_to_pose(
+        self,
+        target_pose: Dict[str, float],
+        duration_s: Optional[float] = None,
+        feedback_cb: Optional[Callable[[float], None]] = None,
+    ):
+        """Smoothly move follower arm to arbitrary target pose using S-curve trajectory."""
+        duration = duration_s or self.interpolation_time
+        start_pose = self.get_follower_pose()
+        # Ensure all joints exist in target_pose (fallback to start_pose)
+        full_target = {k: target_pose.get(k, start_pose.get(k, 0.0)) for k in start_pose}
+        self.smooth_trajectory(start_pose, full_target, duration, feedback_cb=feedback_cb)
+        self.current_gamepad_target = dict(full_target)
+
     def teleop_step_gamepad(self, gp: Any, dt: float) -> Dict[str, float]:
         """Perform one rate-control teleoperation step from Gamepad inputs.
         

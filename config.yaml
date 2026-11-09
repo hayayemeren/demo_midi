@@ -88,3 +88,51 @@ arm_gamepad_teleop:
 control:
   loop_hz: 50.0                 # Control loop frequency (50 Hz = 20ms)
   telemetry_interval: 0.20      # Dashboard print interval in seconds
+
+# ==============================================================================
+# Case 4: Vision-Guided Autonomous Sock Collection & Basket Tidy
+# Suggestion 3 (Wrist Cam Vision + Visual Servoing) & Suggestion 2 (Grip Check)
+# ==============================================================================
+case4:
+  camera:
+    device: "/dev/video0"
+    fallback: 0
+    width: 640
+    height: 480
+    fps: 30
+
+  # Observation / Scan Pose: Wrist camera looks down at floor in front of base
+  scan_pose:
+    shoulder_pan.pos: 0.0
+    shoulder_lift.pos: -50.0
+    elbow_flex.pos: 35.0
+    wrist_flex.pos: 70.0
+    wrist_roll.pos: 0.0
+    gripper.pos: 10.0
+
+  # Basket Pose: Chassis-mounted collection basket on the mobile base
+  basket_pose:
+    shoulder_pan.pos: -95.0
+    shoulder_lift.pos: -45.0
+    elbow_flex.pos: 30.0
+    wrist_flex.pos: 60.0
+    wrist_roll.pos: 0.0
+    gripper.pos: 85.0
+
+  # Suggestion 2: Tactile / Position grasp verification threshold (%)
+  # If measured gripper > 10.0%, cloth is caught between jaws (Success!)
+  grasp_verification_threshold_pct: 10.0
+
+  # Vision Detection Settings
+  detection:
+    mode: "auto"                # "auto", "contrast", or "color"
+    min_area: 600.0             # minimum contour area (pixels)
+    max_area: 80000.0           # maximum contour area (pixels)
+    save_debug_image: true      # save annotated frame for live operator inspection
+    debug_image_path: "/tmp/sock_detection.jpg"
+
+  # Visual Servoing Gains
+  servoing:
+    pan_gain: 22.0              # max pan angle correction in degrees
+    lift_gain: 15.0             # max lift angle correction in degrees
+    align_tolerance: 0.12       # normalized centering threshold [-1.0, 1.0]

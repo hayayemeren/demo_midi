@@ -13,6 +13,7 @@ from src.gamepad import F710Gamepad, GamepadState
 from src.leader_reader import leader_to_base_drive, SO100LeaderReader, DEFAULT_NEUTRAL_POSE
 from src.network import RobotServer, RobotClient
 from src.state_machine import DemoStateMachine, DemoState
+from src.vision_grasp import WristCamera, SockDetector, VisionGraspPlanner, DetectionResult
 
 
 def test_ddsm_crc8_spec():
@@ -388,6 +389,133 @@ def test_case3_network_teleop_simulation():
     sm.stop()
 
 
+def test_case4_vision_grasp_components():
+    """Verify Case 4 vision detector, camera, and grasp planner."""
+    # 1. Test WristCamera dry-run frame capture
+    cam = WristCamera(dry_run=True)
+    assert cam.connect() is True
+    ok, frame = cam.capture_frame()
+    assert ok is True
+    assert frame is not None
+    assert frame.shape == (480, 640, 3)
+
+    # 2. Test SockDetector on the synthetic frame
+    detector = SockDetector(mode="auto", save_debug_image=False)
+    det = detector.detect(frame)
+    assert det.found is True
+    assert det.area > 500.0
+    assert abs(det.error_x) < 0.5  # near center
+
+    # 3. Test VisionGraspPlanner alignment
+    cfg = {
+        "case4": {
+            "servoing": {"pan_gain": 20.0, "lift_gain": 15.0, "align_tolerance": 0.10},
+            "grasp_verification_threshold_pct": 10.0,
+        }
+    }
+    planner = VisionGraspPlanner(cfg)
+    cur_pose = {"shoulder_pan.pos": 0.0, "shoulder_lift.pos": -50.0, "gripper.pos": 10.0}
+    aligned, is_aligned = planner.compute_aligned_pose(cur_pose, det)
+    assert "shoulder_pan.pos" in aligned
+
+    # 4. Test grasp pose computation
+    grasp_pose = planner.compute_grasp_pose(aligned)
+    assert grasp_pose["gripper.pos"] == 0.0
+    assert grasp_pose["shoulder_lift.pos"] > aligned["shoulder_lift.pos"]  # lower down
+
+    # 5. Test Suggestion 2 grasp verification
+    assert planner.verify_grasp(25.0) is True   # holding cloth
+    assert planner.verify_grasp(4.5) is False   # closed empty
+
+    cam.release()
+
+
+def test_case4_autonomous_state_machine_simulation():
+    """Verify full Case 4 state machine autonomous pick-and-place flow in dry-run mode."""
+    cfg = {
+        "dry_run": True,
+        "serial": {"port": "/dev/null"},
+        "motors": {"left_id": 1, "right_id": 2},
+        "arm": {
+            "follower_port": "/dev/null",
+            "leader_port": "/dev/null",
+            "interpolation_time_s": 0.01,
+        },
+        "gamepad": {"switch_button": "Y"},
+        "case4": {
+            "camera": {"device": "/dev/null"},
+            "scan_pose": {"shoulder_pan.pos": 0.0, "shoulder_lift.pos": -50.0, "gripper.pos": 10.0},
+            "basket_pose": {"shoulder_pan.pos": -95.0, "shoulder_lift.pos": -45.0, "gripper.pos": 85.0},
+            "detection": {"mode": "auto", "save_debug_image": False},
+        }
+    }
+
+    base = BaseController(cfg, dry_run=True)
+    arm = ArmController(cfg, dry_run=True)
+    gamepad = F710Gamepad()
+
+    base.connect()
+    arm.connect_follower()
+
+    sm = DemoStateMachine(
+        base=base,
+        arm=arm,
+        gamepad=gamepad,
+        demo_case=4,
+        loop_hz=50.0,
+        config=cfg,
+    )
+    if sm.camera:
+        sm.camera.connect()
+    assert sm.state == DemoState.BASE_DRIVE
+
+    # 1. Test Base Drive in Case 4
+    gp = GamepadState(forward=0.8, turn=0.0, speed_rpm=100.0, connected=True)
+    sm._handle_base_drive(gp, dt=0.02)
+    assert base.cur_left_rpm > 0.0
+    assert base.cur_right_rpm > 0.0
+    assert base.is_locked is False
+
+    # 2. Press [Y] button -> initiates autonomous pick routine
+    gp_switch = GamepadState(button_y_pressed=True, connected=True)
+    sm._handle_base_drive(gp_switch, dt=0.02)
+    assert sm.state == DemoState.AUTONOMOUS_PICK_SCAN
+    assert base.is_locked is True
+
+    # 3. Autonomous scan step -> finds simulated sock -> switches to ALIGN
+    sm._handle_autonomous_scan(gp)
+    assert sm.state == DemoState.AUTONOMOUS_PICK_ALIGN
+    assert sm.last_detection is not None
+    assert sm.last_detection.found is True
+
+    # 4. Autonomous align step -> aligns gripper -> switches to GRASP
+    sm._handle_autonomous_align(gp)
+    assert sm.state == DemoState.AUTONOMOUS_PICK_GRASP
+
+    # 5. Autonomous grasp step -> descends and clamps -> switches to VERIFY
+    sm._handle_autonomous_grasp(gp)
+    assert sm.state == DemoState.AUTONOMOUS_PICK_VERIFY
+
+    # 6. Grasp verification (Suggestion 2) -> confirms grip -> switches to BASKET
+    sm._handle_autonomous_verify(gp)
+    assert sm.state == DemoState.AUTONOMOUS_BASKET_DUMP
+
+    # 7. Basket dump step -> swings to basket, deposits, parks -> returns to BASE_DRIVE
+    sm._handle_autonomous_basket(gp)
+    assert sm.state == DemoState.PARKING
+    sm._handle_parking()
+    assert sm.state == DemoState.BASE_DRIVE
+    assert base.is_locked is False
+
+    # 8. Test direct manual basket dump macro via Button [X]
+    gp_x = GamepadState(button_x_pressed=True, connected=True)
+    sm._handle_base_drive(gp_x, dt=0.02)
+    assert sm.state == DemoState.AUTONOMOUS_BASKET_DUMP
+    assert base.is_locked is True
+
+    sm.stop()
+
+
 if __name__ == "__main__":
     test_ddsm_crc8_spec()
     print("  [PASS] test_ddsm_crc8_spec")
@@ -411,6 +539,10 @@ if __name__ == "__main__":
     print("  [PASS] test_case3_leader_to_base_kinematics")
     test_case3_network_teleop_simulation()
     print("  [PASS] test_case3_network_teleop_simulation")
+    test_case4_vision_grasp_components()
+    print("  [PASS] test_case4_vision_grasp_components")
+    test_case4_autonomous_state_machine_simulation()
+    print("  [PASS] test_case4_autonomous_state_machine_simulation")
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
 
 
