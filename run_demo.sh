@@ -27,10 +27,10 @@ fi
 
 sudo chmod 666 /dev/ttyUSB* /dev/ttyACM* /dev/input/event* /dev/input/js* /dev/video* 2>/dev/null || true
 
-# 3. Parse arguments: convert positional '1', '2', '3', or '4' into '--case 1/2/3/4'
+# 3. Parse arguments: convert positional '1'..'7' into '--case 1..7'
 ARGS=()
 for arg in "$@"; do
-    if [ "$arg" = "1" ] || [ "$arg" = "2" ] || [ "$arg" = "3" ] || [ "$arg" = "4" ]; then
+    if [ "$arg" = "1" ] || [ "$arg" = "2" ] || [ "$arg" = "3" ] || [ "$arg" = "4" ] || [ "$arg" = "5" ] || [ "$arg" = "6" ] || [ "$arg" = "7" ]; then
         ARGS+=("--case" "$arg")
     else
         ARGS+=("$arg")

@@ -324,6 +324,15 @@ class VisionGraspPlanner:
             "wrist_roll.pos": 0.0,
             "gripper.pos": 85.0,
         })
+        # Calibrated floor reach to grasp sock from floor below the mobile base
+        self.floor_grasp_pose = c4.get("floor_grasp_pose", {
+            "shoulder_pan.pos": 0.0,
+            "shoulder_lift.pos": -30.0,
+            "elbow_flex.pos": 45.0,
+            "wrist_flex.pos": 80.0,
+            "wrist_roll.pos": 0.0,
+            "gripper.pos": 0.0,
+        })
 
     def compute_aligned_pose(
         self,
@@ -359,11 +368,18 @@ class VisionGraspPlanner:
         descent_lift_deg: float = 16.0,
         descent_elbow_deg: float = 12.0,
     ) -> Dict[str, float]:
-        """Compute final downward descent pose to hover right at floor level."""
+        """Compute final downward descent pose to hover right at floor level below chassis base."""
         grasp = dict(aligned_pose)
-        grasp["shoulder_lift.pos"] = float(np.clip(grasp.get("shoulder_lift.pos", -50.0) + descent_lift_deg, -90.0, 0.0))
-        grasp["elbow_flex.pos"] = float(np.clip(grasp.get("elbow_flex.pos", 35.0) + descent_elbow_deg, -20.0, 70.0))
-        grasp["wrist_flex.pos"] = float(np.clip(grasp.get("wrist_flex.pos", 70.0) + 10.0, 0.0, 100.0))
+        if self.floor_grasp_pose:
+            # Maintain visually aligned shoulder_pan, apply calibrated floor reach & pitch
+            grasp["shoulder_lift.pos"] = float(self.floor_grasp_pose.get("shoulder_lift.pos", -30.0))
+            grasp["elbow_flex.pos"] = float(self.floor_grasp_pose.get("elbow_flex.pos", 45.0))
+            grasp["wrist_flex.pos"] = float(self.floor_grasp_pose.get("wrist_flex.pos", 80.0))
+            grasp["wrist_roll.pos"] = float(self.floor_grasp_pose.get("wrist_roll.pos", 0.0))
+        else:
+            grasp["shoulder_lift.pos"] = float(np.clip(grasp.get("shoulder_lift.pos", -50.0) + descent_lift_deg, -90.0, 0.0))
+            grasp["elbow_flex.pos"] = float(np.clip(grasp.get("elbow_flex.pos", 35.0) + descent_elbow_deg, -20.0, 70.0))
+            grasp["wrist_flex.pos"] = float(np.clip(grasp.get("wrist_flex.pos", 70.0) + 10.0, 0.0, 100.0))
         grasp["gripper.pos"] = 0.0  # Clamp target
         return grasp
 

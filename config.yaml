@@ -113,6 +113,14 @@ case4:
   # Multi-angle floor search sweep (shoulder_pan angles in degrees)
   scan_sweep_angles: [0.0, -28.0, 28.0]
 
+  # Floor Grasp Pose: Calibrated downward reach to pick sock from floor below the base
+  floor_grasp_pose:
+    shoulder_pan.pos: 0.0
+    shoulder_lift.pos: -30.0
+    elbow_flex.pos: 45.0
+    wrist_flex.pos: 80.0
+    wrist_roll.pos: 0.0
+    gripper.pos: 0.0
   # Basket Pose: Chassis-mounted collection basket on the mobile base
   # Located directly behind the gripper centerline and elevated
   basket_pose:
