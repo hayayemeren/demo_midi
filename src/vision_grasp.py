@@ -52,6 +52,27 @@ class VisionDebugHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress continuous HTTP access logs in console
 
+    def do_HEAD(self):
+        srv = VisionDebugServer._instance
+        if not srv:
+            self.send_error(503, "Vision debug server not initialized")
+            return
+        path = self.path.split("?")[0]
+        if path in ("/", "/index.html"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+        elif path.startswith("/stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.end_headers()
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.end_headers()
+
     def do_GET(self):
         srv = VisionDebugServer._instance
         if not srv:
@@ -361,11 +382,12 @@ class WristCamera:
         logger.info("Opening wrist camera on %s...", target)
 
         try:
-            self.cap = cv2.VideoCapture(target)
+            backend = cv2.CAP_V4L2 if (hasattr(cv2, "CAP_V4L2") and os.name == "posix") else cv2.CAP_ANY
+            self.cap = cv2.VideoCapture(target, backend)
             if not self.cap.isOpened():
                 if target != self.fallback_index:
                     logger.warning("Failed on %s, trying fallback index %d...", target, self.fallback_index)
-                    self.cap = cv2.VideoCapture(self.fallback_index)
+                    self.cap = cv2.VideoCapture(self.fallback_index, backend)
 
             if self.cap.isOpened():
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
