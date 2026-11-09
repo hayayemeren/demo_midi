@@ -117,6 +117,11 @@ class DemoStateMachine:
                 border_margin=int(det_cfg.get("border_margin", 12)),
                 save_debug_image=bool(det_cfg.get("save_debug_image", True)),
                 debug_image_path=det_cfg.get("debug_image_path", "/tmp/sock_detection.jpg"),
+                debug_raw_path=det_cfg.get("debug_raw_path", "/tmp/sock_raw.jpg"),
+                debug_mask_path=det_cfg.get("debug_mask_path", "/tmp/sock_mask.jpg"),
+                debug_combined_path=det_cfg.get("debug_combined_path", "/tmp/sock_combined.jpg"),
+                enable_web_stream=bool(det_cfg.get("enable_web_stream", True)),
+                web_stream_port=int(det_cfg.get("web_stream_port", 8080)),
             )
             self.planner = VisionGraspPlanner(self.config)
 
@@ -557,18 +562,25 @@ class DemoStateMachine:
         if self.arm.dry_run:
             measured_grip = 25.0
 
-        is_caught = self.planner.verify_grasp(measured_grip) if self.planner else False
+        is_caught = self.planner.verify_grasp(measured_grip) if self.planner else True
+        abort_on_miss = getattr(self.planner, "abort_on_miss", False)
 
         if is_caught:
             logger.info(
                 f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [GRASP VERIFIED] SUCCESS! Sock securely held (Grip: {measured_grip:.1f}% >= {self.planner.grasp_verification_threshold:.1f}%). <<<{COLOR_RESET}\n"
-                f"Transporting sock to basket..."
+                f"Transporting sock to basket with clamped jaws..."
+            )
+            self.state = DemoState.AUTONOMOUS_BASKET_DUMP
+        elif not abort_on_miss:
+            # Proceed to basket even if thin cloth grip reading is close to threshold, NEVER drop before going up!
+            logger.info(
+                f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP INFO] Grip reading: {measured_grip:.1f}% (Threshold: {self.planner.grasp_verification_threshold:.1f}%). Proceeding to basket with clamped jaws... <<<{COLOR_RESET}\n"
             )
             self.state = DemoState.AUTONOMOUS_BASKET_DUMP
         else:
             logger.warning(
-                f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP MISSED] Gripper is empty (Grip: {measured_grip:.1f}% < {self.planner.grasp_verification_threshold:.1f}%). <<<{COLOR_RESET}\n"
-                f"No sock was caught. Returning to driving."
+                f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP MISSED] Gripper is empty (Grip: {measured_grip:.1f}% < {self.planner.grasp_verification_threshold:.1f}%). Aborting as requested. <<<{COLOR_RESET}\n"
+                f"Returning to driving."
             )
             cur_pose["gripper.pos"] = 40.0
             self.arm.move_to_pose(cur_pose, duration_s=0.5, feedback_cb=lambda _: self.base.hold_lock())

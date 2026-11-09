@@ -7,8 +7,12 @@ Suggestion 2 (Gripper Load / Position Grasp Verification) for Case 4.
 from __future__ import annotations
 
 import logging
+import http.server
+import json
 import math
 import os
+import socketserver
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, Any
@@ -30,6 +34,222 @@ class DetectionResult:
     area: float = 0.0         # Contour area (pixels)
     bbox: Tuple[int, int, int, int] = (0, 0, 0, 0) # (x, y, w, h)
     annotated_frame: Optional[np.ndarray] = None
+    raw_frame: Optional[np.ndarray] = None
+    mask_frame: Optional[np.ndarray] = None
+    combined_frame: Optional[np.ndarray] = None
+
+
+class VisionDebugHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP handler serving actual camera frames and segmented masks for operator debugging."""
+
+    def log_message(self, format, *args):
+        pass  # Suppress continuous HTTP access logs in console
+
+    def do_GET(self):
+        srv = VisionDebugServer._instance
+        if not srv:
+            self.send_error(503, "Vision debug server not initialized")
+            return
+
+        path = self.path.split("?")[0]
+        if path in ("/", "/index.html"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(srv.get_dashboard_html().encode("utf-8"))
+        elif path == "/raw.jpg":
+            srv.serve_image(self, srv._latest_raw, "ACTUAL CAMERA FRAME")
+        elif path in ("/mask.jpg", "/segmented.jpg"):
+            srv.serve_image(self, srv._latest_mask, "SEGMENTED MASK")
+        elif path in ("/detection.jpg", "/annotated.jpg"):
+            srv.serve_image(self, srv._latest_annotated, "DETECTION RETICLE")
+        elif path in ("/combined.jpg", "/debug.jpg"):
+            srv.serve_image(self, srv._latest_combined, "COMBINED DEBUG VIEW")
+        elif path == "/status.json":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(srv._latest_meta).encode("utf-8"))
+        else:
+            self.send_error(404, "Not Found")
+
+
+class VisionDebugServer:
+    """Lightweight HTTP server publishing actual camera and segmented mask images for live browser debugging."""
+    _instance: Optional[VisionDebugServer] = None
+    _lock = threading.Lock()
+
+    def __init__(self, port: int = 8080):
+        self.port = port
+        self._latest_raw: Optional[bytes] = None
+        self._latest_mask: Optional[bytes] = None
+        self._latest_annotated: Optional[bytes] = None
+        self._latest_combined: Optional[bytes] = None
+        self._latest_meta: Dict[str, Any] = {"found": False, "cx": 0, "cy": 0, "area": 0}
+        self.server: Optional[socketserver.TCPServer] = None
+        self.thread: Optional[threading.Thread] = None
+        self.started = False
+
+    @classmethod
+    def get_instance(cls, port: int = 8080) -> VisionDebugServer:
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls(port)
+            return cls._instance
+
+    @classmethod
+    def update(
+        cls,
+        raw_frame: Optional[np.ndarray],
+        mask_frame: Optional[np.ndarray],
+        annotated_frame: Optional[np.ndarray],
+        combined_frame: Optional[np.ndarray],
+        meta: Optional[Dict[str, Any]] = None,
+    ):
+        inst = cls._instance
+        if inst is None or not inst.started:
+            return
+
+        with cls._lock:
+            if meta:
+                inst._latest_meta = meta
+            if raw_frame is not None:
+                _, buf = cv2.imencode(".jpg", raw_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                inst._latest_raw = buf.tobytes()
+            if mask_frame is not None:
+                _, buf = cv2.imencode(".jpg", mask_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                inst._latest_mask = buf.tobytes()
+            if annotated_frame is not None:
+                _, buf = cv2.imencode(".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                inst._latest_annotated = buf.tobytes()
+            if combined_frame is not None:
+                _, buf = cv2.imencode(".jpg", combined_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                inst._latest_combined = buf.tobytes()
+
+    def serve_image(self, handler, jpeg_bytes: Optional[bytes], placeholder_label: str):
+        if jpeg_bytes is None:
+            blank = np.zeros((300, 400, 3), dtype=np.uint8)
+            cv2.putText(blank, placeholder_label, (25, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 120, 120), 2)
+            cv2.putText(blank, "Awaiting Camera...", (25, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 2)
+            _, buf = cv2.imencode(".jpg", blank)
+            jpeg_bytes = buf.tobytes()
+
+        handler.send_response(200)
+        handler.send_header("Content-Type", "image/jpeg")
+        handler.send_header("Content-Length", str(len(jpeg_bytes)))
+        handler.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.end_headers()
+        handler.wfile.write(jpeg_bytes)
+
+    def start(self):
+        if self.started:
+            return
+        try:
+            socketserver.TCPServer.allow_reuse_address = True
+            self.server = socketserver.TCPServer(("", self.port), VisionDebugHandler)
+            self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+            self.thread.start()
+            self.started = True
+            logger.info(">>> [VISION DEBUG] Live Web Stream active at http://0.0.0.0:%d/ <<<", self.port)
+        except Exception as e:
+            logger.warning("Could not start Vision Debug Web Server on port %d: %s", self.port, e)
+
+    def get_dashboard_html(self) -> str:
+        return """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MIDI Robot - Vision Debug Stream</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #121214; color: #e1e1e6; margin: 0; padding: 20px; }
+        h1 { margin: 0 0 10px 0; font-size: 22px; color: #00d26a; }
+        .meta-bar { background: #1e1e24; padding: 12px 18px; border-radius: 8px; margin-bottom: 20px; display: flex; gap: 20px; align-items: center; border: 1px solid #333; flex-wrap: wrap; }
+        .badge { padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 14px; }
+        .badge-found { background: #00d26a; color: #000; }
+        .badge-none { background: #e02424; color: #fff; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 20px; }
+        .card { background: #1a1a20; border-radius: 8px; overflow: hidden; border: 1px solid #2d2d38; }
+        .card-header { padding: 10px 14px; font-weight: 600; font-size: 15px; background: #22222c; border-bottom: 1px solid #333; display: flex; justify-content: space-between; }
+        .card img { width: 100%; height: auto; display: block; background: #0a0a0c; min-height: 240px; }
+        .full-width { grid-column: 1 / -1; }
+        .btn { background: #00d26a; color: #000; border: none; padding: 6px 14px; border-radius: 4px; font-weight: 600; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>MIDI Robot: Live Wrist Camera & Segmentation Debugger</h1>
+    <div class="meta-bar">
+        <div>Detection: <span id="status-badge" class="badge badge-none">WAITING</span></div>
+        <div>Offset: <span id="offset-text">eX: 0.00, eY: 0.00</span></div>
+        <div>Cloth Area: <span id="area-text">0 px</span></div>
+        <div style="margin-left: auto;">
+            <button class="btn" onclick="refreshNow()">Force Refresh</button>
+        </div>
+    </div>
+
+    <div class="grid">
+        <div class="card full-width">
+            <div class="card-header">
+                <span>Multi-View Composite (Actual Raw | Segmented Mask | Annotated Reticle)</span>
+                <a href="/combined.jpg" target="_blank" style="color: #00d26a; text-decoration: none;">Open Full Image</a>
+            </div>
+            <img id="img-combined" src="/combined.jpg" alt="Combined Multi-View">
+        </div>
+        <div class="card">
+            <div class="card-header">
+                <span>1. Actual Camera Frame (Raw)</span>
+                <a href="/raw.jpg" target="_blank" style="color: #00d26a; text-decoration: none;">Raw JPG</a>
+            </div>
+            <img id="img-raw" src="/raw.jpg" alt="Actual Camera Image">
+        </div>
+        <div class="card">
+            <div class="card-header">
+                <span>2. Segmented Mask (Foreground Filter)</span>
+                <a href="/mask.jpg" target="_blank" style="color: #00d26a; text-decoration: none;">Mask JPG</a>
+            </div>
+            <img id="img-mask" src="/mask.jpg" alt="Segmented Mask">
+        </div>
+        <div class="card">
+            <div class="card-header">
+                <span>3. Detection Overlay (Grasp Target)</span>
+                <a href="/detection.jpg" target="_blank" style="color: #00d26a; text-decoration: none;">Detection JPG</a>
+            </div>
+            <img id="img-detection" src="/detection.jpg" alt="Annotated Detection">
+        </div>
+    </div>
+
+    <script>
+        function updateImages() {
+            const t = Date.now();
+            document.getElementById('img-combined').src = '/combined.jpg?t=' + t;
+            document.getElementById('img-raw').src = '/raw.jpg?t=' + t;
+            document.getElementById('img-mask').src = '/mask.jpg?t=' + t;
+            document.getElementById('img-detection').src = '/detection.jpg?t=' + t;
+
+            fetch('/status.json')
+                .then(r => r.json())
+                .then(d => {
+                    const b = document.getElementById('status-badge');
+                    if (d.found) {
+                        b.className = 'badge badge-found';
+                        b.innerText = 'SOCK DETECTED';
+                    } else {
+                        b.className = 'badge badge-none';
+                        b.innerText = 'SEARCHING FLOOR...';
+                    }
+                    document.getElementById('offset-text').innerText = 'eX: ' + (d.error_x >= 0 ? '+' : '') + Number(d.error_x || 0).toFixed(2) + ', eY: ' + (d.error_y >= 0 ? '+' : '') + Number(d.error_y || 0).toFixed(2);
+                    document.getElementById('area-text').innerText = Math.round(d.area || 0) + ' px';
+                })
+                .catch(() => {});
+        }
+        function refreshNow() { updateImages(); }
+        setInterval(updateImages, 500);
+    </script>
+</body>
+</html>"""
 
 
 class WristCamera:
@@ -129,11 +349,16 @@ class SockDetector:
         self,
         mode: str = "auto",
         min_area: float = 1000.0,
-        max_area: float = 60000.0,
+        max_area: float = 80000.0,
         contrast_threshold: float = 38.0,
         border_margin: int = 12,
         save_debug_image: bool = True,
         debug_image_path: str = "/tmp/sock_detection.jpg",
+        debug_raw_path: str = "/tmp/sock_raw.jpg",
+        debug_mask_path: str = "/tmp/sock_mask.jpg",
+        debug_combined_path: str = "/tmp/sock_combined.jpg",
+        enable_web_stream: bool = True,
+        web_stream_port: int = 8080,
         roi_top_pct: float = 0.10,
         roi_bottom_pct: float = 0.68,
         roi_left_pct: float = 0.12,
@@ -146,10 +371,19 @@ class SockDetector:
         self.border_margin = border_margin
         self.save_debug_image = save_debug_image
         self.debug_image_path = debug_image_path
+        self.debug_raw_path = debug_raw_path
+        self.debug_mask_path = debug_mask_path
+        self.debug_combined_path = debug_combined_path
+        self.enable_web_stream = enable_web_stream
+        self.web_stream_port = web_stream_port
         self.roi_top_pct = roi_top_pct
         self.roi_bottom_pct = roi_bottom_pct
         self.roi_left_pct = roi_left_pct
         self.roi_right_pct = roi_right_pct
+
+        if self.enable_web_stream:
+            server = VisionDebugServer.get_instance(self.web_stream_port)
+            server.start()
 
     def detect(self, frame: np.ndarray) -> DetectionResult:
         """Process image frame to locate the sock on the floor."""
@@ -161,7 +395,6 @@ class SockDetector:
         center_y = h / 2.0
 
         # 1. Define active floor Region of Interest (ROI)
-        # Excludes lens edge vignetting (left/right) and cyan gripper finger tips (bottom)
         x_min = int(w * self.roi_left_pct)
         x_max = int(w * self.roi_right_pct)
         y_min = int(h * self.roi_top_pct)
@@ -188,8 +421,8 @@ class SockDetector:
             sat = hsv_roi[:, :, 1]
             val = hsv_roi[:, :, 2]
             thresh = cv2.bitwise_or(
-                cv2.inRange(sat, 50, 255),        # Chromatic / colored socks
-                cv2.inRange(val, 0, 70)           # Dark / black socks
+                cv2.inRange(sat, 50, 255),
+                cv2.inRange(val, 0, 70)
             )
 
         # Exclude cyan gripper areas
@@ -247,11 +480,15 @@ class SockDetector:
                         best_center = (cx, cy)
                         best_bbox = (global_bx, global_by, bw, bh)
 
-        # 5. Build annotation overlay
+        # 5. Build full-frame segmented mask representation
+        mask_full = np.zeros((h, w), dtype=np.uint8)
+        mask_full[y_min:y_max, x_min:x_max] = cleaned
+        mask_bgr = cv2.cvtColor(mask_full, cv2.COLOR_GRAY2BGR)
+        cv2.rectangle(mask_bgr, (x_min, y_min), (x_max, y_max), (70, 70, 70), 1, cv2.LINE_AA)
+
+        # 6. Build annotation overlay
         annotated = frame.copy()
-        # Draw search ROI bounds
         cv2.rectangle(annotated, (x_min, y_min), (x_max, y_max), (100, 100, 100), 1, cv2.LINE_AA)
-        # Draw central grasp reticle
         cv2.drawMarker(annotated, (int(center_x), int(center_y)), (0, 255, 255), cv2.MARKER_CROSS, 20, 1)
 
         if best_contour is not None:
@@ -262,13 +499,17 @@ class SockDetector:
             error_x = (cx - center_x) / center_x
             error_y = (cy - center_y) / center_y
 
-            # Draw detection bounding box & centroid
+            # Draw detection bounding box & centroid on annotated frame
             cv2.rectangle(annotated, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
             cv2.circle(annotated, (int(cx), int(cy)), 6, (0, 0, 255), -1)
             cv2.line(annotated, (int(center_x), int(center_y)), (int(cx), int(cy)), (0, 255, 0), 2)
 
             label = f"SOCK: {int(best_area)}px [eX:{error_x:+.2f}, eY:{error_y:+.2f}]"
             cv2.putText(annotated, label, (bx, max(20, by - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+            # Also draw bounding box and center on mask for visual clarity
+            cv2.rectangle(mask_bgr, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
+            cv2.circle(mask_bgr, (int(cx), int(cy)), 6, (0, 0, 255), -1)
 
             result = DetectionResult(
                 found=True,
@@ -279,17 +520,70 @@ class SockDetector:
                 area=best_area,
                 bbox=best_bbox,
                 annotated_frame=annotated,
+                raw_frame=frame.copy(),
+                mask_frame=mask_bgr,
             )
         else:
             cv2.putText(annotated, "NO SOCK DETECTED", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            result = DetectionResult(found=False, annotated_frame=annotated)
+            result = DetectionResult(
+                found=False,
+                annotated_frame=annotated,
+                raw_frame=frame.copy(),
+                mask_frame=mask_bgr,
+            )
 
-        # Save debug inspection snapshot
-        if self.save_debug_image and self.debug_image_path:
+        # 7. Build 3-panel combined debug frame: [ Actual Raw | Segmented Mask | Annotated Detection ]
+        p_raw = frame.copy()
+        cv2.putText(p_raw, "ACTUAL CAMERA", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+
+        p_mask = mask_bgr.copy()
+        cv2.putText(p_mask, "SEGMENTED MASK", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+
+        p_ann = annotated.copy()
+        cv2.putText(p_ann, "DETECTION & RETICLE", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+
+        rw, rh = 426, 320
+        c_raw = cv2.resize(p_raw, (rw, rh))
+        c_mask = cv2.resize(p_mask, (rw, rh))
+        c_ann = cv2.resize(p_ann, (rw, rh))
+        combined = np.hstack([c_raw, c_mask, c_ann])
+        result.combined_frame = combined
+
+        # 8. Save debug images to disk
+        if self.save_debug_image:
             try:
-                cv2.imwrite(self.debug_image_path, annotated)
-            except Exception:
-                pass
+                if self.debug_image_path:
+                    cv2.imwrite(self.debug_image_path, annotated)
+                if self.debug_raw_path:
+                    cv2.imwrite(self.debug_raw_path, frame)
+                if self.debug_mask_path:
+                    cv2.imwrite(self.debug_mask_path, mask_bgr)
+                if self.debug_combined_path:
+                    cv2.imwrite(self.debug_combined_path, combined)
+
+                # Also save easy-access files in current workspace
+                cv2.imwrite("debug_actual.jpg", frame)
+                cv2.imwrite("debug_segmented.jpg", mask_bgr)
+                cv2.imwrite("debug_combined.jpg", combined)
+            except Exception as e:
+                logger.debug("Error saving debug images: %s", e)
+
+        # 9. Update live HTTP web stream
+        if self.enable_web_stream:
+            VisionDebugServer.update(
+                raw_frame=frame,
+                mask_frame=mask_bgr,
+                annotated_frame=annotated,
+                combined_frame=combined,
+                meta={
+                    "found": result.found,
+                    "cx": result.cx,
+                    "cy": result.cy,
+                    "error_x": result.error_x,
+                    "error_y": result.error_y,
+                    "area": result.area,
+                }
+            )
 
         return result
 
@@ -303,7 +597,8 @@ class VisionGraspPlanner:
         self.pan_gain = float(serv.get("pan_gain", 22.0))
         self.lift_gain = float(serv.get("lift_gain", 15.0))
         self.align_tolerance = float(serv.get("align_tolerance", 0.12))
-        self.grasp_verification_threshold = float(c4.get("grasp_verification_threshold_pct", 12.0))
+        self.grasp_verification_threshold = float(c4.get("grasp_verification_threshold_pct", 5.8))
+        self.abort_on_miss = bool(c4.get("abort_on_miss", False))
         self.scan_sweep_angles = c4.get("scan_sweep_angles", [0.0, -28.0, 28.0])
 
         # Default poses

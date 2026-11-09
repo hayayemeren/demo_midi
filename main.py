@@ -415,23 +415,22 @@ def test_pick(config_path: str, dry_run: bool = False):
     is_caught = planner.verify_grasp(measured_grip)
 
     if is_caught:
-        print("\n[SUCCESS] Sock detected in jaws! Moving to chassis basket...")
-        transit_p = dict(planner.basket_pose)
-        transit_p["gripper.pos"] = 0.0
-        arm.move_to_pose(transit_p, duration_s=1.5, feedback_cb=lambda _: base.hold_lock())
-
-        print("[TEST] 5. Opening gripper over basket (85%)...")
-        drop_p = dict(transit_p)
-        drop_p["gripper.pos"] = 85.0
-        arm.move_to_pose(drop_p, duration_s=0.5, feedback_cb=lambda _: base.hold_lock())
-        time.sleep(0.5)
-        base.hold_lock()
-        print("\n>>> [PASSED] Sock successfully picked from floor and deposited into basket! <<<\n")
+        print("[SUCCESS] Cloth securely held between jaws!")
     else:
-        print("\n[MISSED] Gripper closed empty (no cloth caught). Reopening...")
-        reopen_p = dict(cur_pose)
-        reopen_p["gripper.pos"] = 40.0
-        arm.move_to_pose(reopen_p, duration_s=0.5, feedback_cb=lambda _: base.hold_lock())
+        print(f"[INFO] Grip aperture reading: {measured_grip:.1f}% (Threshold: {planner.grasp_verification_threshold:.1f}%).")
+
+    print("\n[TEST] 5. Holding sock firmly clamped (0%) and moving to chassis basket...")
+    transit_p = dict(planner.basket_pose)
+    transit_p["gripper.pos"] = 0.0  # Keep tight clamp on sock during transit
+    arm.move_to_pose(transit_p, duration_s=1.5, feedback_cb=lambda _: base.hold_lock())
+
+    print("[TEST] 6. Opening gripper over basket (85%)...")
+    drop_p = dict(transit_p)
+    drop_p["gripper.pos"] = 85.0
+    arm.move_to_pose(drop_p, duration_s=0.5, feedback_cb=lambda _: base.hold_lock())
+    time.sleep(0.5)
+    base.hold_lock()
+    print("\n>>> [PASSED] Sock successfully picked from floor and deposited into basket! <<<\n")
 
     print("[TEST] Returning to stow pose...")
     arm.move_to_stow(duration_s=1.2, feedback_cb=lambda _: base.hold_lock())

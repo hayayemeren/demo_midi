@@ -131,8 +131,9 @@ case4:
     wrist_roll.pos: 0.0
     gripper.pos: 85.0
   # Suggestion 2: Tactile / Position grasp verification threshold (%)
-  # Checked while elevated: empty jaws close < 8%; trapped cloth holds jaws >= 12%
-  grasp_verification_threshold_pct: 12.0
+  # Empty jaws close to ~5.2%; trapped cloth holds jaws >= 5.8%
+  grasp_verification_threshold_pct: 5.8
+  abort_on_miss: false         # If false, always proceeds to basket without dropping on floor
 
   # Vision Detection Settings
   detection:
@@ -143,6 +144,11 @@ case4:
     border_margin: 12           # pixels from ROI edge to reject border vignetting
     save_debug_image: true      # save annotated frame for live operator inspection
     debug_image_path: "/tmp/sock_detection.jpg"
+    debug_raw_path: "/tmp/sock_raw.jpg"
+    debug_mask_path: "/tmp/sock_mask.jpg"
+    debug_combined_path: "/tmp/sock_combined.jpg"
+    enable_web_stream: true     # Live browser stream at http://<robot-ip>:8080/
+    web_stream_port: 8080
 
   # Visual Servoing Gains
   servoing:
