@@ -11,6 +11,7 @@ import http.server
 import json
 import math
 import os
+import socket
 import socketserver
 import threading
 import time
@@ -39,8 +40,14 @@ class DetectionResult:
     combined_frame: Optional[np.ndarray] = None
 
 
+class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    """Multi-threaded TCP server to handle simultaneous HTTP requests and persistent MJPEG streams."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 class VisionDebugHandler(http.server.BaseHTTPRequestHandler):
-    """HTTP handler serving actual camera frames and segmented masks for operator debugging."""
+    """HTTP handler serving real-time MJPEG streams and snapshots for operator debugging."""
 
     def log_message(self, format, *args):
         pass  # Suppress continuous HTTP access logs in console
@@ -58,6 +65,14 @@ class VisionDebugHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(srv.get_dashboard_html().encode("utf-8"))
+        elif path in ("/stream/combined", "/stream.mjpg"):
+            srv.stream_mjpeg(self, "combined")
+        elif path == "/stream/raw":
+            srv.stream_mjpeg(self, "raw")
+        elif path in ("/stream/mask", "/stream/segmented"):
+            srv.stream_mjpeg(self, "mask")
+        elif path in ("/stream/detection", "/stream/annotated"):
+            srv.stream_mjpeg(self, "detection")
         elif path == "/raw.jpg":
             srv.serve_image(self, srv._latest_raw, "ACTUAL CAMERA FRAME")
         elif path in ("/mask.jpg", "/segmented.jpg"):
@@ -70,14 +85,17 @@ class VisionDebugHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            self.wfile.write(json.dumps(srv._latest_meta).encode("utf-8"))
+            with srv._lock:
+                meta = dict(srv._latest_meta)
+            self.wfile.write(json.dumps(meta).encode("utf-8"))
         else:
             self.send_error(404, "Not Found")
 
 
 class VisionDebugServer:
-    """Lightweight HTTP server publishing actual camera and segmented mask images for live browser debugging."""
+    """Lightweight HTTP server publishing live MJPEG video streams and segmented masks."""
     _instance: Optional[VisionDebugServer] = None
     _lock = threading.Lock()
 
@@ -87,7 +105,7 @@ class VisionDebugServer:
         self._latest_mask: Optional[bytes] = None
         self._latest_annotated: Optional[bytes] = None
         self._latest_combined: Optional[bytes] = None
-        self._latest_meta: Dict[str, Any] = {"found": False, "cx": 0, "cy": 0, "area": 0}
+        self._latest_meta: Dict[str, Any] = {"found": False, "cx": 0, "cy": 0, "area": 0, "fps": 0.0}
         self.server: Optional[socketserver.TCPServer] = None
         self.thread: Optional[threading.Thread] = None
         self.started = False
@@ -114,7 +132,7 @@ class VisionDebugServer:
 
         with cls._lock:
             if meta:
-                inst._latest_meta = meta
+                inst._latest_meta.update(meta)
             if raw_frame is not None:
                 _, buf = cv2.imencode(".jpg", raw_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 inst._latest_raw = buf.tobytes()
@@ -144,16 +162,57 @@ class VisionDebugServer:
         handler.end_headers()
         handler.wfile.write(jpeg_bytes)
 
+    def stream_mjpeg(self, handler, stream_type: str = "combined"):
+        """Serve continuous real-time MJPEG video stream over HTTP multipart."""
+        try:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            handler.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            handler.send_header("Pragma", "no-cache")
+            handler.send_header("Access-Control-Allow-Origin", "*")
+            handler.end_headers()
+        except Exception:
+            return
+
+        last_bytes = None
+        while self.started:
+            try:
+                with self._lock:
+                    if stream_type == "raw":
+                        cur_bytes = self._latest_raw
+                    elif stream_type == "mask":
+                        cur_bytes = self._latest_mask
+                    elif stream_type == "detection":
+                        cur_bytes = self._latest_annotated
+                    else:
+                        cur_bytes = self._latest_combined
+
+                if cur_bytes is not None and cur_bytes != last_bytes:
+                    last_bytes = cur_bytes
+                    header = (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(cur_bytes)).encode("ascii") + b"\r\n\r\n"
+                    )
+                    handler.wfile.write(header + cur_bytes + b"\r\n")
+                    handler.wfile.flush()
+
+                time.sleep(0.04)  # ~25 FPS max stream output rate
+            except (BrokenPipeError, ConnectionResetError, socket.error):
+                break
+            except Exception:
+                break
+
     def start(self):
         if self.started:
             return
         try:
-            socketserver.TCPServer.allow_reuse_address = True
-            self.server = socketserver.TCPServer(("", self.port), VisionDebugHandler)
+            ThreadedTCPServer.allow_reuse_address = True
+            self.server = ThreadedTCPServer(("", self.port), VisionDebugHandler)
             self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
             self.thread.start()
             self.started = True
-            logger.info(">>> [VISION DEBUG] Live Web Stream active at http://0.0.0.0:%d/ <<<", self.port)
+            logger.info(">>> [VISION DEBUG] Live Web MJPEG Stream active at http://0.0.0.0:%d/ <<<", self.port)
         except Exception as e:
             logger.warning("Could not start Vision Debug Web Server on port %d: %s", self.port, e)
 
@@ -163,12 +222,13 @@ class VisionDebugServer:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MIDI Robot - Vision Debug Stream</title>
+    <title>MIDI Robot - Live Vision Debug Stream</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #121214; color: #e1e1e6; margin: 0; padding: 20px; }
         h1 { margin: 0 0 10px 0; font-size: 22px; color: #00d26a; }
         .meta-bar { background: #1e1e24; padding: 12px 18px; border-radius: 8px; margin-bottom: 20px; display: flex; gap: 20px; align-items: center; border: 1px solid #333; flex-wrap: wrap; }
         .badge { padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 14px; }
+        .badge-live { background: #0088ff; color: #fff; }
         .badge-found { background: #00d26a; color: #000; }
         .badge-none { background: #e02424; color: #fff; }
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 20px; }
@@ -182,53 +242,49 @@ class VisionDebugServer:
 <body>
     <h1>MIDI Robot: Live Wrist Camera & Segmentation Debugger</h1>
     <div class="meta-bar">
-        <div>Detection: <span id="status-badge" class="badge badge-none">WAITING</span></div>
+        <div>Video: <span class="badge badge-live">LIVE MJPEG</span></div>
+        <div>Detection: <span id="status-badge" class="badge badge-none">SEARCHING FLOOR...</span></div>
+        <div>Rate: <span id="fps-text" style="font-weight: bold; color: #00d26a;">-- FPS</span></div>
         <div>Offset: <span id="offset-text">eX: 0.00, eY: 0.00</span></div>
         <div>Cloth Area: <span id="area-text">0 px</span></div>
         <div style="margin-left: auto;">
-            <button class="btn" onclick="refreshNow()">Force Refresh</button>
+            <button class="btn" onclick="reloadStreams()">Reconnect Streams</button>
         </div>
     </div>
 
     <div class="grid">
         <div class="card full-width">
             <div class="card-header">
-                <span>Multi-View Composite (Actual Raw | Segmented Mask | Annotated Reticle)</span>
-                <a href="/combined.jpg" target="_blank" style="color: #00d26a; text-decoration: none;">Open Full Image</a>
+                <span>Multi-View Live Stream (Actual Raw | Segmented Mask | Annotated Reticle)</span>
+                <a href="/stream/combined" target="_blank" style="color: #00d26a; text-decoration: none;">Direct Stream</a>
             </div>
-            <img id="img-combined" src="/combined.jpg" alt="Combined Multi-View">
+            <img id="img-combined" src="/stream/combined" alt="Combined Multi-View Stream">
         </div>
         <div class="card">
             <div class="card-header">
-                <span>1. Actual Camera Frame (Raw)</span>
-                <a href="/raw.jpg" target="_blank" style="color: #00d26a; text-decoration: none;">Raw JPG</a>
+                <span>1. Actual Camera Frame (Live)</span>
+                <a href="/stream/raw" target="_blank" style="color: #00d26a; text-decoration: none;">Direct Stream</a>
             </div>
-            <img id="img-raw" src="/raw.jpg" alt="Actual Camera Image">
+            <img id="img-raw" src="/stream/raw" alt="Actual Camera Stream">
         </div>
         <div class="card">
             <div class="card-header">
-                <span>2. Segmented Mask (Foreground Filter)</span>
-                <a href="/mask.jpg" target="_blank" style="color: #00d26a; text-decoration: none;">Mask JPG</a>
+                <span>2. Segmented Mask (Live Filter)</span>
+                <a href="/stream/mask" target="_blank" style="color: #00d26a; text-decoration: none;">Direct Stream</a>
             </div>
-            <img id="img-mask" src="/mask.jpg" alt="Segmented Mask">
+            <img id="img-mask" src="/stream/mask" alt="Segmented Mask Stream">
         </div>
         <div class="card">
             <div class="card-header">
                 <span>3. Detection Overlay (Grasp Target)</span>
-                <a href="/detection.jpg" target="_blank" style="color: #00d26a; text-decoration: none;">Detection JPG</a>
+                <a href="/stream/detection" target="_blank" style="color: #00d26a; text-decoration: none;">Direct Stream</a>
             </div>
-            <img id="img-detection" src="/detection.jpg" alt="Annotated Detection">
+            <img id="img-detection" src="/stream/detection" alt="Annotated Detection Stream">
         </div>
     </div>
 
     <script>
-        function updateImages() {
-            const t = Date.now();
-            document.getElementById('img-combined').src = '/combined.jpg?t=' + t;
-            document.getElementById('img-raw').src = '/raw.jpg?t=' + t;
-            document.getElementById('img-mask').src = '/mask.jpg?t=' + t;
-            document.getElementById('img-detection').src = '/detection.jpg?t=' + t;
-
+        function checkStatus() {
             fetch('/status.json')
                 .then(r => r.json())
                 .then(d => {
@@ -242,18 +298,29 @@ class VisionDebugServer:
                     }
                     document.getElementById('offset-text').innerText = 'eX: ' + (d.error_x >= 0 ? '+' : '') + Number(d.error_x || 0).toFixed(2) + ', eY: ' + (d.error_y >= 0 ? '+' : '') + Number(d.error_y || 0).toFixed(2);
                     document.getElementById('area-text').innerText = Math.round(d.area || 0) + ' px';
+                    if (d.fps !== undefined) {
+                        document.getElementById('fps-text').innerText = Number(d.fps).toFixed(1) + ' FPS';
+                    }
                 })
                 .catch(() => {});
         }
-        function refreshNow() { updateImages(); }
-        setInterval(updateImages, 500);
+
+        function reloadStreams() {
+            const t = Date.now();
+            document.getElementById('img-combined').src = '/stream/combined?t=' + t;
+            document.getElementById('img-raw').src = '/stream/raw?t=' + t;
+            document.getElementById('img-mask').src = '/stream/mask?t=' + t;
+            document.getElementById('img-detection').src = '/stream/detection?t=' + t;
+        }
+
+        setInterval(checkStatus, 300);
     </script>
 </body>
 </html>"""
 
 
 class WristCamera:
-    """Manages wrist camera video capture with fallback and dry-run simulation."""
+    """Manages wrist camera video capture with fallback, background streaming, and dry-run simulation."""
 
     def __init__(
         self,
@@ -272,6 +339,15 @@ class WristCamera:
         self.dry_run = dry_run
         self.cap: Optional[cv2.VideoCapture] = None
         self.is_opened = False
+
+        # Live background stream worker
+        self._streaming = False
+        self._stream_thread: Optional[threading.Thread] = None
+        self._frame_lock = threading.Lock()
+        self._latest_raw_frame: Optional[np.ndarray] = None
+        self._detector: Optional[Any] = None
+        self._target_fps: float = 20.0
+        self._measured_fps: float = 0.0
 
     def connect(self) -> bool:
         """Initialize camera capture."""
@@ -307,20 +383,95 @@ class WristCamera:
         self.is_opened = False
         return False
 
+    def _generate_synthetic_frame(self) -> np.ndarray:
+        """Generate a realistic synthetic camera frame with simulated sock."""
+        frame = np.full((self.height, self.width, 3), 150, dtype=np.uint8)
+        noise = np.random.randint(-15, 15, (self.height, self.width, 3), dtype=np.int16)
+        frame = np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+        cv2.ellipse(frame, (340, 220), (45, 25), 20, 0, 360, (30, 30, 40), -1)
+        cv2.fillPoly(frame, [np.array([[180, 480], [240, 340], [280, 360], [220, 480]])], (180, 150, 0))
+        cv2.fillPoly(frame, [np.array([[460, 480], [400, 340], [360, 360], [420, 480]])], (180, 150, 0))
+        return frame
+
+    def start_stream(self, detector: Optional[Any] = None, target_fps: float = 20.0):
+        """Start continuous background video capture and live detection stream."""
+        if self._streaming:
+            if detector is not None:
+                self._detector = detector
+            return
+
+        if not self.is_opened:
+            if not self.connect():
+                logger.warning("Cannot start camera live stream: camera failed to open.")
+                return
+
+        self._detector = detector
+        self._target_fps = target_fps
+        self._streaming = True
+        self._stream_thread = threading.Thread(target=self._stream_worker, daemon=True)
+        self._stream_thread.start()
+        logger.info(">>> Wrist camera background live stream worker started (~%.1f FPS) <<<", self._target_fps)
+
+    def stop_stream(self):
+        """Stop background capture worker."""
+        self._streaming = False
+        if self._stream_thread and self._stream_thread.is_alive():
+            self._stream_thread.join(timeout=1.0)
+            self._stream_thread = None
+
+    def _stream_worker(self):
+        """Background thread continuously pulling frames and updating debug stream at high FPS."""
+        interval = 1.0 / max(1.0, self._target_fps)
+        frame_count = 0
+        fps_t0 = time.time()
+
+        while self._streaming:
+            loop_start = time.time()
+            if self.dry_run:
+                frame = self._generate_synthetic_frame()
+                ret = True
+            else:
+                if self.cap is None or not self.cap.isOpened():
+                    time.sleep(0.1)
+                    continue
+                ret, frame = self.cap.read()
+
+            if ret and frame is not None:
+                with self._frame_lock:
+                    self._latest_raw_frame = frame
+
+                frame_count += 1
+                fps_elapsed = time.time() - fps_t0
+                if fps_elapsed >= 1.0:
+                    self._measured_fps = frame_count / fps_elapsed
+                    frame_count = 0
+                    fps_t0 = time.time()
+
+                # Process detection continuously to update the web debugger in real time
+                if self._detector is not None:
+                    try:
+                        self._detector.detect(frame)
+                        srv = VisionDebugServer._instance
+                        if srv and srv.started:
+                            with srv._lock:
+                                srv._latest_meta["fps"] = round(self._measured_fps, 1)
+                    except Exception as e:
+                        logger.debug("Background detector stream error: %s", e)
+
+            elapsed = time.time() - loop_start
+            sleep_t = interval - elapsed
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+
     def capture_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """Read a single frame from the camera."""
+        """Read a frame: immediately returns latest buffered frame if streaming, or queries cap."""
+        if self._streaming:
+            with self._frame_lock:
+                if self._latest_raw_frame is not None:
+                    return True, self._latest_raw_frame.copy()
+
         if self.dry_run:
-            # Generate a realistic synthetic camera frame with simulated sock
-            frame = np.full((self.height, self.width, 3), 150, dtype=np.uint8)
-            # Add synthetic floor texture
-            noise = np.random.randint(-15, 15, (self.height, self.width, 3), dtype=np.int16)
-            frame = np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-            # Draw synthetic dark sock near center
-            cv2.ellipse(frame, (340, 220), (45, 25), 20, 0, 360, (30, 30, 40), -1)
-            # Draw synthetic cyan gripper tips at bottom
-            cv2.fillPoly(frame, [np.array([[180, 480], [240, 340], [280, 360], [220, 480]])], (180, 150, 0))
-            cv2.fillPoly(frame, [np.array([[460, 480], [400, 340], [360, 360], [420, 480]])], (180, 150, 0))
-            return True, frame
+            return True, self._generate_synthetic_frame()
 
         if not self.is_opened or self.cap is None:
             if not self.connect():
@@ -331,10 +482,13 @@ class WristCamera:
             logger.warning("Wrist camera failed to capture frame!")
             return False, None
 
+        with self._frame_lock:
+            self._latest_raw_frame = frame
         return True, frame
 
     def release(self):
         """Cleanly release camera resources."""
+        self.stop_stream()
         if self.cap is not None:
             self.cap.release()
             self.cap = None
@@ -628,6 +782,16 @@ class VisionGraspPlanner:
             "wrist_roll.pos": 0.0,
             "gripper.pos": 0.0,
         })
+
+        # Motion timing (seconds) - Slow and gentle for stability
+        mot = c4.get("motion", {})
+        self.scan_move_duration_s = float(mot.get("scan_move_duration_s", 1.5))
+        self.descend_duration_s = float(mot.get("descend_duration_s", 2.5))
+        self.clamp_duration_s = float(mot.get("clamp_duration_s", 1.2))
+        self.lift_duration_s = float(mot.get("lift_duration_s", 1.5))
+        self.basket_duration_s = float(mot.get("basket_duration_s", 3.2))
+        self.release_duration_s = float(mot.get("release_duration_s", 0.8))
+        self.stow_duration_s = float(mot.get("stow_duration_s", 2.5))
 
     def compute_aligned_pose(
         self,

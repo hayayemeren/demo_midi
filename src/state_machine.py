@@ -141,6 +141,7 @@ class DemoStateMachine:
             self.server.start()
         elif self.demo_case == 4 and self.camera is not None:
             self.camera.connect()
+            self.camera.start_stream(detector=self.detector)
 
         if self.demo_case == 1:
             case_desc = f"Case 1: {COLOR_MAGENTA}SO-100 LEADER ARM TELEOPERATION (Pi Local){COLOR_RESET}"
@@ -427,6 +428,7 @@ class DemoStateMachine:
         )
 
         detected_sock = None
+        scan_t = getattr(self.planner, "scan_move_duration_s", 1.5)
         for angle in sweep_angles:
             if (not self.running and not self.arm.dry_run) or gp.brake or gp.button_b_held:
                 break
@@ -436,7 +438,7 @@ class DemoStateMachine:
             scan_target["shoulder_pan.pos"] = float(angle)
             self.arm.move_to_pose(
                 scan_target,
-                duration_s=0.9,
+                duration_s=scan_t,
                 feedback_cb=lambda _: self.base.hold_lock(),
             )
             time.sleep(0.20)
@@ -524,30 +526,34 @@ class DemoStateMachine:
             self.state = DemoState.PARKING
             return
 
+        descend_t = getattr(self.planner, "descend_duration_s", 2.5)
+        clamp_t = getattr(self.planner, "clamp_duration_s", 1.2)
+        lift_t = getattr(self.planner, "lift_duration_s", 1.5)
+
         logger.info("\n[GRASP] 1. Opening gripper wide (85%)...")
         cur_pose = self.arm.get_follower_pose()
         open_pose = dict(cur_pose)
         open_pose["gripper.pos"] = 85.0
-        self.arm.move_to_pose(open_pose, duration_s=0.6, feedback_cb=lambda _: self.base.hold_lock())
+        self.arm.move_to_pose(open_pose, duration_s=0.8, feedback_cb=lambda _: self.base.hold_lock())
 
-        logger.info("[GRASP] 2. Lowering arm down to floor grasp pose...")
+        logger.info("[GRASP] 2. Lowering arm down to floor grasp pose (%.1fs smooth descent)...", descend_t)
         grasp_pose = self.planner.compute_grasp_pose(open_pose)
         grasp_descend = dict(grasp_pose)
         grasp_descend["gripper.pos"] = 85.0
-        self.arm.move_to_pose(grasp_descend, duration_s=1.0, feedback_cb=lambda _: self.base.hold_lock())
+        self.arm.move_to_pose(grasp_descend, duration_s=descend_t, feedback_cb=lambda _: self.base.hold_lock())
 
-        logger.info("[GRASP] 3. Clamping gripper jaws onto sock (0%)...")
+        logger.info("[GRASP] 3. Clamping gripper jaws onto sock (0%%) over %.1fs...", clamp_t)
         grasp_clamp = dict(grasp_descend)
         grasp_clamp["gripper.pos"] = 0.0
-        self.arm.move_to_pose(grasp_clamp, duration_s=0.8, feedback_cb=lambda _: self.base.hold_lock())
+        self.arm.move_to_pose(grasp_clamp, duration_s=clamp_t, feedback_cb=lambda _: self.base.hold_lock())
         time.sleep(0.3)
         self.base.hold_lock()
 
-        logger.info("[GRASP] 4. Elevating arm off floor to verify grasp...")
+        logger.info("[GRASP] 4. Elevating arm off floor to verify grasp (%.1fs)...", lift_t)
         lift_verify_pose = dict(grasp_clamp)
         lift_verify_pose["shoulder_lift.pos"] -= 15.0  # elevate shoulder
         lift_verify_pose["elbow_flex.pos"] -= 10.0     # pull up elbow
-        self.arm.move_to_pose(lift_verify_pose, duration_s=0.6, feedback_cb=lambda _: self.base.hold_lock())
+        self.arm.move_to_pose(lift_verify_pose, duration_s=lift_t, feedback_cb=lambda _: self.base.hold_lock())
         time.sleep(0.3)
         self.base.hold_lock()
 
@@ -594,19 +600,22 @@ class DemoStateMachine:
             self.state = DemoState.PARKING
             return
 
-        logger.info("\n[BASKET] 1. Moving arm over collection basket (behind gripper, elevated)...")
+        basket_t = getattr(self.planner, "basket_duration_s", 3.2)
+        release_t = getattr(self.planner, "release_duration_s", 0.8)
+
+        logger.info("\n[BASKET] 1. Moving arm over collection basket (%.1fs gentle swing)...", basket_t)
         transit_pose = dict(self.planner.basket_pose)
         transit_pose["gripper.pos"] = 0.0  # Hold sock firmly during transit
         self.arm.move_to_pose(
             transit_pose,
-            duration_s=1.2,
+            duration_s=basket_t,
             feedback_cb=lambda _: self.base.hold_lock(),
         )
 
-        logger.info("[BASKET] 2. Releasing sock into basket (opening gripper to 85%)...")
+        logger.info("[BASKET] 2. Releasing sock into basket (opening gripper to 85%% over %.1fs)...", release_t)
         drop_pose = dict(transit_pose)
         drop_pose["gripper.pos"] = 85.0
-        self.arm.move_to_pose(drop_pose, duration_s=0.5, feedback_cb=lambda _: self.base.hold_lock())
+        self.arm.move_to_pose(drop_pose, duration_s=release_t, feedback_cb=lambda _: self.base.hold_lock())
         time.sleep(0.5)
         self.base.hold_lock()
 
@@ -618,9 +627,10 @@ class DemoStateMachine:
     def _handle_parking(self):
         """Base is locked; smoothly park follower arm back to safe stow pose."""
         self.base.hold_lock()
-        logger.info("\n[PARK] Returning Follower arm to safe Stow Pose...")
+        stow_t = getattr(self.planner, "stow_duration_s", 2.5) if self.planner else 2.5
+        logger.info("\n[PARK] Returning Follower arm to safe Stow Pose over %.1fs...", stow_t)
         self.arm.move_to_stow(
-            duration_s=self.arm.interpolation_time,
+            duration_s=stow_t,
             feedback_cb=lambda _: self.base.hold_lock(),
         )
         self.base.release_brakes()

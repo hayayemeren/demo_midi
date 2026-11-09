@@ -230,10 +230,12 @@ class ArmController:
         feedback_cb: Optional[Callable[[float], None]] = None,
     ):
         """Execute smooth cosine trajectory from start_pose to target_pose."""
+        effective_duration = min(duration_s, 0.05) if self.dry_run else duration_s
+        effective_dt = min(step_dt, 0.01) if self.dry_run else step_dt
         t0 = time.time()
         while True:
             elapsed = time.time() - t0
-            progress = min(1.0, elapsed / max(0.001, duration_s))
+            progress = min(1.0, elapsed / max(0.001, effective_duration))
             cmd_pose = cosine_interpolate(start_pose, target_pose, progress)
             self.send_follower_action(cmd_pose)
 
@@ -242,7 +244,7 @@ class ArmController:
 
             if progress >= 1.0:
                 break
-            time.sleep(step_dt)
+            time.sleep(effective_dt)
 
     def move_to_stow(self, duration_s: Optional[float] = None, feedback_cb = None):
         """Smoothly park the follower arm into the safe stowed travel pose."""

@@ -155,3 +155,13 @@ case4:
     pan_gain: 22.0              # max pan angle correction in degrees
     lift_gain: 15.0             # max lift angle correction in degrees
     align_tolerance: 0.12       # normalized centering threshold [-1.0, 1.0]
+
+  # Motion Timing (seconds) - Smooth, gentle S-curve transitions
+  motion:
+    scan_move_duration_s: 1.5   # Camera pan sweep duration
+    descend_duration_s: 2.5     # Descent to floor grasp pose
+    clamp_duration_s: 1.2       # Gripper clamping onto sock
+    lift_duration_s: 1.5        # Elevating arm off floor
+    basket_duration_s: 3.2      # Swing arm over chassis basket
+    release_duration_s: 0.8     # Opening gripper over basket
+    stow_duration_s: 2.5        # Parking arm into travel stow pose

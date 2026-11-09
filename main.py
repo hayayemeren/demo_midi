@@ -23,7 +23,7 @@ from src.arm_controller import ArmController
 from src.base_controller import BaseController
 from src.gamepad import F710Gamepad
 from src.state_machine import DemoStateMachine
-from src.vision_grasp import VisionGraspPlanner
+from src.vision_grasp import VisionGraspPlanner, WristCamera, SockDetector
 
 
 def setup_logging(verbose: bool = False):
@@ -363,7 +363,7 @@ def teach_grasp(config_path: str, dry_run: bool = False):
 
 
 def test_pick(config_path: str, dry_run: bool = False):
-    """Test full pick-and-place sequence from floor to basket to verify reach and grip."""
+    """Test full pick-and-place sequence from floor to basket with gentle motions and live web debug stream."""
     print("\n" + "=" * 64)
     print("      TEST FLOOR PICKUP & BASKET DEPOSIT SEQUENCE")
     print("=" * 64)
@@ -379,63 +379,101 @@ def test_pick(config_path: str, dry_run: bool = False):
         base.release_brakes()
         return
 
-    planner = VisionGraspPlanner(config)
-    print("\n[TEST] 1. Moving to scan/approach pose (gripper open 85%)...")
-    scan_p = dict(planner.scan_pose)
-    scan_p["gripper.pos"] = 85.0
-    arm.move_to_pose(scan_p, duration_s=1.2, feedback_cb=lambda _: base.hold_lock())
+    # Start live camera and vision web debugger if available
+    camera = None
+    try:
+        cam_cfg = config.get("case4", {}).get("camera", {})
+        det_cfg = config.get("case4", {}).get("detection", {})
+        camera = WristCamera(
+            device_path=cam_cfg.get("device", "/dev/video0"),
+            fallback_index=int(cam_cfg.get("fallback", 0)),
+            width=int(cam_cfg.get("width", 640)),
+            height=int(cam_cfg.get("height", 480)),
+            fps=int(cam_cfg.get("fps", 30)),
+            dry_run=dry_run,
+        )
+        detector = SockDetector(
+            mode=det_cfg.get("mode", "auto"),
+            min_area=float(det_cfg.get("min_area", 1000.0)),
+            max_area=float(det_cfg.get("max_area", 80000.0)),
+            contrast_threshold=float(det_cfg.get("contrast_threshold", 38.0)),
+            enable_web_stream=True,
+            web_stream_port=int(det_cfg.get("web_stream_port", 8080)),
+        )
+        if camera.connect():
+            camera.start_stream(detector=detector)
+            print(">>> [VISION DEBUG] Live Web MJPEG Stream active at http://<robot-ip>:8080/ <<<\n")
+    except Exception as e:
+        print(f"Note: Camera live stream not available: {e}")
 
-    print("[TEST] 2. Descending to calibrated floor grasp pose...")
-    grasp_p = planner.compute_grasp_pose(scan_p)
-    grasp_open = dict(grasp_p)
-    grasp_open["gripper.pos"] = 85.0
-    arm.move_to_pose(grasp_open, duration_s=1.2, feedback_cb=lambda _: base.hold_lock())
+    try:
+        planner = VisionGraspPlanner(config)
+        descend_t = planner.descend_duration_s
+        clamp_t = planner.clamp_duration_s
+        lift_t = planner.lift_duration_s
+        basket_t = planner.basket_duration_s
+        release_t = planner.release_duration_s
+        stow_t = planner.stow_duration_s
 
-    print("[TEST] 3. Clamping gripper jaws onto sock (0%)...")
-    grasp_clamp = dict(grasp_open)
-    grasp_clamp["gripper.pos"] = 0.0
-    arm.move_to_pose(grasp_clamp, duration_s=0.8, feedback_cb=lambda _: base.hold_lock())
-    time.sleep(0.3)
-    base.hold_lock()
+        print("\n[TEST] 1. Moving to scan/approach pose (gripper open 85%)...")
+        scan_p = dict(planner.scan_pose)
+        scan_p["gripper.pos"] = 85.0
+        arm.move_to_pose(scan_p, duration_s=1.8, feedback_cb=lambda _: base.hold_lock())
 
-    print("[TEST] 4. Elevating arm 15 cm off floor to verify grip...")
-    lift_p = dict(grasp_clamp)
-    lift_p["shoulder_lift.pos"] -= 15.0
-    lift_p["elbow_flex.pos"] -= 10.0
-    arm.move_to_pose(lift_p, duration_s=0.7, feedback_cb=lambda _: base.hold_lock())
-    time.sleep(0.3)
-    base.hold_lock()
+        print(f"[TEST] 2. Descending to calibrated floor grasp pose ({descend_t:.1f}s smooth motion)...")
+        grasp_p = planner.compute_grasp_pose(scan_p)
+        grasp_open = dict(grasp_p)
+        grasp_open["gripper.pos"] = 85.0
+        arm.move_to_pose(grasp_open, duration_s=descend_t, feedback_cb=lambda _: base.hold_lock())
 
-    cur_pose = arm.get_follower_pose()
-    measured_grip = cur_pose.get("gripper.pos", 0.0)
-    if dry_run:
-        measured_grip = 25.0
+        print(f"[TEST] 3. Clamping gripper jaws onto sock (0%) over {clamp_t:.1f}s...")
+        grasp_clamp = dict(grasp_open)
+        grasp_clamp["gripper.pos"] = 0.0
+        arm.move_to_pose(grasp_clamp, duration_s=clamp_t, feedback_cb=lambda _: base.hold_lock())
+        time.sleep(0.3)
+        base.hold_lock()
 
-    print(f"\n>>> Measured gripper aperture: {measured_grip:.1f}% (Verification Threshold: {planner.grasp_verification_threshold:.1f}%) <<<")
-    is_caught = planner.verify_grasp(measured_grip)
+        print(f"[TEST] 4. Elevating arm off floor to verify grip ({lift_t:.1f}s)...")
+        lift_p = dict(grasp_clamp)
+        lift_p["shoulder_lift.pos"] -= 15.0
+        lift_p["elbow_flex.pos"] -= 10.0
+        arm.move_to_pose(lift_p, duration_s=lift_t, feedback_cb=lambda _: base.hold_lock())
+        time.sleep(0.3)
+        base.hold_lock()
 
-    if is_caught:
-        print("[SUCCESS] Cloth securely held between jaws!")
-    else:
-        print(f"[INFO] Grip aperture reading: {measured_grip:.1f}% (Threshold: {planner.grasp_verification_threshold:.1f}%).")
+        cur_pose = arm.get_follower_pose()
+        measured_grip = cur_pose.get("gripper.pos", 0.0)
+        if dry_run:
+            measured_grip = 25.0
 
-    print("\n[TEST] 5. Holding sock firmly clamped (0%) and moving to chassis basket...")
-    transit_p = dict(planner.basket_pose)
-    transit_p["gripper.pos"] = 0.0  # Keep tight clamp on sock during transit
-    arm.move_to_pose(transit_p, duration_s=1.5, feedback_cb=lambda _: base.hold_lock())
+        print(f"\n>>> Measured gripper aperture: {measured_grip:.1f}% (Verification Threshold: {planner.grasp_verification_threshold:.1f}%) <<<")
+        is_caught = planner.verify_grasp(measured_grip)
 
-    print("[TEST] 6. Opening gripper over basket (85%)...")
-    drop_p = dict(transit_p)
-    drop_p["gripper.pos"] = 85.0
-    arm.move_to_pose(drop_p, duration_s=0.5, feedback_cb=lambda _: base.hold_lock())
-    time.sleep(0.5)
-    base.hold_lock()
-    print("\n>>> [PASSED] Sock successfully picked from floor and deposited into basket! <<<\n")
+        if is_caught:
+            print("[SUCCESS] Cloth securely held between jaws!")
+        else:
+            print(f"[INFO] Grip aperture reading: {measured_grip:.1f}% (Threshold: {planner.grasp_verification_threshold:.1f}%).")
 
-    print("[TEST] Returning to stow pose...")
-    arm.move_to_stow(duration_s=1.2, feedback_cb=lambda _: base.hold_lock())
-    base.release_brakes()
-    print("Done.\n")
+        print(f"\n[TEST] 5. Holding sock firmly clamped (0%) and moving to chassis basket ({basket_t:.1f}s gentle transit)...")
+        transit_p = dict(planner.basket_pose)
+        transit_p["gripper.pos"] = 0.0  # Keep tight clamp on sock during transit
+        arm.move_to_pose(transit_p, duration_s=basket_t, feedback_cb=lambda _: base.hold_lock())
+
+        print(f"[TEST] 6. Opening gripper over basket (85%) over {release_t:.1f}s...")
+        drop_p = dict(transit_p)
+        drop_p["gripper.pos"] = 85.0
+        arm.move_to_pose(drop_p, duration_s=release_t, feedback_cb=lambda _: base.hold_lock())
+        time.sleep(0.5)
+        base.hold_lock()
+        print("\n>>> [PASSED] Sock successfully picked from floor and deposited into basket! <<<\n")
+
+        print(f"[TEST] Returning to stow pose over {stow_t:.1f}s...")
+        arm.move_to_stow(duration_s=stow_t, feedback_cb=lambda _: base.hold_lock())
+    finally:
+        if camera is not None:
+            camera.release()
+        base.release_brakes()
+        print("Done.\n")
 
 
 def parse_args():
