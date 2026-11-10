@@ -469,6 +469,17 @@ class WristCamera:
         time.sleep(0.2)
         ok = self.connect()
         if not ok:
+            # 1. Primary hardware recovery: power-cycle camera USB port via uhubctl
+            try:
+                logger.info("[CAMERA RECOVERY] Power cycling camera USB port via uhubctl...")
+                os.system("uhubctl -l 1-1.2 -p 2 -a cycle -d 1 >/dev/null 2>&1 || sudo -n uhubctl -l 1-1.2 -p 2 -a cycle -d 1 >/dev/null 2>&1")
+                time.sleep(1.0)
+                ok = self.connect()
+            except Exception:
+                pass
+
+        if not ok:
+            # 2. Secondary fallback: toggle USB authorized sysfs
             for sys_path in [
                 "/sys/bus/usb/devices/1-1.2.2/authorized",
                 "/sys/bus/usb/devices/1-1.2/authorized",
