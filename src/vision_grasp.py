@@ -595,8 +595,8 @@ class WristCamera:
                     frame_count = 0
                     fps_t0 = now
 
-                # Process detection continuously to update the web debugger in real time
-                if self._detector is not None:
+                # Process detection continuously to update the web debugger in real time only if web stream is enabled
+                if self._detector is not None and getattr(self._detector, "enable_web_stream", False):
                     try:
                         self._detector.detect(frame)
                         srv = VisionDebugServer._instance
@@ -698,7 +698,7 @@ class SockDetector:
         debug_raw_path: str = "/tmp/sock_raw.jpg",
         debug_mask_path: str = "/tmp/sock_mask.jpg",
         debug_combined_path: str = "/tmp/sock_combined.jpg",
-        enable_web_stream: bool = True,
+        enable_web_stream: bool = False,
         web_stream_port: int = 8080,
         roi_top_pct: float = 0.10,
         roi_bottom_pct: float = 0.68,
@@ -897,26 +897,29 @@ class SockDetector:
                 mask_frame=mask_bgr,
             )
 
-        # 7. Build 3-panel combined debug frame: [ Actual Raw | Segmented Mask | Annotated Detection ]
-        p_raw = frame.copy()
-        cv2.putText(p_raw, "ACTUAL CAMERA", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+        # 7. Build 3-panel combined debug frame only if needed for saving or web streaming
+        combined = None
+        now = time.time()
+        should_save = self.save_debug_image and (force_save or (now - self._last_disk_save_time >= 1.5))
+        if self.enable_web_stream or (should_save and self.debug_combined_path):
+            p_raw = frame.copy()
+            cv2.putText(p_raw, "ACTUAL CAMERA", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
-        p_mask = mask_bgr.copy()
-        cv2.putText(p_mask, "SEGMENTED MASK", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+            p_mask = mask_bgr.copy()
+            cv2.putText(p_mask, "SEGMENTED MASK", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
-        p_ann = annotated.copy()
-        cv2.putText(p_ann, "DETECTION & RETICLE", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+            p_ann = annotated.copy()
+            cv2.putText(p_ann, "DETECTION & RETICLE", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
-        rw, rh = 426, 320
-        c_raw = cv2.resize(p_raw, (rw, rh))
-        c_mask = cv2.resize(p_mask, (rw, rh))
-        c_ann = cv2.resize(p_ann, (rw, rh))
-        combined = np.hstack([c_raw, c_mask, c_ann])
+            rw, rh = 426, 320
+            c_raw = cv2.resize(p_raw, (rw, rh))
+            c_mask = cv2.resize(p_mask, (rw, rh))
+            c_ann = cv2.resize(p_ann, (rw, rh))
+            combined = np.hstack([c_raw, c_mask, c_ann])
         result.combined_frame = combined
 
-        # 8. Save debug images to disk (throttled to at most once every 1.5s unless force_save=True)
-        now = time.time()
-        if self.save_debug_image and (force_save or (now - self._last_disk_save_time >= 1.5)):
+        # 8. Save debug images to RAM disk /tmp (throttled to at most once every 1.5s unless force_save=True)
+        if should_save:
             self._last_disk_save_time = now
             try:
                 if self.debug_image_path:
@@ -925,18 +928,13 @@ class SockDetector:
                     cv2.imwrite(self.debug_raw_path, frame)
                 if self.debug_mask_path:
                     cv2.imwrite(self.debug_mask_path, mask_bgr)
-                if self.debug_combined_path:
+                if self.debug_combined_path and combined is not None:
                     cv2.imwrite(self.debug_combined_path, combined)
-
-                # Also save easy-access files in current workspace
-                cv2.imwrite("debug_actual.jpg", frame)
-                cv2.imwrite("debug_segmented.jpg", mask_bgr)
-                cv2.imwrite("debug_combined.jpg", combined)
             except Exception as e:
                 logger.debug("Error saving debug images: %s", e)
 
-        # 9. Update live HTTP web stream
-        if self.enable_web_stream:
+        # 9. Update live HTTP web stream only if enabled
+        if self.enable_web_stream and VisionDebugServer._instance and VisionDebugServer._instance.started:
             VisionDebugServer.update(
                 raw_frame=frame,
                 mask_frame=mask_bgr,

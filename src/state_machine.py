@@ -120,7 +120,7 @@ class DemoStateMachine:
                 debug_raw_path=det_cfg.get("debug_raw_path", "/tmp/sock_raw.jpg"),
                 debug_mask_path=det_cfg.get("debug_mask_path", "/tmp/sock_mask.jpg"),
                 debug_combined_path=det_cfg.get("debug_combined_path", "/tmp/sock_combined.jpg"),
-                enable_web_stream=bool(det_cfg.get("enable_web_stream", True)),
+                enable_web_stream=bool(det_cfg.get("enable_web_stream", False)),
                 web_stream_port=int(det_cfg.get("web_stream_port", 8080)),
             )
             self.planner = VisionGraspPlanner(self.config)
