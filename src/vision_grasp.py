@@ -390,26 +390,27 @@ class WristCamera:
             return True
 
         candidates = []
-        if self.device_path:
-            candidates.append(self.device_path)
-            if "video" in str(self.device_path):
-                try:
-                    candidates.append(int(str(self.device_path).split("video")[-1]))
-                except ValueError:
-                    pass
-
-        # Always add 0 and /dev/video0 as primary video nodes
-        for alt in [0, "/dev/video0", self.fallback_index]:
-            if alt not in candidates:
-                candidates.append(alt)
-
-        for target in candidates:
-            # Skip /dev/video1 or 1 unless it is the only candidate, since it is metadata on Linux
-            if target in ("/dev/video1", 1) and len(candidates) > 1:
-                continue
-
+        if isinstance(self.device_path, str) and "video" in self.device_path:
             try:
-                # First try CAP_V4L2 if on Linux, otherwise default
+                candidates.append(int(self.device_path.split("video")[-1]))
+            except ValueError:
+                pass
+        elif isinstance(self.device_path, int):
+            candidates.append(self.device_path)
+
+        if self.fallback_index not in candidates:
+            candidates.append(self.fallback_index)
+        if 0 not in candidates:
+            candidates.append(0)
+
+        # Filter out 1 (metadata node on Linux UVC)
+        filtered_candidates = [c for c in candidates if c != 1]
+        if not filtered_candidates:
+            filtered_candidates = candidates
+
+        for target in filtered_candidates:
+            try:
+                # Use CAP_V4L2 directly with integer index for 40ms fast open without FFMPEG hangs
                 backend = cv2.CAP_V4L2 if (hasattr(cv2, "CAP_V4L2") and os.name == "posix") else cv2.CAP_ANY
                 self.cap = cv2.VideoCapture(target, backend)
                 if not self.cap.isOpened():
@@ -435,7 +436,7 @@ class WristCamera:
                     if ret:
                         self.is_opened = True
                         self._consecutive_failures = 0
-                        logger.info("Wrist camera opened successfully on %s (%dx%d @ %d FPS)", str(target), self.width, self.height, self.fps)
+                        logger.info("Wrist camera opened successfully on index %s (%dx%d @ %d FPS)", str(target), self.width, self.height, self.fps)
                         return True
                     else:
                         self.cap.release()
@@ -450,7 +451,7 @@ class WristCamera:
                     self.cap = None
 
         self.is_opened = False
-        logger.error("Could not open wrist camera on any candidate: %s", candidates)
+        logger.error("Could not open wrist camera on any candidate: %s", filtered_candidates)
         return False
 
     def _reconnect_camera(self) -> bool:
