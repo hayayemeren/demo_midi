@@ -416,6 +416,10 @@ class WristCamera:
                     self.cap = cv2.VideoCapture(target)
 
                 if self.cap.isOpened():
+                    try:
+                        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("M", "J", "P", "G"))
+                    except Exception:
+                        pass
                     self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                     self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
                     self.cap.set(cv2.CAP_PROP_FPS, self.fps)
@@ -461,8 +465,24 @@ class WristCamera:
                 pass
             self.cap = None
         self.is_opened = False
-        time.sleep(0.25)
+        time.sleep(0.2)
         ok = self.connect()
+        if not ok:
+            for sys_path in [
+                "/sys/bus/usb/devices/1-1.2.2/authorized",
+                "/sys/bus/usb/devices/1-1.2/authorized",
+            ]:
+                if os.path.exists(sys_path):
+                    try:
+                        logger.info("[CAMERA RECOVERY] Power cycling USB device via %s...", sys_path)
+                        os.system(f"echo 0 > {sys_path} 2>/dev/null; sleep 0.3; echo 1 > {sys_path} 2>/dev/null")
+                        time.sleep(0.5)
+                        ok = self.connect()
+                        if ok:
+                            break
+                    except Exception:
+                        pass
+
         if ok:
             logger.info("[CAMERA RECOVERY] Camera successfully reconnected and ready!")
             self._consecutive_failures = 0
