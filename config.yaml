@@ -155,6 +155,13 @@ case4:
     pan_gain: 22.0              # max pan angle correction in degrees
     lift_gain: 15.0             # max lift angle correction in degrees
     align_tolerance: 0.12       # normalized centering threshold [-1.0, 1.0]
+    reach_elbow_gain: 20.0      # forward/backward reach modulation gain (degrees)
+    reach_lift_gain: 6.0        # lift angle compensation with reach (degrees)
+    max_reach_delta_deg: 18.0   # clamp maximum reach adjustment (degrees)
+    enable_roll_alignment: true # align gripper jaws with cloth contour orientation
+    enable_hover_refinement: true # pre-grasp hover at 8-10cm + close-up camera refinement
+    hover_lift_offset_deg: -14.0 # elevation offset for pre-grasp hover (degrees)
+    max_align_iterations: 3     # closed-loop centering loop maximum iterations
 
   # Motion Timing (seconds) - Smooth, gentle S-curve transitions
   motion:

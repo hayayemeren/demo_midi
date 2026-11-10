@@ -32,6 +32,7 @@ class DetectionResult:
     cy: float = 0.0           # Centroid Y (pixel)
     error_x: float = 0.0      # Normalized error from center [-1.0, 1.0]
     error_y: float = 0.0      # Normalized error from center [-1.0, 1.0]
+    angle: float = 0.0        # Orientation angle in degrees [-90.0, 90.0]
     area: float = 0.0         # Contour area (pixels)
     bbox: Tuple[int, int, int, int] = (0, 0, 0, 0) # (x, y, w, h)
     annotated_frame: Optional[np.ndarray] = None
@@ -267,6 +268,7 @@ class VisionDebugServer:
         <div>Detection: <span id="status-badge" class="badge badge-none">SEARCHING FLOOR...</span></div>
         <div>Rate: <span id="fps-text" style="font-weight: bold; color: #00d26a;">-- FPS</span></div>
         <div>Offset: <span id="offset-text">eX: 0.00, eY: 0.00</span></div>
+        <div>Angle: <span id="angle-text">0.0°</span></div>
         <div>Cloth Area: <span id="area-text">0 px</span></div>
         <div style="margin-left: auto;">
             <button class="btn" onclick="reloadStreams()">Reconnect Streams</button>
@@ -318,6 +320,7 @@ class VisionDebugServer:
                         b.innerText = 'SEARCHING FLOOR...';
                     }
                     document.getElementById('offset-text').innerText = 'eX: ' + (d.error_x >= 0 ? '+' : '') + Number(d.error_x || 0).toFixed(2) + ', eY: ' + (d.error_y >= 0 ? '+' : '') + Number(d.error_y || 0).toFixed(2);
+                    document.getElementById('angle-text').innerText = (d.angle !== undefined ? (d.angle >= 0 ? '+' : '') + Number(d.angle || 0).toFixed(1) + '°' : '--');
                     document.getElementById('area-text').innerText = Math.round(d.area || 0) + ' px';
                     if (d.fps !== undefined) {
                         document.getElementById('fps-text').innerText = Number(d.fps).toFixed(1) + ' FPS';
@@ -377,32 +380,42 @@ class WristCamera:
             self.is_opened = True
             return True
 
-        # Try device path first if exists
-        target = self.device_path if (self.device_path and os.path.exists(self.device_path)) else self.fallback_index
-        logger.info("Opening wrist camera on %s...", target)
+        candidates = []
+        if self.device_path:
+            candidates.append(self.device_path)
+            if "video" in str(self.device_path):
+                try:
+                    candidates.append(int(str(self.device_path).split("video")[-1]))
+                except ValueError:
+                    pass
+        if self.fallback_index not in candidates:
+            candidates.append(self.fallback_index)
+        for alt in [0, 1, "/dev/video0", "/dev/video1"]:
+            if alt not in candidates:
+                candidates.append(alt)
 
-        try:
-            backend = cv2.CAP_V4L2 if (hasattr(cv2, "CAP_V4L2") and os.name == "posix") else cv2.CAP_ANY
-            self.cap = cv2.VideoCapture(target, backend)
-            if not self.cap.isOpened():
-                if target != self.fallback_index:
-                    logger.warning("Failed on %s, trying fallback index %d...", target, self.fallback_index)
-                    self.cap = cv2.VideoCapture(self.fallback_index, backend)
+        for target in candidates:
+            try:
+                # First try with CAP_V4L2 if on Linux, otherwise default
+                backend = cv2.CAP_V4L2 if (hasattr(cv2, "CAP_V4L2") and os.name == "posix") else cv2.CAP_ANY
+                self.cap = cv2.VideoCapture(target, backend)
+                if not self.cap.isOpened():
+                    self.cap = cv2.VideoCapture(target)
 
-            if self.cap.isOpened():
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                self.cap.set(cv2.CAP_PROP_FPS, self.fps)
-                # Warm up camera buffer
-                for _ in range(5):
-                    self.cap.read()
-                self.is_opened = True
-                logger.info("Wrist camera opened successfully (%dx%d @ %d FPS)", self.width, self.height, self.fps)
-                return True
-        except Exception as e:
-            logger.error("Error opening wrist camera: %s", e)
+                if self.cap.isOpened():
+                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                    self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+                    for _ in range(5):
+                        self.cap.read()
+                    self.is_opened = True
+                    logger.info("Wrist camera opened successfully on %s (%dx%d @ %d FPS)", str(target), self.width, self.height, self.fps)
+                    return True
+            except Exception as e:
+                logger.debug("Failed opening camera candidate %s: %s", target, e)
 
         self.is_opened = False
+        logger.error("Could not open wrist camera on any candidate: %s", candidates)
         return False
 
     def _generate_synthetic_frame(self) -> np.ndarray:
@@ -667,6 +680,7 @@ class SockDetector:
         cv2.rectangle(annotated, (x_min, y_min), (x_max, y_max), (100, 100, 100), 1, cv2.LINE_AA)
         cv2.drawMarker(annotated, (int(center_x), int(center_y)), (0, 255, 255), cv2.MARKER_CROSS, 20, 1)
 
+        sock_angle = 0.0
         if best_contour is not None:
             cx, cy = best_center
             bx, by, bw, bh = best_bbox
@@ -675,12 +689,33 @@ class SockDetector:
             error_x = (cx - center_x) / center_x
             error_y = (cy - center_y) / center_y
 
+            # Compute oriented bounding box and orientation angle (long axis)
+            try:
+                rect = cv2.minAreaRect(best_contour)
+                (rcx, rcy), (rw, rh), rangle = rect
+                if rw < rh:
+                    raw_angle = rangle + 90.0
+                else:
+                    raw_angle = rangle
+                while raw_angle > 90.0:
+                    raw_angle -= 180.0
+                while raw_angle < -90.0:
+                    raw_angle += 180.0
+                sock_angle = float(raw_angle)
+
+                # Draw oriented bounding box in cyan
+                box_pts = cv2.boxPoints(rect)
+                box_pts = np.intp(box_pts) + np.array([x_min, y_min])
+                cv2.drawContours(annotated, [box_pts], 0, (255, 255, 0), 2)
+            except Exception:
+                sock_angle = 0.0
+
             # Draw detection bounding box & centroid on annotated frame
             cv2.rectangle(annotated, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
             cv2.circle(annotated, (int(cx), int(cy)), 6, (0, 0, 255), -1)
             cv2.line(annotated, (int(center_x), int(center_y)), (int(cx), int(cy)), (0, 255, 0), 2)
 
-            label = f"SOCK: {int(best_area)}px [eX:{error_x:+.2f}, eY:{error_y:+.2f}]"
+            label = f"SOCK: {int(best_area)}px [eX:{error_x:+.2f}, eY:{error_y:+.2f}, {sock_angle:+.1f}deg]"
             cv2.putText(annotated, label, (bx, max(20, by - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
             # Also draw bounding box and center on mask for visual clarity
@@ -693,6 +728,7 @@ class SockDetector:
                 cy=cy,
                 error_x=error_x,
                 error_y=error_y,
+                angle=sock_angle,
                 area=best_area,
                 bbox=best_bbox,
                 annotated_frame=annotated,
@@ -757,6 +793,7 @@ class SockDetector:
                     "cy": result.cy,
                     "error_x": result.error_x,
                     "error_y": result.error_y,
+                    "angle": round(result.angle, 1),
                     "area": result.area,
                 }
             )
@@ -776,6 +813,15 @@ class VisionGraspPlanner:
         self.grasp_verification_threshold = float(c4.get("grasp_verification_threshold_pct", 5.8))
         self.abort_on_miss = bool(c4.get("abort_on_miss", False))
         self.scan_sweep_angles = c4.get("scan_sweep_angles", [0.0, -28.0, 28.0])
+
+        # Adaptive visual servoing parameters
+        self.reach_elbow_gain = float(serv.get("reach_elbow_gain", 20.0))
+        self.reach_lift_gain = float(serv.get("reach_lift_gain", 6.0))
+        self.max_reach_delta_deg = float(serv.get("max_reach_delta_deg", 18.0))
+        self.enable_roll_alignment = bool(serv.get("enable_roll_alignment", True))
+        self.enable_hover_refinement = bool(serv.get("enable_hover_refinement", True))
+        self.hover_lift_offset_deg = float(serv.get("hover_lift_offset_deg", -14.0))
+        self.max_align_iterations = int(serv.get("max_align_iterations", 3))
 
         # Default poses
         self.scan_pose = c4.get("scan_pose", {
@@ -846,22 +892,59 @@ class VisionGraspPlanner:
     def compute_grasp_pose(
         self,
         aligned_pose: Dict[str, float],
+        detection: Optional[DetectionResult] = None,
+        is_hover: bool = False,
         descent_lift_deg: float = 16.0,
         descent_elbow_deg: float = 12.0,
     ) -> Dict[str, float]:
-        """Compute final downward descent pose to hover right at floor level below chassis base."""
+        """Compute final downward descent pose to hover right at floor level below chassis base,
+        dynamically adapting reach (elbow/lift) and gripper orientation (roll) to detected cloth."""
         grasp = dict(aligned_pose)
         if self.floor_grasp_pose:
-            # Maintain visually aligned shoulder_pan, apply calibrated floor reach & pitch
-            grasp["shoulder_lift.pos"] = float(self.floor_grasp_pose.get("shoulder_lift.pos", -30.0))
-            grasp["elbow_flex.pos"] = float(self.floor_grasp_pose.get("elbow_flex.pos", 45.0))
-            grasp["wrist_flex.pos"] = float(self.floor_grasp_pose.get("wrist_flex.pos", 80.0))
-            grasp["wrist_roll.pos"] = float(self.floor_grasp_pose.get("wrist_roll.pos", 0.0))
+            base_lift = float(self.floor_grasp_pose.get("shoulder_lift.pos", -30.0))
+            base_elbow = float(self.floor_grasp_pose.get("elbow_flex.pos", 45.0))
+            base_wrist = float(self.floor_grasp_pose.get("wrist_flex.pos", 80.0))
+            base_roll = float(self.floor_grasp_pose.get("wrist_roll.pos", 0.0))
         else:
-            grasp["shoulder_lift.pos"] = float(np.clip(grasp.get("shoulder_lift.pos", -50.0) + descent_lift_deg, -90.0, 0.0))
-            grasp["elbow_flex.pos"] = float(np.clip(grasp.get("elbow_flex.pos", 35.0) + descent_elbow_deg, -20.0, 70.0))
-            grasp["wrist_flex.pos"] = float(np.clip(grasp.get("wrist_flex.pos", 70.0) + 10.0, 0.0, 100.0))
-        grasp["gripper.pos"] = 0.0  # Clamp target
+            base_lift = float(np.clip(grasp.get("shoulder_lift.pos", -50.0) + descent_lift_deg, -90.0, 90.0))
+            base_elbow = float(np.clip(grasp.get("elbow_flex.pos", 35.0) + descent_elbow_deg, -70.0, 70.0))
+            base_wrist = float(np.clip(grasp.get("wrist_flex.pos", 70.0) + 10.0, -100.0, 100.0))
+            base_roll = float(grasp.get("wrist_roll.pos", 0.0))
+
+        grasp["shoulder_lift.pos"] = base_lift
+        grasp["elbow_flex.pos"] = base_elbow
+        grasp["wrist_flex.pos"] = base_wrist
+        grasp["wrist_roll.pos"] = base_roll
+
+        # Dynamic adaptation if detection is provided
+        if detection is not None and detection.found:
+            # 1. Fine-trim pan if residual error exists
+            if abs(detection.error_x) > 0.03:
+                pan_trim = -self.pan_gain * 0.3 * float(detection.error_x)
+                grasp["shoulder_pan.pos"] = float(np.clip(grasp.get("shoulder_pan.pos", 0.0) + pan_trim, -110.0, 110.0))
+
+            # 2. Longitudinal reach modulation (negative error_y = sock further away)
+            longitudinal_error = -float(detection.error_y)
+            elbow_reach_delta = float(np.clip(self.reach_elbow_gain * longitudinal_error, -self.max_reach_delta_deg, self.max_reach_delta_deg))
+            lift_reach_delta = float(np.clip(self.reach_lift_gain * longitudinal_error, -self.max_reach_delta_deg * 0.5, self.max_reach_delta_deg * 0.5))
+            wrist_reach_delta = float(np.clip(-0.5 * elbow_reach_delta, -15.0, 15.0))
+
+            grasp["elbow_flex.pos"] = float(base_elbow + elbow_reach_delta)
+            grasp["shoulder_lift.pos"] = float(base_lift + lift_reach_delta)
+            grasp["wrist_flex.pos"] = float(base_wrist + wrist_reach_delta)
+
+            # 3. Gripper roll orientation adaptation
+            if self.enable_roll_alignment and abs(detection.angle) > 2.0:
+                roll_offset = float(np.clip(detection.angle, -60.0, 60.0))
+                grasp["wrist_roll.pos"] = float(np.clip(base_roll + roll_offset, -180.0, 180.0))
+
+        # If hover pose: elevate shoulder and open gripper wide
+        if is_hover:
+            grasp["shoulder_lift.pos"] = float(grasp["shoulder_lift.pos"] + self.hover_lift_offset_deg)
+            grasp["gripper.pos"] = 85.0
+        else:
+            grasp["gripper.pos"] = 0.0  # Clamp target
+
         return grasp
 
     def verify_grasp(self, measured_gripper_pct: float) -> bool:
@@ -872,3 +955,4 @@ class VisionGraspPlanner:
         - If holding cloth, jaws are blocked at >= 12%.
         """
         return measured_gripper_pct >= self.grasp_verification_threshold
+

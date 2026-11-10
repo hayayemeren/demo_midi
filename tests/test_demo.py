@@ -418,10 +418,27 @@ def test_case4_vision_grasp_components():
     aligned, is_aligned = planner.compute_aligned_pose(cur_pose, det)
     assert "shoulder_pan.pos" in aligned
 
-    # 4. Test grasp pose computation
+    # 4. Test grasp pose computation (adaptive reach, orientation, and hover)
     grasp_pose = planner.compute_grasp_pose(aligned)
     assert grasp_pose["gripper.pos"] == 0.0
     assert grasp_pose["shoulder_lift.pos"] > aligned["shoulder_lift.pos"]  # lower down
+
+    # 4b. Test adaptive longitudinal reach modulation
+    det_far = DetectionResult(found=True, error_y=-0.4)
+    det_near = DetectionResult(found=True, error_y=0.4)
+    grasp_far = planner.compute_grasp_pose(aligned, det_far)
+    grasp_near = planner.compute_grasp_pose(aligned, det_near)
+    assert grasp_far["elbow_flex.pos"] > grasp_near["elbow_flex.pos"], "Elbow should extend further forward for far sock"
+
+    # 4c. Test adaptive wrist roll orientation alignment
+    det_angled = DetectionResult(found=True, angle=35.0)
+    grasp_angled = planner.compute_grasp_pose(aligned, det_angled)
+    assert abs(grasp_angled["wrist_roll.pos"] - grasp_pose["wrist_roll.pos"]) > 10.0, "Wrist roll should rotate to match sock orientation"
+
+    # 4d. Test pre-grasp hover pose (elevated with open jaws)
+    hover_pose = planner.compute_grasp_pose(aligned, det, is_hover=True)
+    assert hover_pose["gripper.pos"] == 85.0
+    assert hover_pose["shoulder_lift.pos"] < grasp_pose["shoulder_lift.pos"], "Hover pose must elevate above floor grasp"
 
     # 5. Test Suggestion 2 grasp verification
     assert planner.verify_grasp(25.0) is True   # holding cloth

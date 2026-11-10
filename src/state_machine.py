@@ -95,7 +95,7 @@ class DemoStateMachine:
         self.scan_retries = 0
         self.max_scan_retries = 3
         self.align_iterations = 0
-        self.max_align_iterations = 2
+        self.max_align_iterations = int(self.config.get("case4", {}).get("servoing", {}).get("max_align_iterations", 3))
 
         if demo_case == 4:
             c4 = self.config.get("case4", {})
@@ -489,7 +489,7 @@ class DemoStateMachine:
 
         logger.info(
             f"[ALIGN] Servoing arm to center sock: pan={aligned_pose.get('shoulder_pan.pos', 0.0):.1f}°, "
-            f"lift={aligned_pose.get('shoulder_lift.pos', 0.0):.1f}°..."
+            f"lift={aligned_pose.get('shoulder_lift.pos', 0.0):.1f}° (iteration {self.align_iterations + 1}/{self.max_align_iterations})..."
         )
         self.arm.move_to_pose(
             aligned_pose,
@@ -507,6 +507,7 @@ class DemoStateMachine:
                 det = self.detector.detect(frame)
                 if det.found:
                     self.last_detection = det
+            return
 
         logger.info(
             f"\n{COLOR_BOLD}{COLOR_CYAN}>>> [ALIGN] Sock aligned with gripper center! Initiating Grasp... <<<{COLOR_RESET}\n"
@@ -514,7 +515,7 @@ class DemoStateMachine:
         self.state = DemoState.AUTONOMOUS_PICK_GRASP
 
     def _handle_autonomous_grasp(self, gp: GamepadState):
-        """Case 4: Opens gripper, descends to floor height, clamps the sock, and elevates off floor."""
+        """Case 4: Opens gripper, executes pre-grasp hover with close-up refinement, descends to floor height, clamps the sock, and elevates off floor."""
         self.base.hold_lock()
 
         if gp.brake or gp.button_b_held:
@@ -536,11 +537,42 @@ class DemoStateMachine:
         open_pose["gripper.pos"] = 85.0
         self.arm.move_to_pose(open_pose, duration_s=0.8, feedback_cb=lambda _: self.base.hold_lock())
 
-        logger.info("[GRASP] 2. Lowering arm down to floor grasp pose (%.1fs smooth descent)...", descend_t)
-        grasp_pose = self.planner.compute_grasp_pose(open_pose)
+        # Check if 2-stage hover refinement is enabled
+        enable_hover = getattr(self.planner, "enable_hover_refinement", True)
+        if enable_hover and self.last_detection is not None and self.last_detection.found:
+            # 2a. Pre-Grasp Hover directly above the sock (~8-10 cm)
+            hover_pose = self.planner.compute_grasp_pose(open_pose, detection=self.last_detection, is_hover=True)
+            logger.info(
+                f"[GRASP] 2a. Moving to Pre-Grasp Hover ~8-10cm above sock: pan={hover_pose.get('shoulder_pan.pos', 0.0):.1f}°, "
+                f"lift={hover_pose.get('shoulder_lift.pos', 0.0):.1f}°, elbow={hover_pose.get('elbow_flex.pos', 0.0):.1f}°, "
+                f"roll={hover_pose.get('wrist_roll.pos', 0.0):.1f}°..."
+            )
+            self.arm.move_to_pose(hover_pose, duration_s=max(1.0, descend_t * 0.5), feedback_cb=lambda _: self.base.hold_lock())
+
+            # 2b. Close-up visual refinement directly above sock
+            if self.camera is not None and self.detector is not None:
+                time.sleep(0.15)
+                ok, hover_frame = self.camera.capture_frame()
+                if ok and hover_frame is not None:
+                    refined_det = self.detector.detect(hover_frame)
+                    if refined_det.found:
+                        self.last_detection = refined_det
+                        logger.info(
+                            f"[GRASP] 2b. Refined close-up: offset=(eX={refined_det.error_x:+.2f}, eY={refined_det.error_y:+.2f}), "
+                            f"angle={refined_det.angle:+.1f}°, area={refined_det.area:.0f}px"
+                        )
+
+        # 2c. Final descent to floor grasp pose
+        logger.info("[GRASP] 2c. Lowering arm down to floor grasp pose (smooth descent)...")
+        grasp_pose = self.planner.compute_grasp_pose(open_pose, detection=self.last_detection, is_hover=False)
         grasp_descend = dict(grasp_pose)
         grasp_descend["gripper.pos"] = 85.0
-        self.arm.move_to_pose(grasp_descend, duration_s=descend_t, feedback_cb=lambda _: self.base.hold_lock())
+        logger.info(
+            f"[GRASP] Floor target: pan={grasp_descend.get('shoulder_pan.pos', 0.0):.1f}°, "
+            f"lift={grasp_descend.get('shoulder_lift.pos', 0.0):.1f}°, elbow={grasp_descend.get('elbow_flex.pos', 0.0):.1f}°, "
+            f"roll={grasp_descend.get('wrist_roll.pos', 0.0):.1f}°"
+        )
+        self.arm.move_to_pose(grasp_descend, duration_s=max(1.0, descend_t * 0.6), feedback_cb=lambda _: self.base.hold_lock())
 
         logger.info("[GRASP] 3. Clamping gripper jaws onto sock (0%%) over %.1fs...", clamp_t)
         grasp_clamp = dict(grasp_descend)
