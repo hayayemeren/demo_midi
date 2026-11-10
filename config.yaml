@@ -21,7 +21,7 @@ serial:
   port: "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BH002HMM-if00-port0"
   fallback_port: "/dev/ttyUSB0"
   baudrate: 115200
-  timeout: 0.02
+  timeout: 0.012
 
 # DDSM Motors Configuration
 motors:

@@ -347,6 +347,33 @@ class VisionDebugServer:
 </html>"""
 
 
+def discover_camera_indices() -> List[int]:
+    """Discover all valid V4L2 video capture devices (excluding RPi codec nodes and metadata)."""
+    indices = []
+    v4l_dir = "/sys/class/video4linux"
+    if os.path.exists(v4l_dir):
+        for node in sorted(os.listdir(v4l_dir), key=lambda x: int(x.replace("video", "")) if x.replace("video", "").isdigit() else 999):
+            if not node.startswith("video"):
+                continue
+            name_path = os.path.join(v4l_dir, node, "name")
+            idx_path = os.path.join(v4l_dir, node, "index")
+            if os.path.exists(name_path):
+                try:
+                    with open(name_path, "r") as f:
+                        name = f.read().strip()
+                    if "bcm2835" in name.lower():
+                        continue
+                    idx = 0
+                    if os.path.exists(idx_path):
+                        with open(idx_path, "r") as f:
+                            idx = int(f.read().strip())
+                    if idx == 0:
+                        indices.append(int(node.replace("video", "")))
+                except Exception:
+                    pass
+    return indices
+
+
 class WristCamera:
     """Manages wrist camera video capture with fallback, background streaming, and dry-run simulation."""
 
@@ -378,9 +405,10 @@ class WristCamera:
         self._detector: Optional[Any] = None
         self._target_fps: float = 20.0
         self._measured_fps: float = 0.0
+        self._last_reconnect_time: float = 0.0
 
     def connect(self) -> bool:
-        """Initialize camera capture with resilient fallback."""
+        """Initialize camera capture with resilient auto-discovery and fallback."""
         if self.dry_run:
             logger.info("[DRY RUN] Wrist camera initialized in simulation.")
             self.is_opened = True
@@ -398,6 +426,11 @@ class WristCamera:
         elif isinstance(self.device_path, int):
             candidates.append(self.device_path)
 
+        # Dynamically discover all active UVC cameras on the system
+        for discovered in discover_camera_indices():
+            if discovered not in candidates:
+                candidates.append(discovered)
+
         if self.fallback_index not in candidates:
             candidates.append(self.fallback_index)
         if 0 not in candidates:
@@ -413,8 +446,6 @@ class WristCamera:
                 # Use CAP_V4L2 directly with integer index for 40ms fast open without FFMPEG hangs
                 backend = cv2.CAP_V4L2 if (hasattr(cv2, "CAP_V4L2") and os.name == "posix") else cv2.CAP_ANY
                 self.cap = cv2.VideoCapture(target, backend)
-                if not self.cap.isOpened():
-                    self.cap = cv2.VideoCapture(target)
 
                 if self.cap.isOpened():
                     try:
@@ -455,9 +486,15 @@ class WristCamera:
         return False
 
     def _reconnect_camera(self) -> bool:
-        """Safely reset and reconnect the camera device."""
+        """Safely reset and reconnect the camera device with rate-limiting and dynamic port recovery."""
         if self.dry_run:
             return True
+
+        now = time.time()
+        if now - getattr(self, "_last_reconnect_time", 0.0) < 5.0:
+            return False
+        self._last_reconnect_time = now
+
         logger.warning("[CAMERA RECOVERY] Resetting and reconnecting camera hardware...")
         if self.cap is not None:
             try:
@@ -468,38 +505,32 @@ class WristCamera:
         self.is_opened = False
         time.sleep(0.2)
         ok = self.connect()
+
         if not ok:
-            # 1. Primary hardware recovery: power-cycle camera USB port via uhubctl
+            # 1. Primary hardware recovery: power-cycle camera USB port wherever plugged in via uhubctl
             try:
                 logger.info("[CAMERA RECOVERY] Power cycling camera USB port via uhubctl...")
-                os.system("uhubctl -l 1-1.2 -p 2 -a cycle -d 1 >/dev/null 2>&1 || sudo -n uhubctl -l 1-1.2 -p 2 -a cycle -d 1 >/dev/null 2>&1")
-                time.sleep(1.0)
+                os.system("uhubctl -s 05a3:9230 -a cycle -d 1 >/dev/null 2>&1 || sudo -n uhubctl -s 05a3:9230 -a cycle -d 1 >/dev/null 2>&1")
+                time.sleep(1.2)
                 ok = self.connect()
             except Exception:
                 pass
 
         if not ok:
-            # 2. Secondary fallback: toggle USB authorized sysfs
-            for sys_path in [
-                "/sys/bus/usb/devices/1-1.2.2/authorized",
-                "/sys/bus/usb/devices/1-1.2/authorized",
-            ]:
-                if os.path.exists(sys_path):
-                    try:
-                        logger.info("[CAMERA RECOVERY] Power cycling USB device via %s...", sys_path)
-                        os.system(f"echo 0 > {sys_path} 2>/dev/null; sleep 0.3; echo 1 > {sys_path} 2>/dev/null")
-                        time.sleep(0.5)
-                        ok = self.connect()
-                        if ok:
-                            break
-                    except Exception:
-                        pass
+            # 2. Secondary fallback: usbreset by device vendor/product ID
+            try:
+                logger.info("[CAMERA RECOVERY] Resetting USB camera via usbreset...")
+                os.system("usbreset 05a3:9230 >/dev/null 2>&1 || sudo -n usbreset 05a3:9230 >/dev/null 2>&1")
+                time.sleep(0.8)
+                ok = self.connect()
+            except Exception:
+                pass
 
         if ok:
             logger.info("[CAMERA RECOVERY] Camera successfully reconnected and ready!")
             self._consecutive_failures = 0
         else:
-            logger.warning("[CAMERA RECOVERY] Camera reconnect failed; will retry.")
+            logger.warning("[CAMERA RECOVERY] Camera reconnect failed; will backoff.")
         return ok
 
     def ensure_healthy(self) -> bool:

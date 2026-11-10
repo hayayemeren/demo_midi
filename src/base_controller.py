@@ -70,7 +70,7 @@ class BaseController:
             self.last_fb_l = self.driver.set_velocity(
                 self.left_id, 0.0, acceleration=1, brake=True
             )
-            time.sleep(0.002)
+            time.sleep(0.0005)
             self.last_fb_r = self.driver.set_velocity(
                 self.right_id, 0.0, acceleration=1, brake=True
             )
@@ -98,7 +98,7 @@ class BaseController:
             acceleration=1,
             brake=brake,
         )
-        time.sleep(0.002)  # 2ms turnaround
+        time.sleep(0.0005)  # 0.5ms bus turnaround
         self.last_fb_r = self.driver.set_velocity(
             self.right_id,
             self.right_dir * self.cur_right_rpm,

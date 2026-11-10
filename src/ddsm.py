@@ -30,13 +30,14 @@ def calculate_crc8(data: bytes) -> int:
 
 def set_usb_latency_1ms(port: str):
     """Set FTDI / USB-serial converter latency timer from default 16ms to 1ms on Linux."""
-    yol = f"/sys/bus/usb-serial/devices/{os.path.basename(port)}/latency_timer"
     try:
-        with open(yol, "w") as f:
-            f.write("1")
-        logger.info("USB serial latency timer set to 1 ms on %s", yol)
+        real_dev = os.path.basename(os.path.realpath(port))
+        yol = f"/sys/bus/usb-serial/devices/{real_dev}/latency_timer"
+        if os.path.exists(yol):
+            with open(yol, "w") as f:
+                f.write("1")
+            logger.debug("USB serial latency timer set to 1 ms on %s", yol)
     except Exception:
-        # Requires root or udev rule; continue gracefully if not writable
         pass
 
 
