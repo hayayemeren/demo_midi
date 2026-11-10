@@ -34,10 +34,10 @@ DEFAULT_READY_POSE = {
 
 DEFAULT_JOINT_LIMITS = {
     "shoulder_pan.pos": (-110.0, 110.0),
-    "shoulder_lift.pos": (-110.0, 85.0),
-    "elbow_flex.pos": (-100.0, 100.0),
-    "wrist_flex.pos": (-100.0, 100.0),
-    "wrist_roll.pos": (-180.0, 180.0),
+    "shoulder_lift.pos": (-100.0, 100.0),  # Accommodates floor reach up to 95° safely inside [-104.1°, 104.1°]
+    "elbow_flex.pos": (-92.0, 92.0),       # Accommodates basket (-80.4°) and floor (-56.2°) inside [-97.1°, 97.1°]
+    "wrist_flex.pos": (-96.0, 96.0),       # 5.7° safety margin inside [-101.7°, 101.7°] to prevent motor buzzing against endstops
+    "wrist_roll.pos": (-175.0, 175.0),     # 5.0° safety margin inside continuous [-180.0°, 180.0°]
     "gripper.pos": (0.0, 100.0),
 }
 
@@ -210,14 +210,26 @@ class ArmController:
 
         return pose
 
+    def clamp_to_joint_limits(self, pose: Dict[str, float]) -> Dict[str, float]:
+        """Clamp joint positions strictly within safe hardware limits to prevent mechanical strain/buzzing."""
+        clamped = {}
+        for k, v in pose.items():
+            if k in self.joint_limits:
+                j_min, j_max = self.joint_limits[k]
+                clamped[k] = float(max(j_min, min(j_max, v)))
+            else:
+                clamped[k] = float(v)
+        return clamped
+
     def send_follower_action(self, action: Dict[str, float]):
-        """Send joint position command to Follower arm."""
+        """Send joint position command to Follower arm, clamped to safe hardware limits."""
+        clamped = self.clamp_to_joint_limits(action)
         if self.dry_run or self.follower is None:
-            self.sim_follower_pose.update(action)
+            self.sim_follower_pose.update(clamped)
             return
 
         try:
-            self.follower.send_action(action)
+            self.follower.send_action(clamped)
         except Exception as e:
             logger.warning("Error sending action to follower: %s", e)
 
@@ -247,11 +259,32 @@ class ArmController:
             time.sleep(effective_dt)
 
     def move_to_stow(self, duration_s: Optional[float] = None, feedback_cb = None):
-        """Smoothly park the follower arm into the safe stowed travel pose."""
+        """Smoothly park the follower arm into the safe stowed travel pose.
+        
+        If currently in a rear/basket posture (elbow or wrist flex < 0), first uncurls
+        and lifts the forearm to clear the chassis and basket before folding into stow.
+        """
         duration = duration_s or self.interpolation_time
         start_pose = self.get_follower_pose()
+
+        elbow = start_pose.get("elbow_flex.pos", 25.0)
+        wrist = start_pose.get("wrist_flex.pos", 95.0)
+        if elbow < -10.0 or wrist < -10.0:
+            logger.info("[ARM] Clearing chassis/basket before parking into stow pose...")
+            clearance_pose = dict(start_pose)
+            # Elevate shoulder slightly, uncurl elbow and wrist forward, reset roll
+            cur_lift = start_pose.get("shoulder_lift.pos", -35.0)
+            clearance_pose["shoulder_lift.pos"] = min(-30.0, max(-60.0, cur_lift + 15.0 if cur_lift < -45.0 else -35.0))
+            clearance_pose["elbow_flex.pos"] = 15.0
+            clearance_pose["wrist_flex.pos"] = 50.0
+            clearance_pose["wrist_roll.pos"] = 0.0
+            clearance_pose["gripper.pos"] = min(20.0, start_pose.get("gripper.pos", 20.0))
+            self.smooth_trajectory(start_pose, clearance_pose, duration_s=1.2, feedback_cb=feedback_cb)
+            start_pose = clearance_pose
+
         logger.info("[ARM] Moving Follower to Stow Pose over %.1fs...", duration)
         self.smooth_trajectory(start_pose, self.stow_pose, duration, feedback_cb=feedback_cb)
+        self.current_gamepad_target = dict(self.stow_pose)
         logger.info("[ARM] Follower is parked safely at Stow Pose.")
 
     def sync_to_leader(self, duration_s: Optional[float] = None, feedback_cb = None):
@@ -297,10 +330,11 @@ class ArmController:
         """Smoothly move follower arm to arbitrary target pose using S-curve trajectory."""
         duration = duration_s or self.interpolation_time
         start_pose = self.get_follower_pose()
-        # Ensure all joints exist in target_pose (fallback to start_pose)
+        # Ensure all joints exist in target_pose (fallback to start_pose) and clamp to safe hardware limits
         full_target = {k: target_pose.get(k, start_pose.get(k, 0.0)) for k in start_pose}
-        self.smooth_trajectory(start_pose, full_target, duration, feedback_cb=feedback_cb)
-        self.current_gamepad_target = dict(full_target)
+        clamped_target = self.clamp_to_joint_limits(full_target)
+        self.smooth_trajectory(start_pose, clamped_target, duration, feedback_cb=feedback_cb)
+        self.current_gamepad_target = dict(clamped_target)
 
     def teleop_step_gamepad(self, gp: Any, dt: float) -> Dict[str, float]:
         """Perform one rate-control teleoperation step from Gamepad inputs.

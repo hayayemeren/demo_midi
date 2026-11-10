@@ -547,6 +547,42 @@ def test_case4_autonomous_state_machine_simulation():
     sm.stop()
 
 
+def test_arm_safety_and_stow_recovery():
+    """Verify that joint limit clamping prevents mechanical stop contention,
+    and move_to_stow safely clears rear/basket postures before stowing."""
+    from src.arm_controller import ArmController
+    cfg = {
+        "dry_run": True,
+        "arm": {
+            "follower_port": "/dev/null",
+            "interpolation_time_s": 0.01,
+        }
+    }
+    arm = ArmController(cfg, dry_run=True)
+    arm.connect_follower()
+
+    # 1. Test joint limit clamping against hardware stops
+    extreme_pose = {
+        "shoulder_pan.pos": 0.0,
+        "shoulder_lift.pos": 95.0,
+        "elbow_flex.pos": -85.0,
+        "wrist_flex.pos": -101.5,   # At physical stop!
+        "wrist_roll.pos": -179.5,   # Near continuous wrap limit!
+        "gripper.pos": 85.0,
+    }
+    clamped = arm.clamp_to_joint_limits(extreme_pose)
+    assert clamped["wrist_flex.pos"] == -96.0, f"Expected -96.0, got {clamped['wrist_flex.pos']}"
+    assert clamped["wrist_roll.pos"] == -175.0, f"Expected -175.0, got {clamped['wrist_roll.pos']}"
+    assert clamped["shoulder_lift.pos"] == 95.0, "Should allow 95.0 within [-100, 100]"
+
+    # 2. Test safe stow transition from rear basket posture
+    arm.sim_follower_pose = dict(clamped)
+    arm.move_to_stow(duration_s=0.01)
+    # Follower should end up at exact stow pose
+    for k, v in arm.stow_pose.items():
+        assert abs(arm.sim_follower_pose[k] - v) < 1e-3, f"Joint {k} did not reach stow pose"
+
+
 if __name__ == "__main__":
     test_ddsm_crc8_spec()
     print("  [PASS] test_ddsm_crc8_spec")
@@ -574,6 +610,8 @@ if __name__ == "__main__":
     print("  [PASS] test_case4_vision_grasp_components")
     test_case4_autonomous_state_machine_simulation()
     print("  [PASS] test_case4_autonomous_state_machine_simulation")
+    test_arm_safety_and_stow_recovery()
+    print("  [PASS] test_arm_safety_and_stow_recovery")
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
 
 

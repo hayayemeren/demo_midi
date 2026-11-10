@@ -1096,10 +1096,12 @@ class VisionGraspPlanner:
         dynamically adapting reach (elbow/lift) and gripper orientation (roll) to detected cloth."""
         grasp = dict(aligned_pose)
         if self.floor_grasp_pose:
+            base_pan = float(self.floor_grasp_pose.get("shoulder_pan.pos", grasp.get("shoulder_pan.pos", 0.0)))
             base_lift = float(self.floor_grasp_pose.get("shoulder_lift.pos", -30.0))
             base_elbow = float(self.floor_grasp_pose.get("elbow_flex.pos", 45.0))
             base_wrist = float(self.floor_grasp_pose.get("wrist_flex.pos", 80.0))
             base_roll = float(self.floor_grasp_pose.get("wrist_roll.pos", 0.0))
+            grasp["shoulder_pan.pos"] = base_pan
         else:
             base_lift = float(np.clip(grasp.get("shoulder_lift.pos", -50.0) + descent_lift_deg, -90.0, 90.0))
             base_elbow = float(np.clip(grasp.get("elbow_flex.pos", 35.0) + descent_elbow_deg, -70.0, 70.0))

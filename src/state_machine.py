@@ -590,8 +590,8 @@ class DemoStateMachine:
 
         logger.info("[GRASP] 4. Elevating arm off floor to verify grasp (%.1fs)...", lift_t)
         lift_verify_pose = dict(grasp_clamp)
-        lift_verify_pose["shoulder_lift.pos"] -= 15.0  # elevate shoulder
-        lift_verify_pose["elbow_flex.pos"] -= 10.0     # pull up elbow
+        cur_lift = lift_verify_pose.get("shoulder_lift.pos", 0.0)
+        lift_verify_pose["shoulder_lift.pos"] = cur_lift - 20.0 if cur_lift > 0 else cur_lift - 15.0
         self.arm.move_to_pose(lift_verify_pose, duration_s=lift_t, feedback_cb=lambda _: self.base.hold_lock())
         time.sleep(0.3)
         self.base.hold_lock()
@@ -631,7 +631,7 @@ class DemoStateMachine:
             self.state = DemoState.PARKING
 
     def _handle_autonomous_basket(self, gp: GamepadState):
-        """Case 4: Smoothly elevates arm to safe clearance height, moves over chassis-mounted basket, drops sock, and parks."""
+        """Case 4: Smoothly moves arm over chassis-mounted basket, drops sock, and returns cleanly to stow."""
         self.base.hold_lock()
 
         if self.planner is None:
@@ -641,18 +641,8 @@ class DemoStateMachine:
         basket_t = getattr(self.planner, "basket_duration_s", 3.2)
         release_t = getattr(self.planner, "release_duration_s", 0.8)
 
-        # 1. Elevate arm vertically clear of floor and chassis before swinging back
-        cur_pose = self.arm.get_follower_pose()
-        safe_lift_pose = dict(cur_pose)
-        safe_lift_pose["shoulder_lift.pos"] = -30.0   # Clear chassis height
-        safe_lift_pose["elbow_flex.pos"] = 20.0       # Tuck elbow in to minimize moment arm
-        safe_lift_pose["wrist_flex.pos"] = 40.0       # Gripper angled safely
-        safe_lift_pose["gripper.pos"] = 0.0          # Maintain tight clamp
-        logger.info("\n[BASKET] 1. Lifting arm to safe travel height clear of chassis...")
-        self.arm.move_to_pose(safe_lift_pose, duration_s=1.2, feedback_cb=lambda _: self.base.hold_lock())
-
-        # 2. Smoothly transit over chassis collection basket in the back
-        logger.info("[BASKET] 2. Moving arm over collection basket (%.1fs gentle swing)...", basket_t)
+        # 1. Smoothly transit over chassis collection basket in the back
+        logger.info("\n[BASKET] 1. Moving arm over collection basket (%.1fs gentle swing)...", basket_t)
         transit_pose = dict(self.planner.basket_pose)
         transit_pose["gripper.pos"] = 0.0  # Hold sock firmly during transit
         self.arm.move_to_pose(

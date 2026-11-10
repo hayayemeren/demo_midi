@@ -152,7 +152,7 @@ def select_case_interactive(default_case: Optional[int] = None) -> int:
 
 
 def update_config_basket_pose(config_path: str, pose: dict) -> bool:
-    """Save calibrated basket pose into config.yaml, preserving file comments and formatting."""
+    """Save calibrated basket pose into config.yaml, clamping to safe limits and preserving file comments."""
     import re
     if not os.path.exists(config_path):
         logging.error("Config file %s does not exist!", config_path)
@@ -161,14 +161,20 @@ def update_config_basket_pose(config_path: str, pose: dict) -> bool:
     with open(config_path, "r", encoding="utf-8") as f:
         content = f.read()
 
+    # Clamp wrist joints safely within mechanical hard stops
+    w_flex = max(-96.0, min(96.0, float(pose.get("wrist_flex.pos", 50.0))))
+    w_roll = max(-175.0, min(175.0, float(pose.get("wrist_roll.pos", 0.0))))
+    s_lift = max(-100.0, min(100.0, float(pose.get("shoulder_lift.pos", -80.0))))
+    e_flex = max(-92.0, min(92.0, float(pose.get("elbow_flex.pos", 20.0))))
+
     new_basket_block = (
         "  basket_pose:\n"
         f"    shoulder_pan.pos: {pose.get('shoulder_pan.pos', 0.0):.1f}\n"
-        f"    shoulder_lift.pos: {pose.get('shoulder_lift.pos', -80.0):.1f}\n"
-        f"    elbow_flex.pos: {pose.get('elbow_flex.pos', 20.0):.1f}\n"
-        f"    wrist_flex.pos: {pose.get('wrist_flex.pos', 50.0):.1f}\n"
-        f"    wrist_roll.pos: {pose.get('wrist_roll.pos', 0.0):.1f}\n"
-        f"    gripper.pos: 85.0"
+        f"    shoulder_lift.pos: {s_lift:.1f}\n"
+        f"    elbow_flex.pos: {e_flex:.1f}\n"
+        f"    wrist_flex.pos: {w_flex:.1f}\n"
+        f"    wrist_roll.pos: {w_roll:.1f}\n"
+        "    gripper.pos: 85.0"
     )
 
     pattern = r"  basket_pose:\n(?:    [a-z_.]+: -?[0-9.]+\n?)+"
@@ -180,10 +186,10 @@ def update_config_basket_pose(config_path: str, pose: dict) -> bool:
                 cfg = yaml.safe_load(f) or {}
             cfg.setdefault("case4", {})["basket_pose"] = {
                 "shoulder_pan.pos": round(float(pose.get("shoulder_pan.pos", 0.0)), 1),
-                "shoulder_lift.pos": round(float(pose.get("shoulder_lift.pos", -80.0)), 1),
-                "elbow_flex.pos": round(float(pose.get("elbow_flex.pos", 20.0)), 1),
-                "wrist_flex.pos": round(float(pose.get("wrist_flex.pos", 50.0)), 1),
-                "wrist_roll.pos": round(float(pose.get("wrist_roll.pos", 0.0)), 1),
+                "shoulder_lift.pos": round(s_lift, 1),
+                "elbow_flex.pos": round(e_flex, 1),
+                "wrist_flex.pos": round(w_flex, 1),
+                "wrist_roll.pos": round(w_roll, 1),
                 "gripper.pos": 85.0,
             }
             with open(config_path, "w", encoding="utf-8") as f:
@@ -208,13 +214,18 @@ def update_config_grasp_pose(config_path: str, pose: dict) -> bool:
     with open(config_path, "r", encoding="utf-8") as f:
         content = f.read()
 
+    w_flex = max(-96.0, min(96.0, float(pose.get("wrist_flex.pos", 80.0))))
+    w_roll = max(-175.0, min(175.0, float(pose.get("wrist_roll.pos", 0.0))))
+    s_lift = max(-100.0, min(100.0, float(pose.get("shoulder_lift.pos", -30.0))))
+    e_flex = max(-92.0, min(92.0, float(pose.get("elbow_flex.pos", 45.0))))
+
     new_grasp_block = (
         "  floor_grasp_pose:\n"
-        "    shoulder_pan.pos: 0.0\n"
-        f"    shoulder_lift.pos: {pose.get('shoulder_lift.pos', -30.0):.1f}\n"
-        f"    elbow_flex.pos: {pose.get('elbow_flex.pos', 45.0):.1f}\n"
-        f"    wrist_flex.pos: {pose.get('wrist_flex.pos', 80.0):.1f}\n"
-        f"    wrist_roll.pos: {pose.get('wrist_roll.pos', 0.0):.1f}\n"
+        f"    shoulder_pan.pos: {pose.get('shoulder_pan.pos', 0.0):.1f}\n"
+        f"    shoulder_lift.pos: {s_lift:.1f}\n"
+        f"    elbow_flex.pos: {e_flex:.1f}\n"
+        f"    wrist_flex.pos: {w_flex:.1f}\n"
+        f"    wrist_roll.pos: {w_roll:.1f}\n"
         "    gripper.pos: 0.0"
     )
 
@@ -230,11 +241,11 @@ def update_config_grasp_pose(config_path: str, pose: dict) -> bool:
                 with open(config_path, "r", encoding="utf-8") as f:
                     cfg = yaml.safe_load(f) or {}
                 cfg.setdefault("case4", {})["floor_grasp_pose"] = {
-                    "shoulder_pan.pos": 0.0,
-                    "shoulder_lift.pos": round(float(pose.get("shoulder_lift.pos", -30.0)), 1),
-                    "elbow_flex.pos": round(float(pose.get("elbow_flex.pos", 45.0)), 1),
-                    "wrist_flex.pos": round(float(pose.get("wrist_flex.pos", 80.0)), 1),
-                    "wrist_roll.pos": round(float(pose.get("wrist_roll.pos", 0.0)), 1),
+                    "shoulder_pan.pos": round(float(pose.get("shoulder_pan.pos", 0.0)), 1),
+                    "shoulder_lift.pos": round(s_lift, 1),
+                    "elbow_flex.pos": round(e_flex, 1),
+                    "wrist_flex.pos": round(w_flex, 1),
+                    "wrist_roll.pos": round(w_roll, 1),
                     "gripper.pos": 0.0,
                 }
                 with open(config_path, "w", encoding="utf-8") as f:
@@ -435,8 +446,8 @@ def test_pick(config_path: str, dry_run: bool = False):
 
         print(f"[TEST] 4. Elevating arm off floor to verify grip ({lift_t:.1f}s)...")
         lift_p = dict(grasp_clamp)
-        lift_p["shoulder_lift.pos"] -= 15.0
-        lift_p["elbow_flex.pos"] -= 10.0
+        cur_lift = lift_p.get("shoulder_lift.pos", 0.0)
+        lift_p["shoulder_lift.pos"] = cur_lift - 20.0 if cur_lift > 0 else cur_lift - 15.0
         arm.move_to_pose(lift_p, duration_s=lift_t, feedback_cb=lambda _: base.hold_lock())
         time.sleep(0.3)
         base.hold_lock()
@@ -454,21 +465,12 @@ def test_pick(config_path: str, dry_run: bool = False):
         else:
             print(f"[INFO] Grip aperture reading: {measured_grip:.1f}% (Threshold: {planner.grasp_verification_threshold:.1f}%).")
 
-        print(f"\n[TEST] 5. Lifting arm to safe clearance height clear of chassis...")
-        cur_pose = arm.get_follower_pose()
-        safe_lift_p = dict(cur_pose)
-        safe_lift_p["shoulder_lift.pos"] = -30.0
-        safe_lift_p["elbow_flex.pos"] = 20.0
-        safe_lift_p["wrist_flex.pos"] = 40.0
-        safe_lift_p["gripper.pos"] = 0.0
-        arm.move_to_pose(safe_lift_p, duration_s=1.2, feedback_cb=lambda _: base.hold_lock())
-
-        print(f"[TEST] 6. Holding sock firmly clamped (0%) and moving to chassis basket ({basket_t:.1f}s gentle transit)...")
+        print(f"\n[TEST] 5. Holding sock firmly clamped (0%) and moving to chassis basket ({basket_t:.1f}s gentle transit)...")
         transit_p = dict(planner.basket_pose)
         transit_p["gripper.pos"] = 0.0  # Keep tight clamp on sock during transit
         arm.move_to_pose(transit_p, duration_s=basket_t, feedback_cb=lambda _: base.hold_lock())
 
-        print(f"[TEST] 7. Opening gripper over basket (85%) over {release_t:.1f}s...")
+        print(f"[TEST] 6. Opening gripper over basket (85%) over {release_t:.1f}s...")
         drop_p = dict(transit_p)
         drop_p["gripper.pos"] = 85.0
         arm.move_to_pose(drop_p, duration_s=release_t, feedback_cb=lambda _: base.hold_lock())
