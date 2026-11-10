@@ -444,6 +444,14 @@ def test_case4_vision_grasp_components():
     assert planner.verify_grasp(25.0) is True   # holding cloth
     assert planner.verify_grasp(4.5) is False   # closed empty
 
+    # 6. Test camera health monitoring and staleness recovery
+    assert cam.ensure_healthy() is True
+    cam.start_stream(detector=detector)
+    assert cam.ensure_healthy() is True
+    ok, live_frame = cam.capture_frame(max_staleness_s=0.5)
+    assert ok is True
+    assert live_frame is not None
+
     cam.release()
 
 

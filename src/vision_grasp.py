@@ -197,6 +197,7 @@ class VisionDebugServer:
             return
 
         last_bytes = None
+        last_send_time = time.time()
         while self.started:
             try:
                 with self._lock:
@@ -209,8 +210,11 @@ class VisionDebugServer:
                     else:
                         cur_bytes = self._latest_combined
 
-                if cur_bytes is not None and cur_bytes != last_bytes:
+                now = time.time()
+                # Send if new frame or keepalive heartbeat every 0.6s
+                if cur_bytes is not None and (cur_bytes != last_bytes or (now - last_send_time >= 0.6)):
                     last_bytes = cur_bytes
+                    last_send_time = now
                     header = (
                         b"--frame\r\n"
                         b"Content-Type: image/jpeg\r\n"
@@ -281,28 +285,28 @@ class VisionDebugServer:
                 <span>Multi-View Live Stream (Actual Raw | Segmented Mask | Annotated Reticle)</span>
                 <a href="/stream/combined" target="_blank" style="color: #00d26a; text-decoration: none;">Direct Stream</a>
             </div>
-            <img id="img-combined" src="/stream/combined" alt="Combined Multi-View Stream">
+            <img id="img-combined" src="/stream/combined" alt="Combined Multi-View Stream" onerror="setTimeout(reloadStreams, 2000)">
         </div>
         <div class="card">
             <div class="card-header">
                 <span>1. Actual Camera Frame (Live)</span>
                 <a href="/stream/raw" target="_blank" style="color: #00d26a; text-decoration: none;">Direct Stream</a>
             </div>
-            <img id="img-raw" src="/stream/raw" alt="Actual Camera Stream">
+            <img id="img-raw" src="/stream/raw" alt="Actual Camera Stream" onerror="setTimeout(reloadStreams, 2000)">
         </div>
         <div class="card">
             <div class="card-header">
                 <span>2. Segmented Mask (Live Filter)</span>
                 <a href="/stream/mask" target="_blank" style="color: #00d26a; text-decoration: none;">Direct Stream</a>
             </div>
-            <img id="img-mask" src="/stream/mask" alt="Segmented Mask Stream">
+            <img id="img-mask" src="/stream/mask" alt="Segmented Mask Stream" onerror="setTimeout(reloadStreams, 2000)">
         </div>
         <div class="card">
             <div class="card-header">
                 <span>3. Detection Overlay (Grasp Target)</span>
                 <a href="/stream/detection" target="_blank" style="color: #00d26a; text-decoration: none;">Direct Stream</a>
             </div>
-            <img id="img-detection" src="/stream/detection" alt="Annotated Detection Stream">
+            <img id="img-detection" src="/stream/detection" alt="Annotated Detection Stream" onerror="setTimeout(reloadStreams, 2000)">
         </div>
     </div>
 
@@ -364,20 +368,25 @@ class WristCamera:
         self.cap: Optional[cv2.VideoCapture] = None
         self.is_opened = False
 
-        # Live background stream worker
+        # Live background stream worker & health monitoring
         self._streaming = False
         self._stream_thread: Optional[threading.Thread] = None
         self._frame_lock = threading.Lock()
         self._latest_raw_frame: Optional[np.ndarray] = None
+        self._latest_frame_time: float = 0.0
+        self._consecutive_failures: int = 0
         self._detector: Optional[Any] = None
         self._target_fps: float = 20.0
         self._measured_fps: float = 0.0
 
     def connect(self) -> bool:
-        """Initialize camera capture."""
+        """Initialize camera capture with resilient fallback."""
         if self.dry_run:
             logger.info("[DRY RUN] Wrist camera initialized in simulation.")
             self.is_opened = True
+            with self._frame_lock:
+                self._latest_raw_frame = self._generate_synthetic_frame()
+                self._latest_frame_time = time.time()
             return True
 
         candidates = []
@@ -388,15 +397,19 @@ class WristCamera:
                     candidates.append(int(str(self.device_path).split("video")[-1]))
                 except ValueError:
                     pass
-        if self.fallback_index not in candidates:
-            candidates.append(self.fallback_index)
-        for alt in [0, 1, "/dev/video0", "/dev/video1"]:
+
+        # Always add 0 and /dev/video0 as primary video nodes
+        for alt in [0, "/dev/video0", self.fallback_index]:
             if alt not in candidates:
                 candidates.append(alt)
 
         for target in candidates:
+            # Skip /dev/video1 or 1 unless it is the only candidate, since it is metadata on Linux
+            if target in ("/dev/video1", 1) and len(candidates) > 1:
+                continue
+
             try:
-                # First try with CAP_V4L2 if on Linux, otherwise default
+                # First try CAP_V4L2 if on Linux, otherwise default
                 backend = cv2.CAP_V4L2 if (hasattr(cv2, "CAP_V4L2") and os.name == "posix") else cv2.CAP_ANY
                 self.cap = cv2.VideoCapture(target, backend)
                 if not self.cap.isOpened():
@@ -406,17 +419,81 @@ class WristCamera:
                     self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                     self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
                     self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+                    # Warm up camera buffer
+                    ret = False
                     for _ in range(5):
-                        self.cap.read()
-                    self.is_opened = True
-                    logger.info("Wrist camera opened successfully on %s (%dx%d @ %d FPS)", str(target), self.width, self.height, self.fps)
-                    return True
+                        ret, frame = self.cap.read()
+                        if ret and frame is not None:
+                            with self._frame_lock:
+                                self._latest_raw_frame = frame
+                                self._latest_frame_time = time.time()
+
+                    if ret:
+                        self.is_opened = True
+                        self._consecutive_failures = 0
+                        logger.info("Wrist camera opened successfully on %s (%dx%d @ %d FPS)", str(target), self.width, self.height, self.fps)
+                        return True
+                    else:
+                        self.cap.release()
+                        self.cap = None
             except Exception as e:
                 logger.debug("Failed opening camera candidate %s: %s", target, e)
+                if self.cap is not None:
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = None
 
         self.is_opened = False
         logger.error("Could not open wrist camera on any candidate: %s", candidates)
         return False
+
+    def _reconnect_camera(self) -> bool:
+        """Safely reset and reconnect the camera device."""
+        if self.dry_run:
+            return True
+        logger.warning("[CAMERA RECOVERY] Resetting and reconnecting camera hardware...")
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+        self.is_opened = False
+        time.sleep(0.25)
+        ok = self.connect()
+        if ok:
+            logger.info("[CAMERA RECOVERY] Camera successfully reconnected and ready!")
+            self._consecutive_failures = 0
+        else:
+            logger.warning("[CAMERA RECOVERY] Camera reconnect failed; will retry.")
+        return ok
+
+    def ensure_healthy(self) -> bool:
+        """Verify camera is alive and producing live frames; re-initialize if stalled."""
+        if self.dry_run:
+            return True
+        now = time.time()
+        # 1. If background stream thread died, restart it
+        if self._streaming:
+            if self._stream_thread is None or not self._stream_thread.is_alive():
+                logger.warning("[CAMERA HEALTH] Stream worker thread was dead! Restarting...")
+                self._streaming = False
+                self.start_stream(detector=self._detector, target_fps=self._target_fps)
+                time.sleep(0.15)
+
+            # 2. If no fresh frame in last 0.6s, reconnect
+            age = now - self._latest_frame_time
+            if self._latest_raw_frame is None or age > 0.6:
+                logger.warning("[CAMERA HEALTH] Camera stalled (last frame %.2fs ago). Triggering recovery...", age)
+                self._reconnect_camera()
+                time.sleep(0.15)
+            return self.is_opened
+        else:
+            if not self.is_opened or self.cap is None or not self.cap.isOpened():
+                return self.connect()
+            return True
 
     def _generate_synthetic_frame(self) -> np.ndarray:
         """Generate a realistic synthetic camera frame with simulated sock."""
@@ -430,7 +507,7 @@ class WristCamera:
 
     def start_stream(self, detector: Optional[Any] = None, target_fps: float = 20.0):
         """Start continuous background video capture and live detection stream."""
-        if self._streaming:
+        if self._streaming and self._stream_thread is not None and self._stream_thread.is_alive():
             if detector is not None:
                 self._detector = detector
             return
@@ -455,32 +532,47 @@ class WristCamera:
             self._stream_thread = None
 
     def _stream_worker(self):
-        """Background thread continuously pulling frames and updating debug stream at high FPS."""
+        """Background thread continuously pulling frames with auto-recovery and live stream updates."""
         interval = 1.0 / max(1.0, self._target_fps)
         frame_count = 0
         fps_t0 = time.time()
 
         while self._streaming:
             loop_start = time.time()
+            frame = None
+            ret = False
+
             if self.dry_run:
                 frame = self._generate_synthetic_frame()
                 ret = True
             else:
-                if self.cap is None or not self.cap.isOpened():
-                    time.sleep(0.1)
-                    continue
-                ret, frame = self.cap.read()
+                try:
+                    if self.cap is None or not self.cap.isOpened():
+                        self._consecutive_failures += 1
+                        if self._consecutive_failures >= 3:
+                            self._reconnect_camera()
+                        time.sleep(0.2)
+                        continue
+
+                    ret, frame = self.cap.read()
+                except Exception as e:
+                    logger.debug("Camera read exception: %s", e)
+                    ret = False
+                    frame = None
 
             if ret and frame is not None:
+                self._consecutive_failures = 0
+                now = time.time()
                 with self._frame_lock:
                     self._latest_raw_frame = frame
+                    self._latest_frame_time = now
 
                 frame_count += 1
-                fps_elapsed = time.time() - fps_t0
+                fps_elapsed = now - fps_t0
                 if fps_elapsed >= 1.0:
                     self._measured_fps = frame_count / fps_elapsed
                     frame_count = 0
-                    fps_t0 = time.time()
+                    fps_t0 = now
 
                 # Process detection continuously to update the web debugger in real time
                 if self._detector is not None:
@@ -492,15 +584,50 @@ class WristCamera:
                                 srv._latest_meta["fps"] = round(self._measured_fps, 1)
                     except Exception as e:
                         logger.debug("Background detector stream error: %s", e)
+            else:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= 8:  # ~0.4s of consecutive drops
+                    logger.warning("[CAMERA] Lost %d consecutive frames. Re-establishing camera connection...", self._consecutive_failures)
+                    self._reconnect_camera()
 
             elapsed = time.time() - loop_start
             sleep_t = interval - elapsed
             if sleep_t > 0:
                 time.sleep(sleep_t)
 
-    def capture_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """Read a frame: immediately returns latest buffered frame if streaming, or queries cap."""
+    def capture_frame(self, max_staleness_s: float = 0.5) -> Tuple[bool, Optional[np.ndarray]]:
+        """Read a frame: returns latest frame if fresh, or triggers fresh capture/recovery."""
+        now = time.time()
         if self._streaming:
+            # Check if thread is healthy
+            if self._stream_thread is None or not self._stream_thread.is_alive():
+                logger.warning("[CAMERA] Stream thread inactive. Re-launching worker...")
+                self._streaming = False
+                self.start_stream(detector=self._detector, target_fps=self._target_fps)
+
+            # Check if cached frame is fresh
+            with self._frame_lock:
+                is_fresh = (self._latest_raw_frame is not None) and ((now - self._latest_frame_time) <= max_staleness_s)
+                if is_fresh:
+                    return True, self._latest_raw_frame.copy()
+
+            # If stale (> max_staleness_s):
+            logger.warning("[CAMERA] Buffered frame is stale (age: %.2fs). Forcing fresh frame grab...", now - self._latest_frame_time)
+            if not self.dry_run:
+                if self.cap is None or not self.cap.isOpened():
+                    self._reconnect_camera()
+                if self.cap is not None and self.cap.isOpened():
+                    try:
+                        ret, frame = self.cap.read()
+                        if ret and frame is not None:
+                            with self._frame_lock:
+                                self._latest_raw_frame = frame
+                                self._latest_frame_time = time.time()
+                            return True, frame
+                    except Exception as e:
+                        logger.debug("Direct read error: %s", e)
+
+            # Fallback to cached frame if available
             with self._frame_lock:
                 if self._latest_raw_frame is not None:
                     return True, self._latest_raw_frame.copy()
@@ -519,13 +646,17 @@ class WristCamera:
 
         with self._frame_lock:
             self._latest_raw_frame = frame
+            self._latest_frame_time = time.time()
         return True, frame
 
     def release(self):
         """Cleanly release camera resources."""
         self.stop_stream()
         if self.cap is not None:
-            self.cap.release()
+            try:
+                self.cap.release()
+            except Exception:
+                pass
             self.cap = None
         self.is_opened = False
         logger.debug("Wrist camera released.")
@@ -569,12 +700,13 @@ class SockDetector:
         self.roi_bottom_pct = roi_bottom_pct
         self.roi_left_pct = roi_left_pct
         self.roi_right_pct = roi_right_pct
+        self._last_disk_save_time: float = 0.0
 
         if self.enable_web_stream:
             server = VisionDebugServer.get_instance(self.web_stream_port)
             server.start()
 
-    def detect(self, frame: np.ndarray) -> DetectionResult:
+    def detect(self, frame: np.ndarray, force_save: bool = False) -> DetectionResult:
         """Process image frame to locate the sock on the floor."""
         if frame is None or frame.size == 0:
             return DetectionResult(found=False)
@@ -761,8 +893,10 @@ class SockDetector:
         combined = np.hstack([c_raw, c_mask, c_ann])
         result.combined_frame = combined
 
-        # 8. Save debug images to disk
-        if self.save_debug_image:
+        # 8. Save debug images to disk (throttled to at most once every 1.5s unless force_save=True)
+        now = time.time()
+        if self.save_debug_image and (force_save or (now - self._last_disk_save_time >= 1.5)):
+            self._last_disk_save_time = now
             try:
                 if self.debug_image_path:
                     cv2.imwrite(self.debug_image_path, annotated)

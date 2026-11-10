@@ -249,10 +249,13 @@ class DemoStateMachine:
             elif self.demo_case == 4:
                 logger.info(
                     f"\n{COLOR_BOLD}{COLOR_MAGENTA}>>> [CASE 4] INITIATING AUTONOMOUS SOCK COLLECTION! <<<{COLOR_RESET}\n"
-                    f"Base wheels locked with electric brakes. Starting vision inspection...\n"
+                    f"Base wheels locked with electric brakes. Verifying camera and starting vision inspection...\n"
                 )
+                self.last_detection = None
                 self.scan_retries = 0
                 self.align_iterations = 0
+                if self.camera is not None:
+                    self.camera.ensure_healthy()
                 self.state = DemoState.AUTONOMOUS_PICK_SCAN
             return
 
@@ -428,6 +431,10 @@ class DemoStateMachine:
         )
 
         detected_sock = None
+        self.last_detection = None
+        if self.camera is not None:
+            self.camera.ensure_healthy()
+
         scan_t = getattr(self.planner, "scan_move_duration_s", 1.5)
         for angle in sweep_angles:
             if (not self.running and not self.arm.dry_run) or gp.brake or gp.button_b_held:
@@ -448,7 +455,7 @@ class DemoStateMachine:
             if not ok or frame is None:
                 continue
 
-            det = self.detector.detect(frame)
+            det = self.detector.detect(frame, force_save=True)
             if det.found:
                 detected_sock = det
                 logger.info(
@@ -666,6 +673,11 @@ class DemoStateMachine:
             feedback_cb=lambda _: self.base.hold_lock(),
         )
         self.base.release_brakes()
+        self.last_detection = None
+        self.align_iterations = 0
+        self.scan_retries = 0
+        if self.camera is not None:
+            self.camera.ensure_healthy()
         logger.info(
             f"\n{COLOR_BOLD}{COLOR_CYAN}>>> BASE DRIVE ACTIVE! Mobile base is ready to drive! <<<{COLOR_RESET}\n"
         )
