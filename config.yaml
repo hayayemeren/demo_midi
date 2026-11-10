@@ -158,7 +158,7 @@ case4:
     reach_elbow_gain: 20.0      # forward/backward reach modulation gain (degrees)
     reach_lift_gain: 6.0        # lift angle compensation with reach (degrees)
     max_reach_delta_deg: 18.0   # clamp maximum reach adjustment (degrees)
-    enable_roll_alignment: true # align gripper jaws with cloth contour orientation
+    enable_roll_alignment: false # Keep gripper wrist roll fixed to calibrated floor grasp value (no unwanted wrist twist)
     enable_hover_refinement: true # pre-grasp hover at 8-10cm + close-up camera refinement
     hover_lift_offset_deg: -14.0 # elevation offset for pre-grasp hover (degrees)
     max_align_iterations: 3     # closed-loop centering loop maximum iterations

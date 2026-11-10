@@ -1013,7 +1013,7 @@ class VisionGraspPlanner:
         self.reach_elbow_gain = float(serv.get("reach_elbow_gain", 20.0))
         self.reach_lift_gain = float(serv.get("reach_lift_gain", 6.0))
         self.max_reach_delta_deg = float(serv.get("max_reach_delta_deg", 18.0))
-        self.enable_roll_alignment = bool(serv.get("enable_roll_alignment", True))
+        self.enable_roll_alignment = bool(serv.get("enable_roll_alignment", False))
         self.enable_hover_refinement = bool(serv.get("enable_hover_refinement", True))
         self.hover_lift_offset_deg = float(serv.get("hover_lift_offset_deg", -14.0))
         self.max_align_iterations = int(serv.get("max_align_iterations", 3))
@@ -1128,10 +1128,12 @@ class VisionGraspPlanner:
             grasp["shoulder_lift.pos"] = float(base_lift + lift_reach_delta)
             grasp["wrist_flex.pos"] = float(base_wrist + wrist_reach_delta)
 
-            # 3. Gripper roll orientation adaptation
+            # 3. Gripper roll orientation: keep fixed to calibrated base_roll unless explicitly enabled
             if self.enable_roll_alignment and abs(detection.angle) > 2.0:
                 roll_offset = float(np.clip(detection.angle, -60.0, 60.0))
                 grasp["wrist_roll.pos"] = float(np.clip(base_roll + roll_offset, -180.0, 180.0))
+            else:
+                grasp["wrist_roll.pos"] = base_roll
 
         # If hover pose: elevate shoulder and open gripper wide
         if is_hover:

@@ -430,10 +430,15 @@ def test_case4_vision_grasp_components():
     grasp_near = planner.compute_grasp_pose(aligned, det_near)
     assert grasp_far["elbow_flex.pos"] > grasp_near["elbow_flex.pos"], "Elbow should extend further forward for far sock"
 
-    # 4c. Test adaptive wrist roll orientation alignment
+    # 4c. Test fixed wrist roll by default (no unwanted rolling during grasp)
     det_angled = DetectionResult(found=True, angle=35.0)
     grasp_angled = planner.compute_grasp_pose(aligned, det_angled)
-    assert abs(grasp_angled["wrist_roll.pos"] - grasp_pose["wrist_roll.pos"]) > 10.0, "Wrist roll should rotate to match sock orientation"
+    assert grasp_angled["wrist_roll.pos"] == grasp_pose["wrist_roll.pos"], "Wrist roll should remain fixed and flat without unwanted rolling"
+
+    # 4c-2. Test opt-in wrist roll adaptation if explicitly enabled in configuration
+    planner_roll = VisionGraspPlanner({"case4": {"servoing": {"enable_roll_alignment": True}}})
+    grasp_rolled = planner_roll.compute_grasp_pose(aligned, det_angled)
+    assert abs(grasp_rolled["wrist_roll.pos"] - grasp_pose["wrist_roll.pos"]) > 10.0, "Wrist roll rotates only when explicitly enabled"
 
     # 4d. Test pre-grasp hover pose (elevated with open jaws)
     hover_pose = planner.compute_grasp_pose(aligned, det, is_hover=True)

@@ -610,17 +610,16 @@ class DemoStateMachine:
         is_caught = self.planner.verify_grasp(measured_grip) if self.planner else True
         abort_on_miss = getattr(self.planner, "abort_on_miss", False)
 
-        if is_caught:
-            logger.info(
-                f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [GRASP VERIFIED] SUCCESS! Sock securely held (Grip: {measured_grip:.1f}% >= {self.planner.grasp_verification_threshold:.1f}%). <<<{COLOR_RESET}\n"
-                f"Transporting sock to basket with clamped jaws..."
-            )
-            self.state = DemoState.AUTONOMOUS_BASKET_DUMP
-        elif not abort_on_miss:
-            # Proceed to basket even if thin cloth grip reading is close to threshold, NEVER drop before going up!
-            logger.info(
-                f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP INFO] Grip reading: {measured_grip:.1f}% (Threshold: {self.planner.grasp_verification_threshold:.1f}%). Proceeding to basket with clamped jaws... <<<{COLOR_RESET}\n"
-            )
+        if is_caught or not abort_on_miss:
+            if is_caught:
+                logger.info(
+                    f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [GRASP VERIFIED] SUCCESS! Sock securely held (Grip: {measured_grip:.1f}% >= {self.planner.grasp_verification_threshold:.1f}%). <<<{COLOR_RESET}\n"
+                    f"Transporting sock to basket with clamped jaws..."
+                )
+            else:
+                logger.info(
+                    f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP INFO] Grip reading: {measured_grip:.1f}% (Threshold: {self.planner.grasp_verification_threshold:.1f}%). Proceeding to basket with clamped jaws... <<<{COLOR_RESET}\n"
+                )
             self.state = DemoState.AUTONOMOUS_BASKET_DUMP
         else:
             logger.warning(
@@ -632,7 +631,7 @@ class DemoStateMachine:
             self.state = DemoState.PARKING
 
     def _handle_autonomous_basket(self, gp: GamepadState):
-        """Case 4: Smoothly moves arm over chassis-mounted basket (behind and a little up), drops sock, and parks."""
+        """Case 4: Smoothly elevates arm to safe clearance height, moves over chassis-mounted basket, drops sock, and parks."""
         self.base.hold_lock()
 
         if self.planner is None:
@@ -642,7 +641,18 @@ class DemoStateMachine:
         basket_t = getattr(self.planner, "basket_duration_s", 3.2)
         release_t = getattr(self.planner, "release_duration_s", 0.8)
 
-        logger.info("\n[BASKET] 1. Moving arm over collection basket (%.1fs gentle swing)...", basket_t)
+        # 1. Elevate arm vertically clear of floor and chassis before swinging back
+        cur_pose = self.arm.get_follower_pose()
+        safe_lift_pose = dict(cur_pose)
+        safe_lift_pose["shoulder_lift.pos"] = -30.0   # Clear chassis height
+        safe_lift_pose["elbow_flex.pos"] = 20.0       # Tuck elbow in to minimize moment arm
+        safe_lift_pose["wrist_flex.pos"] = 40.0       # Gripper angled safely
+        safe_lift_pose["gripper.pos"] = 0.0          # Maintain tight clamp
+        logger.info("\n[BASKET] 1. Lifting arm to safe travel height clear of chassis...")
+        self.arm.move_to_pose(safe_lift_pose, duration_s=1.2, feedback_cb=lambda _: self.base.hold_lock())
+
+        # 2. Smoothly transit over chassis collection basket in the back
+        logger.info("[BASKET] 2. Moving arm over collection basket (%.1fs gentle swing)...", basket_t)
         transit_pose = dict(self.planner.basket_pose)
         transit_pose["gripper.pos"] = 0.0  # Hold sock firmly during transit
         self.arm.move_to_pose(
@@ -651,7 +661,8 @@ class DemoStateMachine:
             feedback_cb=lambda _: self.base.hold_lock(),
         )
 
-        logger.info("[BASKET] 2. Releasing sock into basket (opening gripper to 85%% over %.1fs)...", release_t)
+        # 3. Release sock into basket
+        logger.info("[BASKET] 3. Releasing sock into basket (opening gripper to 85%% over %.1fs)...", release_t)
         drop_pose = dict(transit_pose)
         drop_pose["gripper.pos"] = 85.0
         self.arm.move_to_pose(drop_pose, duration_s=release_t, feedback_cb=lambda _: self.base.hold_lock())

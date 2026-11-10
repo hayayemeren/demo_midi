@@ -454,12 +454,21 @@ def test_pick(config_path: str, dry_run: bool = False):
         else:
             print(f"[INFO] Grip aperture reading: {measured_grip:.1f}% (Threshold: {planner.grasp_verification_threshold:.1f}%).")
 
-        print(f"\n[TEST] 5. Holding sock firmly clamped (0%) and moving to chassis basket ({basket_t:.1f}s gentle transit)...")
+        print(f"\n[TEST] 5. Lifting arm to safe clearance height clear of chassis...")
+        cur_pose = arm.get_follower_pose()
+        safe_lift_p = dict(cur_pose)
+        safe_lift_p["shoulder_lift.pos"] = -30.0
+        safe_lift_p["elbow_flex.pos"] = 20.0
+        safe_lift_p["wrist_flex.pos"] = 40.0
+        safe_lift_p["gripper.pos"] = 0.0
+        arm.move_to_pose(safe_lift_p, duration_s=1.2, feedback_cb=lambda _: base.hold_lock())
+
+        print(f"[TEST] 6. Holding sock firmly clamped (0%) and moving to chassis basket ({basket_t:.1f}s gentle transit)...")
         transit_p = dict(planner.basket_pose)
         transit_p["gripper.pos"] = 0.0  # Keep tight clamp on sock during transit
         arm.move_to_pose(transit_p, duration_s=basket_t, feedback_cb=lambda _: base.hold_lock())
 
-        print(f"[TEST] 6. Opening gripper over basket (85%) over {release_t:.1f}s...")
+        print(f"[TEST] 7. Opening gripper over basket (85%) over {release_t:.1f}s...")
         drop_p = dict(transit_p)
         drop_p["gripper.pos"] = 85.0
         arm.move_to_pose(drop_p, duration_s=release_t, feedback_cb=lambda _: base.hold_lock())
