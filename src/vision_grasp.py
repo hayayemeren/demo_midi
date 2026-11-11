@@ -16,7 +16,7 @@ import socketserver
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple, Any
+from typing import Callable, Dict, Optional, Tuple, Any
 
 import cv2
 import numpy as np
@@ -819,7 +819,7 @@ class SockDetector:
 
         # 1. Define active floor Region of Interest (ROI)
         roi_top = 0.02 if allow_border_touch else self.roi_top_pct
-        roi_bottom = max(self.roi_bottom_pct, 0.78) if allow_border_touch else self.roi_bottom_pct
+        roi_bottom = max(self.roi_bottom_pct, 0.82) if allow_border_touch else self.roi_bottom_pct
         x_min = int(w * self.roi_left_pct)
         x_max = int(w * self.roi_right_pct)
         y_min = int(h * roi_top)
@@ -841,8 +841,10 @@ class SockDetector:
             gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
             blurred = cv2.GaussianBlur(gray, (9, 9), 0)
 
-            # Detect objects darker or brighter than median floor background
-            floor_median = np.median(blurred)
+            # Anchor floor median in the lower 70% of ROI so distant dark horizon/furniture
+            # in upper frames cannot depress the median and light up the floor itself.
+            floor_region = blurred[int(roi_h * 0.30):, :] if roi_h >= 20 else blurred
+            floor_median = np.median(floor_region)
             diff = np.abs(blurred.astype(np.float32) - floor_median).astype(np.uint8)
             _, thresh = cv2.threshold(diff, eff_contrast, 255, cv2.THRESH_BINARY)
         else:
@@ -885,6 +887,11 @@ class SockDetector:
                 # RULE A: Discard contours touching the ROI boundary during normal scan,
                 # or tiny vignette slivers in close-up hover mode
                 if touches_border and (not allow_border_touch or area < 2500.0):
+                    continue
+
+                # RULE A2: Discard wide top-edge horizon / room-background contours spanning
+                # across the frame top or nearly full ROI width
+                if (by <= self.border_margin and bw > (0.68 * roi_w)) or bw > (0.80 * roi_w):
                     continue
 
                 # RULE B: Discard abnormal aspect ratios (thin vertical/horizontal edge shadows or scratches)
@@ -1492,3 +1499,103 @@ class VisionGraspPlanner:
             return r_new, pan_new, roll_target, det_hov
 
         return r_target, pan_target, roll_target, det_hov
+
+    def execute_basket_deposit(
+        self,
+        arm: Any,
+        feedback_cb: Optional[Callable[[float], None]] = None,
+    ) -> bool:
+        """Deposit grasped sock into rear basket via 2-stage compact overhead clearance.
+
+        Stage 1 moves through a compact overhead waypoint (shoulder_lift=-38°, elbow_flex=+18°,
+        wrist_flex=-45°, wrist_roll=0°) while keeping gripper clamped (0%), avoiding the full
+        extension gravity spike over the front edge. Stage 2 settles into rear basket_pose
+        still clamped (0%), then verifies follower joints actually reached rear basket before
+        opening the gripper (85%). Returns False without opening if stalled in front.
+        """
+        basket_t = float(getattr(self, "basket_duration_s", 3.2))
+        release_t = float(getattr(self, "release_duration_s", 0.8))
+        is_dry = bool(getattr(arm, "dry_run", False))
+
+        # 1. Stage 1: Compact overhead clearance keeping gripper clamped (0%) and roll neutral
+        stage1_t = 0.05 if is_dry else max(1.8, basket_t * 0.5)
+        overhead_pose = {
+            "shoulder_pan.pos": 0.0,
+            "shoulder_lift.pos": -38.0,
+            "elbow_flex.pos": 18.0,
+            "wrist_flex.pos": -45.0,
+            "wrist_roll.pos": 0.0,
+            "gripper.pos": 0.0,
+        }
+        logger.info(
+            "[BASKET] 1. Compact overhead clearance (pan=0°, lift=-38°, elbow=+18°, wrist=-45°, gripper=0%% over %.1fs)...",
+            stage1_t,
+        )
+        arm.move_to_pose(overhead_pose, duration_s=stage1_t, feedback_cb=feedback_cb)
+
+        if not is_dry:
+            t_wait = time.time()
+            while time.time() - t_wait < 0.5:
+                cur = arm.get_follower_pose()
+                if float(cur.get("shoulder_lift.pos", 999.0)) < 5.0:
+                    break
+                if feedback_cb:
+                    feedback_cb(1.0)
+                time.sleep(0.05)
+
+        meas_stage1 = arm.get_follower_pose()
+        stage1_lift = float(meas_stage1.get("shoulder_lift.pos", 999.0))
+        if stage1_lift >= 5.0:
+            logger.warning(
+                "[BASKET] Safety gate: arm stalled in front during overhead lift "
+                "(shoulder_lift=%.1f° >= 5.0°). Keeping gripper closed and aborting release!",
+                stage1_lift,
+            )
+            return False
+
+        # 2. Stage 2: Settle into rear basket_pose with gripper still clamped (0%)
+        stage2_t = 0.05 if is_dry else max(1.4, basket_t * 0.5)
+        transit_pose = dict(self.basket_pose)
+        transit_pose["gripper.pos"] = 0.0
+        logger.info(
+            "[BASKET] 2. Settling over rear collection basket (%.1fs, gripper=0%%)...",
+            stage2_t,
+        )
+        arm.move_to_pose(transit_pose, duration_s=stage2_t, feedback_cb=feedback_cb)
+
+        target_elbow = float(transit_pose.get("elbow_flex.pos", -80.4))
+        if not is_dry:
+            t_wait = time.time()
+            while time.time() - t_wait < 0.5:
+                cur = arm.get_follower_pose()
+                cur_l = float(cur.get("shoulder_lift.pos", 999.0))
+                cur_e = float(cur.get("elbow_flex.pos", 999.0))
+                if cur_l < 5.0 and (target_elbow >= -20.0 or cur_e < -20.0):
+                    break
+                if feedback_cb:
+                    feedback_cb(1.0)
+                time.sleep(0.05)
+
+        meas_basket = arm.get_follower_pose()
+        basket_lift = float(meas_basket.get("shoulder_lift.pos", 999.0))
+        basket_elbow = float(meas_basket.get("elbow_flex.pos", 999.0))
+        reached_rear = (basket_lift < 5.0) and (target_elbow >= -20.0 or basket_elbow < -20.0)
+        if not reached_rear:
+            logger.warning(
+                "[BASKET] Safety gate: arm did not reach rear basket "
+                "(shoulder_lift=%.1f°, elbow_flex=%.1f°). Keeping gripper closed!",
+                basket_lift,
+                basket_elbow,
+            )
+            return False
+
+        # 3. Release Gate passed: open gripper over rear basket
+        logger.info("[BASKET] 3. Releasing sock into basket (opening gripper to 85%% over %.1fs)...", release_t)
+        drop_pose = dict(transit_pose)
+        drop_pose["gripper.pos"] = 85.0
+        arm.move_to_pose(drop_pose, duration_s=release_t, feedback_cb=feedback_cb)
+        if not is_dry:
+            time.sleep(0.5)
+        if feedback_cb:
+            feedback_cb(1.0)
+        return True

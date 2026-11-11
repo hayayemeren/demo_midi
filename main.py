@@ -687,8 +687,6 @@ def test_pick(config_path: str, dry_run: bool = False):
         descend_t = planner.descend_duration_s
         clamp_t = planner.clamp_duration_s
         lift_t = planner.lift_duration_s
-        basket_t = planner.basket_duration_s
-        release_t = planner.release_duration_s
         stow_t = planner.stow_duration_s
 
         print("\n[TEST] 1. Executing 3-point floor scan sweep (gripper open 85%)...")
@@ -764,18 +762,12 @@ def test_pick(config_path: str, dry_run: bool = False):
         else:
             print(f"[INFO] Grip aperture reading: {measured_grip:.1f}% (Threshold: {planner.grasp_verification_threshold:.1f}%).")
 
-        print(f"\n[TEST] 5. Holding sock firmly clamped (0%) and moving to chassis basket ({basket_t:.1f}s gentle transit)...")
-        transit_p = dict(planner.basket_pose)
-        transit_p["gripper.pos"] = 0.0  # Keep tight clamp on sock during transit
-        arm.move_to_pose(transit_p, duration_s=basket_t, feedback_cb=lambda _: base.hold_lock())
-
-        print(f"[TEST] 6. Opening gripper over basket (85%) over {release_t:.1f}s...")
-        drop_p = dict(transit_p)
-        drop_p["gripper.pos"] = 85.0
-        arm.move_to_pose(drop_p, duration_s=release_t, feedback_cb=lambda _: base.hold_lock())
-        time.sleep(0.5)
-        base.hold_lock()
-        print("\n>>> [PASSED] Sock successfully picked from floor and deposited into basket! <<<\n")
+        print("\n[TEST] 5. Moving via compact overhead clearance to rear basket with position-gated release...")
+        deposited = planner.execute_basket_deposit(arm=arm, feedback_cb=lambda _: base.hold_lock())
+        if deposited:
+            print("\n>>> [PASSED] Sock successfully picked from floor and deposited into basket! <<<\n")
+        else:
+            print("\n>>> [ABORTED] Arm did not reach rear basket; gripper kept closed to protect sock! <<<\n")
 
         print(f"[TEST] Returning to stow pose over {stow_t:.1f}s...")
         arm.move_to_stow(duration_s=stow_t, feedback_cb=lambda _: base.hold_lock())

@@ -639,30 +639,20 @@ class DemoStateMachine:
             self.state = DemoState.PARKING
             return
 
-        basket_t = getattr(self.planner, "basket_duration_s", 3.2)
-        release_t = getattr(self.planner, "release_duration_s", 0.8)
-
-        # 1. Smoothly transit over chassis collection basket in the back
-        logger.info("\n[BASKET] 1. Moving arm over collection basket (%.1fs gentle swing)...", basket_t)
-        transit_pose = dict(self.planner.basket_pose)
-        transit_pose["gripper.pos"] = 0.0  # Hold sock firmly during transit
-        self.arm.move_to_pose(
-            transit_pose,
-            duration_s=basket_t,
+        # Two-stage compact overhead clearance -> rear basket settle -> position-gated release
+        deposited = self.planner.execute_basket_deposit(
+            self.arm,
             feedback_cb=lambda _: self.base.hold_lock(),
         )
 
-        # 3. Release sock into basket
-        logger.info("[BASKET] 3. Releasing sock into basket (opening gripper to 85%% over %.1fs)...", release_t)
-        drop_pose = dict(transit_pose)
-        drop_pose["gripper.pos"] = 85.0
-        self.arm.move_to_pose(drop_pose, duration_s=release_t, feedback_cb=lambda _: self.base.hold_lock())
-        time.sleep(0.5)
-        self.base.hold_lock()
-
-        logger.info(
-            f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [BASKET COMPLETE] Sock deposited successfully into basket! <<<{COLOR_RESET}\n"
-        )
+        if deposited:
+            logger.info(
+                f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [BASKET COMPLETE] Sock deposited successfully into basket! <<<{COLOR_RESET}\n"
+            )
+        else:
+            logger.warning(
+                "\n[BASKET ABORTED] Arm did not reach rear basket; kept gripper closed to avoid dropping sock on floor.\n"
+            )
         self.state = DemoState.PARKING
 
     def _handle_parking(self):

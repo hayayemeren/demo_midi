@@ -153,7 +153,7 @@ case4:
     l2_m: 0.1350                # Forearm length: elbow pitch axis to wrist pitch axis (meters)
     l3_m: 0.1594                # Effective gripper length: wrist pitch axis to fingertips (meters)
     ground_clearance_m: 0.024   # Safe elevation above raw floor contact (24mm -> ~20mm actual clearance with servo droop)
-    hover_height_m: 0.115       # Pre-grasp hover height above floor (115mm) for clean close-up framing
+    hover_height_m: 0.090       # Pre-grasp hover height above floor (90mm) to keep horizon out of hover frame
     lift_height_m: 0.125        # Post-grasp vertical lift height above floor (125mm)
     radial_gain_m: 0.050        # Legacy fallback distance gain (meters)
     pan_gain_deg: 60.0          # Azimuthal pan compensation across camera horizontal FOV (degrees)

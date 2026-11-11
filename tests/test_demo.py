@@ -931,6 +931,16 @@ def test_real_floor_image_and_kinematic_descent():
         assert det_hov.found is True, "Must detect close-up black sock touching top edge in /tmp/cl_hover1.jpg"
         assert det_hov.cy < 150.0, f"Must lock onto real dark sock at top (cy < 150), not floor shadow (got cy={det_hov.cy:.1f})"
 
+    if os.path.exists("/tmp/pi_last_raw.jpg"):
+        img_raw = cv2.imread("/tmp/pi_last_raw.jpg")
+        det_raw = detector.detect(
+            img_raw, allow_border_touch=True, max_area_override=220000.0
+        )
+        assert det_raw.found is True, "Must detect actual black sock beside gripper in /tmp/pi_last_raw.jpg"
+        assert det_raw.cy >= 250.0, (
+            f"Must reject top horizon room furniture (cy~92) and lock onto sock near jaws (got cy={det_raw.cy:.1f})"
+        )
+
 
 def test_arm_front_stow_clearance_recovery():
     """Verify move_to_stow safely clears forward floor postures without tucking jaws backward into chassis."""
@@ -951,6 +961,128 @@ def test_arm_front_stow_clearance_recovery():
     arm.move_to_stow(duration_s=0.01)
     for k, v in arm.stow_pose.items():
         assert abs(arm.sim_follower_pose[k] - v) < 1e-3, f"Joint {k} did not reach stow pose"
+
+
+def test_basket_two_stage_overhead_deposit_and_release_gate():
+    """Verify 2-stage compact overhead clearance before basket release and front-stall release gate."""
+    import yaml
+
+    cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+    with open(cfg_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    planner = VisionGraspPlanner(cfg)
+
+    # 1. Happy path: front floor lift -> compact overhead clearance -> rear basket -> release 85%
+    arm = ArmController(cfg, dry_run=True)
+    arm.connect_follower()
+    arm.sim_follower_pose = {
+        "shoulder_pan.pos": -25.0,
+        "shoulder_lift.pos": 63.0,
+        "elbow_flex.pos": -51.0,
+        "wrist_flex.pos": 74.0,
+        "wrist_roll.pos": -0.7,
+        "gripper.pos": 0.0,
+    }
+
+    recorded_moves = []
+    orig_move = arm.move_to_pose
+
+    def spy_move(target_pose, duration_s=None, feedback_cb=None):
+        recorded_moves.append(dict(target_pose))
+        return orig_move(target_pose, duration_s=duration_s, feedback_cb=feedback_cb)
+
+    arm.move_to_pose = spy_move
+
+    deposited = planner.execute_basket_deposit(arm)
+    assert deposited is True, "Dry-run execute_basket_deposit should succeed when arm clears overhead"
+    assert len(recorded_moves) == 3, f"Expected 3 stages (overhead, basket_clamped, drop), got {len(recorded_moves)}"
+
+    stage1, stage2, stage3 = recorded_moves
+    assert stage1["shoulder_lift.pos"] == -38.0 and stage1["elbow_flex.pos"] == 18.0
+    assert stage1["wrist_flex.pos"] == -45.0 and stage1["wrist_roll.pos"] == 0.0
+    assert stage1["gripper.pos"] == 0.0, "Gripper must remain clamped (0%) during overhead clearance"
+
+    assert abs(stage2["shoulder_lift.pos"] - planner.basket_pose["shoulder_lift.pos"]) < 1e-4
+    assert abs(stage2["elbow_flex.pos"] - planner.basket_pose["elbow_flex.pos"]) < 1e-4
+    assert stage2["gripper.pos"] == 0.0, "Gripper must remain clamped (0%) while settling into basket"
+
+    assert stage3["gripper.pos"] == 85.0, "Gripper must open to 85% only after reaching rear basket"
+
+    # 2. Stage 1 front-stall safety gate: arm stays stalled forward (shoulder_lift=60°) -> must NOT open gripper
+    stalled_arm = ArmController(cfg, dry_run=True)
+    stalled_arm.connect_follower()
+    stalled_moves = []
+    stalled_arm.move_to_pose = lambda p, duration_s=None, feedback_cb=None: stalled_moves.append(dict(p))
+    stalled_arm.get_follower_pose = lambda: {
+        "shoulder_pan.pos": 0.0,
+        "shoulder_lift.pos": 60.0,
+        "elbow_flex.pos": -50.0,
+        "wrist_flex.pos": 70.0,
+        "wrist_roll.pos": 0.0,
+        "gripper.pos": 0.0,
+    }
+    res_front_stall = planner.execute_basket_deposit(stalled_arm)
+    assert res_front_stall is False, "Must abort release if arm stalled in front of overhead dead-center"
+    assert len(stalled_moves) == 1, "Must stop after Stage 1 without commanding Stage 2 or drop"
+    assert all(m.get("gripper.pos", 0.0) == 0.0 for m in stalled_moves)
+
+    # 3. Stage 2 elbow-stall safety gate: overhead clears (-38°) but elbow stalls (+15°) -> must NOT open gripper
+    elbow_stall_arm = ArmController(cfg, dry_run=True)
+    elbow_stall_arm.connect_follower()
+    elbow_stall_moves = []
+    elbow_stall_arm.move_to_pose = lambda p, duration_s=None, feedback_cb=None: elbow_stall_moves.append(dict(p))
+    stage_poses = iter([
+        {"shoulder_lift.pos": -38.0, "elbow_flex.pos": 18.0, "gripper.pos": 0.0},
+        {"shoulder_lift.pos": -38.0, "elbow_flex.pos": 15.0, "gripper.pos": 0.0},
+    ])
+    elbow_stall_arm.get_follower_pose = lambda: next(stage_poses)
+    res_elbow_stall = planner.execute_basket_deposit(elbow_stall_arm)
+    assert res_elbow_stall is False, "Must abort release if elbow never unfolded into rear basket"
+    assert len(elbow_stall_moves) == 2
+    assert all(m.get("gripper.pos", 0.0) == 0.0 for m in elbow_stall_moves)
+
+    # 4. State machine integration: stalled _handle_autonomous_basket keeps gripper clamped & moves to PARKING
+    base = BaseController(cfg, dry_run=True)
+    base.connect()
+    sm = DemoStateMachine(
+        base=base,
+        arm=stalled_arm,
+        gamepad=F710Gamepad(),
+        demo_case=4,
+        config=cfg,
+    )
+    sm.planner = planner
+    sm.state = DemoState.AUTONOMOUS_BASKET_DUMP
+    stalled_moves.clear()
+    sm._handle_autonomous_basket(GamepadState())
+    assert sm.state == DemoState.PARKING
+    assert len(stalled_moves) == 1 and stalled_moves[0]["gripper.pos"] == 0.0
+
+
+def test_hover_horizon_rejection_and_floor_anchor():
+    """Verify hover mode rejects full-width dark top horizon bands and locks onto lower floor sock."""
+    import cv2
+    import numpy as np
+
+    frame = np.full((480, 640, 3), 190, dtype=np.uint8)
+    # Dark room background / cabinet spanning top horizon (y=0..150, full width)
+    frame[0:150, :] = (35, 35, 35)
+    # Compact dark sock near lower-center floor beside gripper
+    cv2.ellipse(frame, (350, 345), (38, 32), 15.0, 0, 360, (20, 20, 20), -1)
+
+    det = SockDetector(
+        mode="auto",
+        min_area=600.0,
+        max_area=80000.0,
+        contrast_threshold=35.0,
+        save_debug_image=False,
+    )
+    res = det.detect(frame, force_save=False, allow_border_touch=True, max_area_override=220000.0)
+    assert res.found is True, "Should detect compact dark sock in lower floor despite dark horizon"
+    assert 310.0 <= res.cx <= 390.0 and 300.0 <= res.cy <= 380.0, (
+        f"Expected hover detection on sock (350, 345), not horizon band (got ({res.cx:.1f}, {res.cy:.1f}))"
+    )
 
 
 if __name__ == "__main__":
@@ -994,6 +1126,11 @@ if __name__ == "__main__":
     print("  [PASS] test_real_floor_image_and_kinematic_descent")
     test_arm_front_stow_clearance_recovery()
     print("  [PASS] test_arm_front_stow_clearance_recovery")
+    test_basket_two_stage_overhead_deposit_and_release_gate()
+    print("  [PASS] test_basket_two_stage_overhead_deposit_and_release_gate")
+    test_hover_horizon_rejection_and_floor_anchor()
+    print("  [PASS] test_hover_horizon_rejection_and_floor_anchor")
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
+
 
 
