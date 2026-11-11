@@ -236,7 +236,8 @@ def test_case2_gamepad_teleop_simulation():
 
 
 def test_base_steering_direction():
-    """Verify that pushing stick left with turn_dir=-1 turns robot left (CCW)."""
+    """Verify that pushing stick left with turn_dir=-1 turns robot left (CCW)
+    and that relative wheel velocity is properly split so it does not double."""
     cfg = {
         "dry_run": True,
         "serial": {"port": "/dev/null"},
@@ -250,6 +251,16 @@ def test_base_steering_direction():
     # Left wheel should turn backward (negative), right wheel forward (positive) -> Turn Left!
     assert base.cur_left_rpm < 0.0
     assert base.cur_right_rpm > 0.0
+
+    # Step forward until slew limiter reaches steady state target
+    for _ in range(5):
+        base.drive(forward=0.0, turn=1.0, max_rpm=100.0, dt=0.05)
+    # At steady state, each wheel runs at 0.5 * 0.65 * 100 = 32.5 RPM
+    assert abs(base.cur_left_rpm - (-32.5)) < 1e-3, f"Expected -32.5 RPM, got {base.cur_left_rpm}"
+    assert abs(base.cur_right_rpm - 32.5) < 1e-3, f"Expected 32.5 RPM, got {base.cur_right_rpm}"
+    # Relative velocity across both wheels is exactly 65 RPM (turn_ratio * max_rpm), NOT 130 RPM
+    relative_rpm = base.cur_right_rpm - base.cur_left_rpm
+    assert abs(relative_rpm - 65.0) < 1e-3, f"Expected 65.0 RPM relative, got {relative_rpm}"
 
 
 def test_arm_joint_standard_1to1():

@@ -81,7 +81,9 @@ class BaseController:
             target_r = 0.0
             dec = self.brake_rate
         else:
-            scaled_turn = turn * self.turn_ratio * self.turn_dir
+            # When rotating, the relative velocity between both wheels adds up (v_l - v_r = 2 * v_wheel).
+            # To prevent spinning faster than intended, distribute the differential turn velocity across both wheels (0.5 * scaled_turn).
+            scaled_turn = 0.5 * turn * self.turn_ratio * self.turn_dir
             l = forward + scaled_turn
             r = forward - scaled_turn
             scale = max(1.0, abs(l), abs(r))
