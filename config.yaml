@@ -177,6 +177,7 @@ case4:
   # Visual Servoing Gains
   servoing:
     pan_gain: 22.0              # max pan angle correction in degrees
+    pan_direction: 1.0          # pan direction multiplier (+1.0: right is positive pan, -1.0: right is negative pan)
     lift_gain: 15.0             # max lift angle correction in degrees
     align_tolerance: 0.12       # normalized centering threshold [-1.0, 1.0]
     reach_elbow_gain: 20.0      # forward/backward reach modulation gain (degrees)

@@ -1030,6 +1030,21 @@ class VisionGraspPlanner:
             "gripper.pos": 10.0,
         })
         self.scan_poses = c4.get("scan_poses", None)
+
+        # Pan direction multiplier (+1.0 if right pan is positive, -1.0 if right pan is negative)
+        configured_pan_dir = serv.get("pan_direction", None)
+        if configured_pan_dir is not None:
+            self.pan_direction = float(configured_pan_dir)
+        elif self.scan_poses and isinstance(self.scan_poses, dict):
+            r_pan = self.scan_poses.get("right", {}).get("shoulder_pan.pos")
+            l_pan = self.scan_poses.get("left", {}).get("shoulder_pan.pos")
+            if r_pan is not None and l_pan is not None:
+                self.pan_direction = 1.0 if float(r_pan) > float(l_pan) else -1.0
+            else:
+                self.pan_direction = 1.0
+        else:
+            self.pan_direction = 1.0
+
         # Basket is mounted directly behind the gripper centerline and slightly elevated
         self.basket_pose = c4.get("basket_pose", {
             "shoulder_pan.pos": 0.0,
@@ -1096,9 +1111,8 @@ class VisionGraspPlanner:
 
         aligned = dict(current_pose)
 
-        # Invert pan direction matching camera horizontal axis:
-        # Rotate shoulder_pan so the arm directly faces the centroid of the sock
-        pan_correction = -self.pan_gain * detection.error_x
+        # Rotate shoulder_pan towards the centroid of the sock using pan_direction
+        pan_correction = self.pan_direction * self.pan_gain * detection.error_x
         aligned["shoulder_pan.pos"] = float(np.clip(
             aligned.get("shoulder_pan.pos", 0.0) + pan_correction,
             -110.0, 110.0
@@ -1152,7 +1166,7 @@ class VisionGraspPlanner:
         if detection is not None and detection.found:
             # 1. Rotate shoulder_pan to center the sock centroid horizontally with the arm base
             if abs(detection.error_x) > 0.02:
-                pan_trim = -self.pan_gain * float(detection.error_x)
+                pan_trim = self.pan_direction * self.pan_gain * float(detection.error_x)
                 grasp["shoulder_pan.pos"] = float(np.clip(target_pan + pan_trim, -110.0, 110.0))
 
             # 2. Longitudinal reach modulation (negative error_y = sock further away)
