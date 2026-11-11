@@ -685,23 +685,46 @@ def test_pick(config_path: str, dry_run: bool = False):
         scan_p["gripper.pos"] = 85.0
         arm.move_to_pose(scan_p, duration_s=1.8, feedback_cb=lambda _: base.hold_lock())
 
-        print(f"[TEST] 2. Descending to calibrated floor grasp pose ({descend_t:.1f}s smooth motion)...")
-        grasp_p = planner.compute_grasp_pose(scan_p)
-        grasp_open = dict(grasp_p)
-        grasp_open["gripper.pos"] = 85.0
+        # If camera is available, check for sock in camera frame
+        det = None
+        if camera is not None:
+            time.sleep(0.3)
+            ok, frame = camera.capture_frame()
+            if ok and frame is not None:
+                det_res = detector.detect(frame, force_save=True)
+                if det_res.found:
+                    det = det_res
+                    print(f"\n>>> [TEST VISION] Sock detected at ({det.cx:.0f}, {det.cy:.0f}), area={det.area:.0f}px! Centering gripper onto sock! <<<\n")
+
+        if det is not None:
+            r_tgt, pan_tgt, roll_tgt = planner.kinematics.compute_sock_target(
+                det,
+                scan_pan_deg=scan_p.get("shoulder_pan.pos", 0.0),
+                pan_direction=planner.pan_direction,
+            )
+            stages = planner.kinematics.get_trajectory_stages(r_tgt, pan_tgt, roll_tgt)
+            grasp_open = stages["descent"]
+            grasp_clamp = stages["clamp"]
+            lift_p = stages["lift"]
+            print(f"[TEST] Target Floor Coordinates: R={r_tgt*100:.1f}cm, Pan={pan_tgt:+.1f}°, Roll={roll_tgt:+.1f}°")
+        else:
+            grasp_p = planner.compute_grasp_pose(scan_p)
+            grasp_open = dict(grasp_p)
+            grasp_open["gripper.pos"] = 85.0
+            grasp_clamp = dict(grasp_open)
+            grasp_clamp["gripper.pos"] = 0.0
+            lift_p = planner.compute_grasp_pose(grasp_clamp, is_lift=True)
+
+        print(f"[TEST] 2. Descending to floor grasp pose ({descend_t:.1f}s smooth motion)...")
+        print(f"       Joints: Pan={grasp_open.get('shoulder_pan.pos', 0.0):.1f}°, Lift={grasp_open.get('shoulder_lift.pos', 0.0):.1f}°, Elbow={grasp_open.get('elbow_flex.pos', 0.0):.1f}°")
         arm.move_to_pose(grasp_open, duration_s=descend_t, feedback_cb=lambda _: base.hold_lock())
 
         print(f"[TEST] 3. Clamping gripper jaws onto sock (0%) over {clamp_t:.1f}s...")
-        grasp_clamp = dict(grasp_open)
-        grasp_clamp["gripper.pos"] = 0.0
         arm.move_to_pose(grasp_clamp, duration_s=clamp_t, feedback_cb=lambda _: base.hold_lock())
         time.sleep(0.3)
         base.hold_lock()
 
-        print(f"[TEST] 4. Elevating arm off floor to verify grip ({lift_t:.1f}s)...")
-        lift_p = dict(grasp_clamp)
-        cur_lift = lift_p.get("shoulder_lift.pos", 0.0)
-        lift_p["shoulder_lift.pos"] = cur_lift - 20.0 if cur_lift > 0 else cur_lift - 15.0
+        print(f"[TEST] 4. Elevating arm off floor via IK to verify grip ({lift_t:.1f}s)...")
         arm.move_to_pose(lift_p, duration_s=lift_t, feedback_cb=lambda _: base.hold_lock())
         time.sleep(0.3)
         base.hold_lock()

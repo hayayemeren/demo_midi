@@ -29,6 +29,10 @@ class SO100Kinematics:
         lift_height_m: float = 0.120,
         radial_gain_m: float = 0.050,
         pan_gain_deg: float = 25.0,
+        r_near_m: float = 0.115,
+        r_far_m: float = 0.215,
+        y_near_px: float = 330.0,
+        y_far_px: float = 60.0,
         floor_grasp_pose: Optional[Dict[str, float]] = None,
     ):
         """Initialize SO-100 kinematics model.
@@ -42,6 +46,10 @@ class SO100Kinematics:
             lift_height_m: Post-grasp vertical lift height above floor (meters).
             radial_gain_m: Radial distance shift across camera vertical FOV (meters).
             pan_gain_deg: Pan angle shift across camera horizontal FOV (degrees).
+            r_near_m: Floor radial distance at bottom of camera ROI (meters).
+            r_far_m: Floor radial distance at top of camera ROI (meters).
+            y_near_px: Pixel Y corresponding to near floor edge.
+            y_far_px: Pixel Y corresponding to far floor edge.
             floor_grasp_pose: Reference pose where gripper touches ground perpendicularly.
         """
         self.L1 = float(l1_m)
@@ -52,6 +60,10 @@ class SO100Kinematics:
         self.lift_height_m = float(lift_height_m)
         self.radial_gain_m = float(radial_gain_m)
         self.pan_gain_deg = float(pan_gain_deg)
+        self.r_near_m = float(r_near_m)
+        self.r_far_m = float(r_far_m)
+        self.y_near_px = float(y_near_px)
+        self.y_far_px = float(y_far_px)
 
         # Baseline reference pose where gripper touches floor perpendicularly
         ref = floor_grasp_pose or {
@@ -80,8 +92,8 @@ class SO100Kinematics:
         self.z_floor = self.z_wrist_ref + self.L3 * math.sin(self.alpha3_ref)
 
         # Reachable radial limits along the ground plane
-        self.r_min = max(0.08, abs(self.L1 - self.L2) + 0.01)
-        self.r_max = (self.L1 + self.L2) * 0.96
+        self.r_min = max(0.08, float(self.r_near_m) - 0.015)
+        self.r_max = min((self.L1 + self.L2) * 0.96, float(self.r_far_m) + 0.015)
 
         logger.debug(
             "SO100Kinematics initialized: R_ref=%.1fcm, Z_floor=%.1fcm, R_bounds=[%.1f, %.1f]cm, Clearance=%.1fmm",
@@ -192,7 +204,7 @@ class SO100Kinematics:
         """Convert camera 2D detection into 3D radial and azimuthal target on the floor.
 
         Args:
-            detection: DetectionResult containing error_x, error_y, angle, found.
+            detection: DetectionResult containing cx, cy, error_x, error_y, angle, found.
             scan_pan_deg: Current shoulder_pan angle during scan.
             pan_direction: Direction multiplier (+1.0: right is positive, -1.0: right is negative).
 
@@ -202,14 +214,27 @@ class SO100Kinematics:
         if detection is None or not getattr(detection, "found", False):
             return self.r_ref, scan_pan_deg, self.roll_ref
 
-        # Horizontal error maps to pan rotation towards centroid
+        # Normalized horizontal and vertical errors [-1.0, 1.0]
         ex = float(getattr(detection, "error_x", 0.0))
+        ey = float(getattr(detection, "error_y", 0.0))
+
+        # Horizontal error maps to pan rotation towards centroid
         pan_target = float(scan_pan_deg + (pan_direction * self.pan_gain_deg * ex))
         pan_target = max(-110.0, min(110.0, pan_target))
 
-        # Vertical error: negative error_y = top of image = further away from base
-        ey = float(getattr(detection, "error_y", 0.0))
-        r_target = float(self.r_ref - (self.radial_gain_m * ey))
+        # Extract pixel centroid if available, or compute from error_y
+        if hasattr(detection, "cy") and getattr(detection, "cy", 0.0) > 0.0:
+            cy = float(detection.cy)
+        else:
+            cy = float((ey + 1.0) * 240.0)
+
+        # Perspective projection of floor plane to radial distance R:
+        # cy near y_near (bottom of ROI): close to robot base (r_near)
+        # cy near y_far (top of ROI): far from robot base (r_far)
+        v = (self.y_near_px - cy) / max(1e-5, (self.y_near_px - self.y_far_px))
+        v = max(0.0, min(1.0, v))
+        inv_r = (1.0 / self.r_near_m) - v * ((1.0 / self.r_near_m) - (1.0 / self.r_far_m))
+        r_target = float(1.0 / max(1e-5, inv_r))
         r_target = max(self.r_min, min(self.r_max, r_target))
 
         # Oriented bounding box angle (if available)
@@ -232,8 +257,8 @@ class SO100Kinematics:
 
         # Joint limit clamps
         lift = max(-110.0, min(110.0, lift))
-        elbow = max(-100.0, min(100.0, elbow))
-        wrist = max(-96.0, min(96.0, wrist))
+        elbow = max(-110.0, min(110.0, elbow))
+        wrist = max(-110.0, min(110.0, wrist))
         pan = max(-110.0, min(110.0, pan_target))
         roll = max(-175.0, min(175.0, roll_target))
         gripper = max(0.0, min(100.0, gripper_pct))

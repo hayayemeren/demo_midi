@@ -156,7 +156,11 @@ case4:
     hover_height_m: 0.080       # Pre-grasp hover height above floor (80mm)
     lift_height_m: 0.120        # Post-grasp vertical lift height above floor (120mm)
     radial_gain_m: 0.050        # Distance compensation across camera vertical FOV (meters)
-    pan_gain_deg: 22.0          # Azimuthal pan compensation across camera horizontal FOV (degrees)
+    pan_gain_deg: 25.0          # Azimuthal pan compensation across camera horizontal FOV (degrees)
+    r_near_m: 0.115             # Floor radial distance at bottom of camera ROI (meters)
+    r_far_m: 0.215              # Floor radial distance at top of camera ROI (meters)
+    y_near_px: 330.0            # Pixel Y corresponding to near floor edge
+    y_far_px: 60.0              # Pixel Y corresponding to far floor edge
 
   # Basket Pose: Chassis-mounted collection basket on the mobile base
   # Located directly behind the gripper centerline and elevated
@@ -175,9 +179,9 @@ case4:
   # Vision Detection Settings
   detection:
     mode: "auto"                # "auto", "contrast", or "color"
-    min_area: 1000.0            # minimum contour area (pixels)
+    min_area: 300.0             # minimum contour area (pixels)
     max_area: 80000.0           # maximum contour area (pixels)
-    contrast_threshold: 38.0    # threshold against median floor background
+    contrast_threshold: 25.0    # threshold against median floor background
     border_margin: 12           # pixels from ROI edge to reject border vignetting
     save_debug_image: true      # save annotated frame for live operator inspection
     debug_image_path: "/tmp/sock_detection.jpg"

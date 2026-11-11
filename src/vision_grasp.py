@@ -735,9 +735,9 @@ class SockDetector:
     def __init__(
         self,
         mode: str = "auto",
-        min_area: float = 1000.0,
+        min_area: float = 300.0,
         max_area: float = 80000.0,
-        contrast_threshold: float = 38.0,
+        contrast_threshold: float = 25.0,
         border_margin: int = 12,
         save_debug_image: bool = True,
         debug_image_path: str = "/tmp/sock_detection.jpg",
@@ -1078,6 +1078,10 @@ class VisionGraspPlanner:
             lift_height_m=float(kin_cfg.get("lift_height_m", 0.120)),
             radial_gain_m=float(kin_cfg.get("radial_gain_m", 0.050)),
             pan_gain_deg=float(serv.get("pan_gain", kin_cfg.get("pan_gain_deg", 25.0))),
+            r_near_m=float(kin_cfg.get("r_near_m", 0.115)),
+            r_far_m=float(kin_cfg.get("r_far_m", 0.215)),
+            y_near_px=float(kin_cfg.get("y_near_px", 330.0)),
+            y_far_px=float(kin_cfg.get("y_far_px", 60.0)),
             floor_grasp_pose=self.floor_grasp_pose,
         )
 
@@ -1146,12 +1150,27 @@ class VisionGraspPlanner:
         is_aligned = abs(detection.error_x) <= self.align_tolerance
         return aligned, is_aligned
 
+    def compute_target_coordinates(
+        self,
+        detection: Optional[DetectionResult],
+        scan_pan_deg: float,
+    ) -> Tuple[float, float, float]:
+        """Compute the 3D ground target coordinates (r_m, pan_deg, roll_deg) from detection."""
+        return self.kinematics.compute_sock_target(
+            detection,
+            scan_pan_deg=scan_pan_deg,
+            pan_direction=self.pan_direction,
+        )
+
     def compute_grasp_pose(
         self,
         aligned_pose: Dict[str, float],
         detection: Optional[DetectionResult] = None,
         is_hover: bool = False,
         is_lift: bool = False,
+        r_target: Optional[float] = None,
+        pan_target: Optional[float] = None,
+        roll_target: Optional[float] = None,
         descent_lift_deg: float = 16.0,
         descent_elbow_deg: float = 12.0,
     ) -> Dict[str, float]:
@@ -1160,11 +1179,18 @@ class VisionGraspPlanner:
         target_pan = float(aligned_pose.get("shoulder_pan.pos", 0.0))
 
         if self.use_ik:
-            r_target, pan_target, roll_target = self.kinematics.compute_sock_target(
-                detection,
-                scan_pan_deg=target_pan,
-                pan_direction=self.pan_direction,
-            )
+            if r_target is None or pan_target is None:
+                r_calc, pan_calc, roll_calc = self.kinematics.compute_sock_target(
+                    detection,
+                    scan_pan_deg=target_pan,
+                    pan_direction=self.pan_direction,
+                )
+                if r_target is None:
+                    r_target = r_calc
+                if pan_target is None:
+                    pan_target = pan_calc
+                if roll_target is None:
+                    roll_target = roll_calc
 
             if is_hover:
                 z_target = self.kinematics.z_floor + self.kinematics.hover_height_m
@@ -1177,7 +1203,7 @@ class VisionGraspPlanner:
                 z_target = self.kinematics.z_floor + self.kinematics.ground_clearance_m
                 gripper_pct = 0.0
 
-            if not self.enable_roll_alignment:
+            if not self.enable_roll_alignment or roll_target is None:
                 roll_target = float(self.floor_grasp_pose.get("wrist_roll.pos", aligned_pose.get("wrist_roll.pos", 0.0)))
 
             return self.kinematics.compute_cartesian_pose(
