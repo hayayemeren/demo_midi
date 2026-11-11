@@ -570,8 +570,9 @@ class DemoStateMachine:
                         )
 
         # 2c. Final descent to floor grasp pose
+        cur_align_pose = self.arm.get_follower_pose()
         logger.info("[GRASP] 2c. Lowering arm down to floor grasp pose (smooth descent)...")
-        grasp_pose = self.planner.compute_grasp_pose(open_pose, detection=self.last_detection, is_hover=False)
+        grasp_pose = self.planner.compute_grasp_pose(cur_align_pose, detection=self.last_detection, is_hover=False)
         grasp_descend = dict(grasp_pose)
         grasp_descend["gripper.pos"] = 85.0
         logger.info(

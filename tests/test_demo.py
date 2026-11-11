@@ -673,6 +673,65 @@ case4:
             os.remove(temp_cfg_path)
 
 
+def test_shoulder_pan_preservation_and_centroid_alignment():
+    """Verify that compute_grasp_pose preserves shoulder_pan at Left/Right scan angles
+    and dynamically centers shoulder_pan onto sock centroid without resetting to 0.0."""
+    cfg = {
+        "case4": {
+            "floor_grasp_pose": {
+                "shoulder_pan.pos": 0.0,    # Middle baseline in config
+                "shoulder_lift.pos": 93.5,
+                "elbow_flex.pos": -56.2,
+                "wrist_flex.pos": 75.4,
+                "wrist_roll.pos": -1.1,
+                "gripper.pos": 0.0,
+            },
+            "servoing": {
+                "pan_gain": 22.0,
+            }
+        }
+    }
+    planner = VisionGraspPlanner(cfg)
+
+    # 1. Sock on right side (Right scan pose: pan = -28.0°)
+    right_aligned = {
+        "shoulder_pan.pos": -28.0,
+        "shoulder_lift.pos": -50.0,
+        "elbow_flex.pos": 35.0,
+        "wrist_flex.pos": 70.0,
+        "wrist_roll.pos": 0.0,
+        "gripper.pos": 85.0,
+    }
+    # Descend to floor without extra detection trim: must stay at -28.0, NOT 0.0!
+    grasp_right = planner.compute_grasp_pose(right_aligned)
+    assert abs(grasp_right["shoulder_pan.pos"] - (-28.0)) < 1e-3, (
+        f"Grasp shoulder_pan should stay at -28.0, but got {grasp_right['shoulder_pan.pos']}"
+    )
+    # Vertical reach joints must come from floor_grasp_pose
+    assert abs(grasp_right["shoulder_lift.pos"] - 93.5) < 1e-3
+    assert abs(grasp_right["elbow_flex.pos"] - (-56.2)) < 1e-3
+
+    # 2. Sock on right with residual horizontal offset (error_x = +0.10)
+    # Must rotate shoulder_pan further to align centroid with arm base (-28.0 + -22.0*0.10 = -30.2°)
+    det_right = DetectionResult(found=True, error_x=0.10, error_y=0.0)
+    grasp_trimmed = planner.compute_grasp_pose(right_aligned, detection=det_right)
+    assert abs(grasp_trimmed["shoulder_pan.pos"] - (-30.2)) < 1e-2, (
+        f"Expected shoulder_pan ~ -30.2, got {grasp_trimmed['shoulder_pan.pos']}"
+    )
+
+    # 3. Sock on left side (Left scan pose: pan = +28.0°)
+    left_aligned = dict(right_aligned)
+    left_aligned["shoulder_pan.pos"] = 28.0
+    grasp_left = planner.compute_grasp_pose(left_aligned)
+    assert abs(grasp_left["shoulder_pan.pos"] - 28.0) < 1e-3, (
+        f"Grasp shoulder_pan should stay at +28.0, but got {grasp_left['shoulder_pan.pos']}"
+    )
+
+    # 4. compute_aligned_pose centering
+    aligned_pose, is_aligned = planner.compute_aligned_pose(right_aligned, det_right)
+    assert abs(aligned_pose["shoulder_pan.pos"] - (-30.2)) < 1e-2
+
+
 if __name__ == "__main__":
     test_ddsm_crc8_spec()
     print("  [PASS] test_ddsm_crc8_spec")
@@ -704,6 +763,8 @@ if __name__ == "__main__":
     print("  [PASS] test_arm_safety_and_stow_recovery")
     test_scan_poses_teaching_and_execution()
     print("  [PASS] test_scan_poses_teaching_and_execution")
+    test_shoulder_pan_preservation_and_centroid_alignment()
+    print("  [PASS] test_shoulder_pan_preservation_and_centroid_alignment")
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
 
 

@@ -1096,18 +1096,20 @@ class VisionGraspPlanner:
 
         aligned = dict(current_pose)
 
-        # Invert pan direction matching camera horizontal axis
+        # Invert pan direction matching camera horizontal axis:
+        # Rotate shoulder_pan so the arm directly faces the centroid of the sock
         pan_correction = -self.pan_gain * detection.error_x
         aligned["shoulder_pan.pos"] = float(np.clip(
             aligned.get("shoulder_pan.pos", 0.0) + pan_correction,
             -110.0, 110.0
         ))
 
-        # Vertical offset adjusts reach (shoulder_lift / elbow_flex)
+        # Vertical offset adjusts reach (shoulder_lift) around the current scan posture
         lift_correction = self.lift_gain * detection.error_y
+        current_lift = float(aligned.get("shoulder_lift.pos", -50.0))
         aligned["shoulder_lift.pos"] = float(np.clip(
-            aligned.get("shoulder_lift.pos", -50.0) + lift_correction,
-            -85.0, -20.0
+            current_lift + lift_correction,
+            -100.0, 100.0
         ))
 
         is_aligned = abs(detection.error_x) <= self.align_tolerance
@@ -1124,19 +1126,23 @@ class VisionGraspPlanner:
         """Compute final downward descent pose to hover right at floor level below chassis base,
         dynamically adapting reach (elbow/lift) and gripper orientation (roll) to detected cloth."""
         grasp = dict(aligned_pose)
+
+        # 1. Shoulder pan: NEVER reset to 0.0 (middle) from floor_grasp_pose!
+        # Always maintain the pan angle pointing at the detected sock from aligned_pose.
+        target_pan = float(aligned_pose.get("shoulder_pan.pos", 0.0))
+
         if self.floor_grasp_pose:
-            base_pan = float(self.floor_grasp_pose.get("shoulder_pan.pos", grasp.get("shoulder_pan.pos", 0.0)))
             base_lift = float(self.floor_grasp_pose.get("shoulder_lift.pos", -30.0))
             base_elbow = float(self.floor_grasp_pose.get("elbow_flex.pos", 45.0))
             base_wrist = float(self.floor_grasp_pose.get("wrist_flex.pos", 80.0))
             base_roll = float(self.floor_grasp_pose.get("wrist_roll.pos", 0.0))
-            grasp["shoulder_pan.pos"] = base_pan
         else:
-            base_lift = float(np.clip(grasp.get("shoulder_lift.pos", -50.0) + descent_lift_deg, -90.0, 90.0))
-            base_elbow = float(np.clip(grasp.get("elbow_flex.pos", 35.0) + descent_elbow_deg, -70.0, 70.0))
-            base_wrist = float(np.clip(grasp.get("wrist_flex.pos", 70.0) + 10.0, -100.0, 100.0))
+            base_lift = float(np.clip(grasp.get("shoulder_lift.pos", -50.0) + descent_lift_deg, -100.0, 100.0))
+            base_elbow = float(np.clip(grasp.get("elbow_flex.pos", 35.0) + descent_elbow_deg, -92.0, 92.0))
+            base_wrist = float(np.clip(grasp.get("wrist_flex.pos", 70.0) + 10.0, -96.0, 96.0))
             base_roll = float(grasp.get("wrist_roll.pos", 0.0))
 
+        grasp["shoulder_pan.pos"] = target_pan
         grasp["shoulder_lift.pos"] = base_lift
         grasp["elbow_flex.pos"] = base_elbow
         grasp["wrist_flex.pos"] = base_wrist
@@ -1144,10 +1150,10 @@ class VisionGraspPlanner:
 
         # Dynamic adaptation if detection is provided
         if detection is not None and detection.found:
-            # 1. Fine-trim pan if residual error exists
-            if abs(detection.error_x) > 0.03:
-                pan_trim = -self.pan_gain * 0.3 * float(detection.error_x)
-                grasp["shoulder_pan.pos"] = float(np.clip(grasp.get("shoulder_pan.pos", 0.0) + pan_trim, -110.0, 110.0))
+            # 1. Rotate shoulder_pan to center the sock centroid horizontally with the arm base
+            if abs(detection.error_x) > 0.02:
+                pan_trim = -self.pan_gain * float(detection.error_x)
+                grasp["shoulder_pan.pos"] = float(np.clip(target_pan + pan_trim, -110.0, 110.0))
 
             # 2. Longitudinal reach modulation (negative error_y = sock further away)
             longitudinal_error = -float(detection.error_y)
