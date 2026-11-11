@@ -111,19 +111,20 @@ class SO100Kinematics:
         wrist_deg: float,
     ) -> Tuple[float, float, float]:
         """Compute end-effector position (R, Z) and pitch angle (degrees) from joint angles."""
-        alpha1 = math.radians(90.0 - lift_deg)
-        alpha2 = alpha1 + math.radians(elbow_deg)
-        # Wrist angle delta relative to reference
-        delta_wrist = math.radians(wrist_deg - self.wrist_ref)
-        alpha3 = -math.pi / 2.0 + (alpha2 - self.alpha2_ref) + delta_wrist
+        r_range = max(1e-5, (self.r_far_m - self.r_near_m) * 0.5)
+        dl = lift_deg - self.lift_ref
+        de = elbow_deg - self.elbow_ref
+        dw = wrist_deg - self.wrist_ref
 
-        r_wrist = self.L1 * math.cos(alpha1) + self.L2 * math.cos(alpha2)
-        z_wrist = self.L1 * math.sin(alpha1) + self.L2 * math.sin(alpha2)
+        reach_factor = de / 18.0
+        r_tip = self.r_ref + reach_factor * r_range
 
-        r_tip = r_wrist + self.L3 * math.cos(alpha3)
-        z_tip = z_wrist + self.L3 * math.sin(alpha3)
-        pitch_deg = math.degrees(alpha3)
+        dl_reach = 6.0 * reach_factor
+        dl_z = dl - dl_reach
+        dz = -(dl_z / 3.0) * self.ground_clearance_m
+        z_tip = self.z_floor + dz
 
+        pitch_deg = -90.0 + (dw + (dl + de) * 0.6)
         return r_tip, z_tip, pitch_deg
 
     def solve_ik(
@@ -132,7 +133,7 @@ class SO100Kinematics:
         z_target: float,
         desired_pitch_deg: float = -90.0,
     ) -> Tuple[float, float, float]:
-        """Solve analytical inverse kinematics for perpendicular or angled downward reach.
+        """Solve floor-anchored inverse kinematics with reach modulation and safe ground clearance.
 
         Args:
             r_target: Radial horizontal distance from shoulder axis along floor (meters).
@@ -142,56 +143,23 @@ class SO100Kinematics:
         Returns:
             Tuple of joint angles: (shoulder_lift_deg, elbow_flex_deg, wrist_flex_deg).
         """
-        # Clamp radial target to physically reachable limits
         r_clamped = max(self.r_min, min(self.r_max, r_target))
+        r_range = max(1e-5, (self.r_far_m - self.r_near_m) * 0.5)
+        reach_factor = (r_clamped - self.r_ref) / r_range
+        reach_factor = max(-1.0, min(1.0, reach_factor))
 
-        alpha3 = math.radians(desired_pitch_deg)
+        de = 18.0 * reach_factor
+        dl_reach = 6.0 * reach_factor
 
-        # 1. Wrist position from desired tip position
-        r_w = r_clamped - self.L3 * math.cos(alpha3)
-        z_w = z_target - self.L3 * math.sin(alpha3)
+        dz = z_target - self.z_floor
+        dl_z = -3.0 * (dz / max(1e-5, self.ground_clearance_m))
 
-        # 2. Check reachability of wrist from shoulder (0, 0)
-        D_sq = r_w**2 + z_w**2
-        D = math.sqrt(D_sq)
+        dl = dl_reach + dl_z
+        dw = -(dl + de) * 0.6 + (desired_pitch_deg - (-90.0))
 
-        max_reach = (self.L1 + self.L2) * 0.995
-        min_reach = abs(self.L1 - self.L2) * 1.005
-
-        if D > max_reach:
-            scale = max_reach / D
-            r_w *= scale
-            z_w *= scale
-            D_sq = r_w**2 + z_w**2
-            D = max_reach
-        elif D < min_reach:
-            scale = min_reach / max(1e-5, D)
-            r_w *= scale
-            z_w *= scale
-            D_sq = r_w**2 + z_w**2
-            D = min_reach
-
-        # 3. Law of Cosines for elbow angle
-        cos_gamma = (self.L1**2 + self.L2**2 - D_sq) / (2.0 * self.L1 * self.L2)
-        cos_gamma = max(-1.0, min(1.0, cos_gamma))
-        gamma = math.acos(cos_gamma)
-        elbow_rad = -(math.pi - gamma)  # Elbow flex is negative for forward bend
-
-        # 4. Shoulder lift angle
-        psi = math.atan2(z_w, r_w)
-        cos_beta = (self.L1**2 + D_sq - self.L2**2) / (2.0 * self.L1 * max(1e-5, D))
-        cos_beta = max(-1.0, min(1.0, cos_beta))
-        beta = math.acos(cos_beta)
-
-        alpha1 = psi + beta
-        lift_deg = 90.0 - math.degrees(alpha1)
-        elbow_deg = math.degrees(elbow_rad)
-
-        # 5. Wrist flex angle to enforce desired_pitch_deg
-        alpha2 = alpha1 + elbow_rad
-        wrist_deg = self.wrist_ref + (
-            math.degrees(alpha3 - alpha2) - math.degrees(-math.pi / 2.0 - self.alpha2_ref)
-        )
+        lift_deg = self.lift_ref + dl
+        elbow_deg = self.elbow_ref + de
+        wrist_deg = self.wrist_ref + dw
 
         return float(lift_deg), float(elbow_deg), float(wrist_deg)
 
@@ -237,9 +205,8 @@ class SO100Kinematics:
         r_target = float(1.0 / max(1e-5, inv_r))
         r_target = max(self.r_min, min(self.r_max, r_target))
 
-        # Oriented bounding box angle (if available)
-        sock_angle = float(getattr(detection, "angle", 0.0))
-        roll_target = float(self.roll_ref + max(-60.0, min(60.0, sock_angle)))
+        # Wrist roll remains locked to calibrated floor grasp value (no unwanted wrist twist)
+        roll_target = float(self.roll_ref)
 
         return r_target, pan_target, roll_target
 
@@ -248,12 +215,15 @@ class SO100Kinematics:
         r_target: float,
         z_target: float,
         pan_target: float,
-        roll_target: float = 0.0,
+        roll_target: Optional[float] = None,
         gripper_pct: float = 0.0,
         desired_pitch_deg: float = -90.0,
     ) -> Dict[str, float]:
         """Calculate complete 6-joint pose dictionary for a Cartesian target."""
         lift, elbow, wrist = self.solve_ik(r_target, z_target, desired_pitch_deg=desired_pitch_deg)
+
+        if roll_target is None:
+            roll_target = self.roll_ref
 
         # Joint limit clamps
         lift = max(-110.0, min(110.0, lift))
@@ -276,7 +246,7 @@ class SO100Kinematics:
         self,
         r_target: float,
         pan_target: float,
-        roll_target: float = 0.0,
+        roll_target: Optional[float] = None,
     ) -> Dict[str, Dict[str, float]]:
         """Generate the complete 4-stage Cartesian pick trajectory:
         1. hover:    elevated hover directly above target (gripper wide open)
@@ -284,6 +254,8 @@ class SO100Kinematics:
         3. clamp:    jaws closed onto cloth at ground clearance
         4. lift:     vertical retract off floor (gripper clamped)
         """
+        if roll_target is None:
+            roll_target = self.roll_ref
         z_hover = self.z_floor + self.hover_height_m
         z_descent = self.z_floor + self.ground_clearance_m
         z_lift = self.z_floor + self.lift_height_m

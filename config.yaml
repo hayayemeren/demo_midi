@@ -179,10 +179,14 @@ case4:
   # Vision Detection Settings
   detection:
     mode: "auto"                # "auto", "contrast", or "color"
-    min_area: 300.0             # minimum contour area (pixels)
+    min_area: 800.0             # minimum contour area (pixels) - rejects small floor noise
     max_area: 80000.0           # maximum contour area (pixels)
-    contrast_threshold: 25.0    # threshold against median floor background
-    border_margin: 12           # pixels from ROI edge to reject border vignetting
+    contrast_threshold: 35.0    # threshold against median floor background (rejects floor seams diff ~26)
+    border_margin: 4            # pixels from ROI edge to reject border vignetting
+    roi_top_pct: 0.06           # Active floor ROI top margin
+    roi_bottom_pct: 0.74        # Active floor ROI bottom margin
+    roi_left_pct: 0.04          # Active floor ROI left margin (expanded for wide sock coverage)
+    roi_right_pct: 0.96         # Active floor ROI right margin
     save_debug_image: true      # save annotated frame for live operator inspection
     debug_image_path: "/tmp/sock_detection.jpg"
     debug_raw_path: "/tmp/sock_raw.jpg"

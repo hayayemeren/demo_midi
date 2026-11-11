@@ -735,10 +735,10 @@ class SockDetector:
     def __init__(
         self,
         mode: str = "auto",
-        min_area: float = 300.0,
+        min_area: float = 800.0,
         max_area: float = 80000.0,
-        contrast_threshold: float = 25.0,
-        border_margin: int = 12,
+        contrast_threshold: float = 35.0,
+        border_margin: int = 4,
         save_debug_image: bool = True,
         debug_image_path: str = "/tmp/sock_detection.jpg",
         debug_raw_path: str = "/tmp/sock_raw.jpg",
@@ -746,10 +746,10 @@ class SockDetector:
         debug_combined_path: str = "/tmp/sock_combined.jpg",
         enable_web_stream: bool = False,
         web_stream_port: int = 8080,
-        roi_top_pct: float = 0.10,
-        roi_bottom_pct: float = 0.68,
-        roi_left_pct: float = 0.12,
-        roi_right_pct: float = 0.88,
+        roi_top_pct: float = 0.06,
+        roi_bottom_pct: float = 0.74,
+        roi_left_pct: float = 0.04,
+        roi_right_pct: float = 0.96,
     ):
         self.mode = mode.lower()
         self.min_area = min_area
@@ -1203,7 +1203,14 @@ class VisionGraspPlanner:
                 z_target = self.kinematics.z_floor + self.kinematics.ground_clearance_m
                 gripper_pct = 0.0
 
-            if not self.enable_roll_alignment or roll_target is None:
+            if self.enable_roll_alignment and detection is not None and getattr(detection, "found", False):
+                sock_angle = float(getattr(detection, "angle", 0.0))
+                if abs(sock_angle) > 2.0:
+                    base_roll = float(self.floor_grasp_pose.get("wrist_roll.pos", 0.0))
+                    roll_target = float(np.clip(base_roll + sock_angle, -175.0, 175.0))
+                else:
+                    roll_target = float(self.floor_grasp_pose.get("wrist_roll.pos", 0.0))
+            else:
                 roll_target = float(self.floor_grasp_pose.get("wrist_roll.pos", aligned_pose.get("wrist_roll.pos", 0.0)))
 
             return self.kinematics.compute_cartesian_pose(

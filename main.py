@@ -536,9 +536,14 @@ def teach_scan(config_path: str, dry_run: bool = False):
         )
         detector = SockDetector(
             mode=det_cfg.get("mode", "auto"),
-            min_area=float(det_cfg.get("min_area", 1000.0)),
+            min_area=float(det_cfg.get("min_area", 800.0)),
             max_area=float(det_cfg.get("max_area", 80000.0)),
-            contrast_threshold=float(det_cfg.get("contrast_threshold", 38.0)),
+            contrast_threshold=float(det_cfg.get("contrast_threshold", 35.0)),
+            border_margin=int(det_cfg.get("border_margin", 4)),
+            roi_top_pct=float(det_cfg.get("roi_top_pct", 0.06)),
+            roi_bottom_pct=float(det_cfg.get("roi_bottom_pct", 0.74)),
+            roi_left_pct=float(det_cfg.get("roi_left_pct", 0.04)),
+            roi_right_pct=float(det_cfg.get("roi_right_pct", 0.96)),
             enable_web_stream=True,
             web_stream_port=int(det_cfg.get("web_stream_port", 8080)),
         )
@@ -659,9 +664,14 @@ def test_pick(config_path: str, dry_run: bool = False):
         )
         detector = SockDetector(
             mode=det_cfg.get("mode", "auto"),
-            min_area=float(det_cfg.get("min_area", 1000.0)),
+            min_area=float(det_cfg.get("min_area", 800.0)),
             max_area=float(det_cfg.get("max_area", 80000.0)),
-            contrast_threshold=float(det_cfg.get("contrast_threshold", 38.0)),
+            contrast_threshold=float(det_cfg.get("contrast_threshold", 35.0)),
+            border_margin=int(det_cfg.get("border_margin", 4)),
+            roi_top_pct=float(det_cfg.get("roi_top_pct", 0.06)),
+            roi_bottom_pct=float(det_cfg.get("roi_bottom_pct", 0.74)),
+            roi_left_pct=float(det_cfg.get("roi_left_pct", 0.04)),
+            roi_right_pct=float(det_cfg.get("roi_right_pct", 0.96)),
             enable_web_stream=True,
             web_stream_port=int(det_cfg.get("web_stream_port", 8080)),
         )

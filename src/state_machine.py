@@ -112,10 +112,14 @@ class DemoStateMachine:
             det_cfg = c4.get("detection", {})
             self.detector = SockDetector(
                 mode=det_cfg.get("mode", "auto"),
-                min_area=float(det_cfg.get("min_area", 1000.0)),
+                min_area=float(det_cfg.get("min_area", 800.0)),
                 max_area=float(det_cfg.get("max_area", 80000.0)),
-                contrast_threshold=float(det_cfg.get("contrast_threshold", 38.0)),
-                border_margin=int(det_cfg.get("border_margin", 12)),
+                contrast_threshold=float(det_cfg.get("contrast_threshold", 35.0)),
+                border_margin=int(det_cfg.get("border_margin", 4)),
+                roi_top_pct=float(det_cfg.get("roi_top_pct", 0.06)),
+                roi_bottom_pct=float(det_cfg.get("roi_bottom_pct", 0.74)),
+                roi_left_pct=float(det_cfg.get("roi_left_pct", 0.04)),
+                roi_right_pct=float(det_cfg.get("roi_right_pct", 0.96)),
                 save_debug_image=bool(det_cfg.get("save_debug_image", True)),
                 debug_image_path=det_cfg.get("debug_image_path", "/tmp/sock_detection.jpg"),
                 debug_raw_path=det_cfg.get("debug_raw_path", "/tmp/sock_raw.jpg"),
@@ -439,6 +443,8 @@ class DemoStateMachine:
             self.camera.ensure_healthy()
 
         scan_t = getattr(self.planner, "scan_move_duration_s", 1.5)
+        candidates = []
+
         for label, scan_target in scan_targets:
             if (not self.running and not self.arm.dry_run) or gp.brake or gp.button_b_held:
                 break
@@ -450,7 +456,7 @@ class DemoStateMachine:
                 duration_s=scan_t,
                 feedback_cb=lambda _: self.base.hold_lock(),
             )
-            time.sleep(0.20)
+            time.sleep(0.25)
             self.base.hold_lock()
 
             ok, frame = self.camera.capture_frame()
@@ -459,26 +465,46 @@ class DemoStateMachine:
 
             det = self.detector.detect(frame, force_save=True)
             if det.found:
-                detected_sock = det
-                # Compute and lock 3D floor target coordinates once from detection
-                r_target, pan_target, roll_target = self.planner.kinematics.compute_sock_target(
-                    det,
-                    scan_pan_deg=pan_val,
-                    pan_direction=self.planner.pan_direction,
-                )
-                self.target_pick_coords = (r_target, pan_target, roll_target)
+                score = det.area * (1.0 - 0.4 * abs(det.error_x))
                 logger.info(
-                    f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [VISION] SOCK DETECTED AT {label.upper()} POSE! <<<{COLOR_RESET}\n"
-                    f"Centroid: ({det.cx:.0f}, {det.cy:.0f}) | Offset: eX={det.error_x:+.2f}, eY={det.error_y:+.2f} | Area: {det.area:.0f}px\n"
-                    f"Locked Floor Target: R={r_target*100:.1f}cm, Pan={pan_target:+.1f}°, Roll={roll_target:+.1f}°\n"
-                    f"Debug image saved to: {self.detector.debug_image_path}\n"
+                    f"[SCAN CANDIDATE] Sock found at {label}: Area={det.area:.0f}px, eX={det.error_x:+.2f}, eY={det.error_y:+.2f}, Score={score:.0f}"
                 )
-                break
+                candidates.append({
+                    "score": score,
+                    "det": det,
+                    "pan_val": pan_val,
+                    "label": label,
+                    "frame": frame,
+                })
             else:
                 logger.info(f"[SCAN] No sock detected at {label}. Continuing sweep...")
 
-        if detected_sock is not None:
-            self.last_detection = detected_sock
+        if candidates:
+            # Select candidate with highest confidence score (largest centered sock)
+            best = max(candidates, key=lambda c: c["score"])
+            best_det = best["det"]
+            best_pan = best["pan_val"]
+            best_label = best["label"]
+
+            # Compute and lock 3D floor target coordinates once from best detection
+            r_target, pan_target, roll_target = self.planner.kinematics.compute_sock_target(
+                best_det,
+                scan_pan_deg=best_pan,
+                pan_direction=self.planner.pan_direction,
+            )
+            self.target_pick_coords = (r_target, pan_target, roll_target)
+            self.last_detection = best_det
+
+            # Re-save best frame as canonical debug view
+            if best.get("frame") is not None:
+                self.detector.detect(best["frame"], force_save=True)
+
+            logger.info(
+                f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [VISION] BEST SOCK DETECTED AT {best_label.upper()} POSE! <<<{COLOR_RESET}\n"
+                f"Centroid: ({best_det.cx:.0f}, {best_det.cy:.0f}) | Offset: eX={best_det.error_x:+.2f}, eY={best_det.error_y:+.2f} | Area: {best_det.area:.0f}px\n"
+                f"Locked Floor Target: R={r_target*100:.1f}cm, Pan={pan_target:+.1f}°, Roll={roll_target:+.1f}°\n"
+                f"Debug image saved to: {self.detector.debug_image_path}\n"
+            )
             self.align_iterations = 0
             self.state = DemoState.AUTONOMOUS_PICK_ALIGN
         else:

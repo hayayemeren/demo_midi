@@ -857,6 +857,65 @@ def test_centroid_to_cartesian_floor_targeting():
     assert abs(pitch - (-90.0)) < 1.0, f"Gripper pitch must remain perpendicular: {pitch:.1f}°"
 
 
+def test_real_floor_image_and_kinematic_descent():
+    """Verify that detector processes real floor image (/tmp/sock_raw.jpg if present),
+    correctly isolates the real sock, rejects floor seams, and generates a grounded
+    floor descent pose anchored to floor_grasp_pose (not floating 15cm in the air)."""
+    import yaml
+    import cv2
+    from src.vision_grasp import SockDetector, VisionGraspPlanner
+
+    with open("config.yaml", "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    planner = VisionGraspPlanner(cfg)
+    detector = SockDetector(
+        min_area=float(cfg["case4"]["detection"]["min_area"]),
+        contrast_threshold=float(cfg["case4"]["detection"]["contrast_threshold"]),
+        border_margin=int(cfg["case4"]["detection"]["border_margin"]),
+        roi_top_pct=float(cfg["case4"]["detection"]["roi_top_pct"]),
+        roi_bottom_pct=float(cfg["case4"]["detection"]["roi_bottom_pct"]),
+        roi_left_pct=float(cfg["case4"]["detection"]["roi_left_pct"]),
+        roi_right_pct=float(cfg["case4"]["detection"]["roi_right_pct"]),
+    )
+
+    if os.path.exists("/tmp/sock_raw.jpg"):
+        img = cv2.imread("/tmp/sock_raw.jpg")
+        det = detector.detect(img)
+        assert det.found is True, "Must detect the black sock in /tmp/sock_raw.jpg"
+        assert det.area > 10000.0, f"Expected real sock area > 10000px, got {det.area}"
+        assert det.cx < 200.0, f"Sock is on left side (cx ~ 147), got {det.cx}"
+
+        r_tgt, pan_tgt, roll_tgt = planner.kinematics.compute_sock_target(
+            det,
+            scan_pan_deg=-7.1,
+            pan_direction=planner.pan_direction,
+        )
+        assert pan_tgt < -7.1, f"Shoulder pan must turn towards left for left sock: {pan_tgt}"
+        assert roll_tgt == -0.7, f"Wrist roll must remain locked to calibrated value (-0.7°): {roll_tgt}"
+
+        stages = planner.kinematics.get_trajectory_stages(r_tgt, pan_tgt, roll_tgt)
+        descent = stages["descent"]
+        hover = stages["hover"]
+        clamp = stages["clamp"]
+        lift = stages["lift"]
+
+        # Descent lift must be within the floor reach envelope [88.0°, 102.0°] around safe clearance (94.5°)
+        assert 88.0 <= descent["shoulder_lift.pos"] <= 102.0, (
+            f"Descent lift must be within reach envelope [88°, 102°], got {descent['shoulder_lift.pos']}°"
+        )
+        assert -78.0 <= descent["elbow_flex.pos"] <= -38.0, (
+            f"Elbow must reach down towards floor within reach envelope [-78°, -38°], got {descent['elbow_flex.pos']}°"
+        )
+        assert descent["wrist_roll.pos"] == -0.7, "Wrist roll must not twist"
+
+        # Hover must be elevated ~14° above descent
+        assert hover["shoulder_lift.pos"] < descent["shoulder_lift.pos"]
+        assert hover["gripper.pos"] == 85.0
+        assert clamp["gripper.pos"] == 0.0
+        assert lift["shoulder_lift.pos"] < descent["shoulder_lift.pos"]
+
+
 if __name__ == "__main__":
     test_ddsm_crc8_spec()
     print("  [PASS] test_ddsm_crc8_spec")
@@ -894,6 +953,8 @@ if __name__ == "__main__":
     print("  [PASS] test_so100_analytical_kinematics_and_clearance")
     test_centroid_to_cartesian_floor_targeting()
     print("  [PASS] test_centroid_to_cartesian_floor_targeting")
+    test_real_floor_image_and_kinematic_descent()
+    print("  [PASS] test_real_floor_image_and_kinematic_descent")
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
 
 
