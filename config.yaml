@@ -110,7 +110,31 @@ case4:
     wrist_roll.pos: 0.0
     gripper.pos: 10.0
 
-  # Multi-angle floor search sweep (shoulder_pan angles in degrees)
+  # 3-Point Calibrated Floor Scan Poses (Middle, Left, Right)
+  scan_poses:
+    center:
+      shoulder_pan.pos: 0.0
+      shoulder_lift.pos: -50.0
+      elbow_flex.pos: 35.0
+      wrist_flex.pos: 70.0
+      wrist_roll.pos: 0.0
+      gripper.pos: 10.0
+    left:
+      shoulder_pan.pos: 28.0
+      shoulder_lift.pos: -50.0
+      elbow_flex.pos: 35.0
+      wrist_flex.pos: 70.0
+      wrist_roll.pos: 0.0
+      gripper.pos: 10.0
+    right:
+      shoulder_pan.pos: -28.0
+      shoulder_lift.pos: -50.0
+      elbow_flex.pos: 35.0
+      wrist_flex.pos: 70.0
+      wrist_roll.pos: 0.0
+      gripper.pos: 10.0
+
+  # Multi-angle floor search sweep (shoulder_pan angles in degrees fallback)
   scan_sweep_angles: [0.0, -28.0, 28.0]
 
   # Floor Grasp Pose: Calibrated downward reach to pick sock from floor below the base

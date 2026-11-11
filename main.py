@@ -10,10 +10,17 @@ import argparse
 import logging
 import os
 import signal
+import socket
 import sys
+import threading
 import time
 from typing import Optional
 import yaml
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 # Add project root to sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -117,13 +124,16 @@ def select_case_interactive(default_case: Optional[int] = None) -> int:
     print("  [7] Test Floor Pickup & Basket Deposit Sequence (--test-pick)")
     print("      - Executes floor descend -> clamp -> lift verify -> basket drop test")
     print()
+    print("  [8] Teach 3-Point Floor Scan Poses (--teach-scan)")
+    print("      - Move limp arm to Middle, Left, and Right scan poses with live camera feed")
+    print()
     print("  [Q] Quit Demonstration")
     print("=" * 64)
 
     default_prompt = f" [{default_case}]" if default_case in (1, 2, 3, 4) else " [1]"
     while True:
         try:
-            choice = input(f"Enter choice (1, 2, 3, 4, 5, 6, 7, or Q){default_prompt}: ").strip().lower()
+            choice = input(f"Enter choice (1, 2, 3, 4, 5, 6, 7, 8, or Q){default_prompt}: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print("\nExiting.")
             sys.exit(0)
@@ -144,11 +154,13 @@ def select_case_interactive(default_case: Optional[int] = None) -> int:
             return 6
         elif choice in ("7", "test pick", "test"):
             return 7
+        elif choice in ("8", "teach scan", "scan"):
+            return 8
         elif choice in ("q", "quit", "exit"):
             print("Exiting.")
             sys.exit(0)
         else:
-            print("Invalid selection. Please enter 1, 2, 3, 4, 5, 6, 7, or Q.")
+            print("Invalid selection. Please enter 1, 2, 3, 4, 5, 6, 7, 8, or Q.")
 
 
 def update_config_basket_pose(config_path: str, pose: dict) -> bool:
@@ -257,6 +269,107 @@ def update_config_grasp_pose(config_path: str, pose: dict) -> bool:
 
     with open(config_path, "w", encoding="utf-8") as f:
         f.write(new_content)
+    return True
+
+
+def update_config_scan_poses(
+    config_path: str,
+    center_pose: dict,
+    left_pose: dict,
+    right_pose: dict,
+) -> bool:
+    """Save 3-point calibrated scan poses (center, left, right) and baseline scan_pose into config.yaml."""
+    import re
+    if not os.path.exists(config_path):
+        logging.error("Config file %s does not exist!", config_path)
+        return False
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    def clamp_pose(p: dict) -> dict:
+        return {
+            "shoulder_pan.pos": max(-110.0, min(110.0, float(p.get("shoulder_pan.pos", 0.0)))),
+            "shoulder_lift.pos": max(-100.0, min(100.0, float(p.get("shoulder_lift.pos", -50.0)))),
+            "elbow_flex.pos": max(-92.0, min(92.0, float(p.get("elbow_flex.pos", 35.0)))),
+            "wrist_flex.pos": max(-96.0, min(96.0, float(p.get("wrist_flex.pos", 70.0)))),
+            "wrist_roll.pos": max(-175.0, min(175.0, float(p.get("wrist_roll.pos", 0.0)))),
+            "gripper.pos": max(0.0, min(100.0, float(p.get("gripper.pos", 10.0)))),
+        }
+
+    c = clamp_pose(center_pose)
+    l = clamp_pose(left_pose)
+    r = clamp_pose(right_pose)
+
+    new_scan_pose_block = (
+        "  scan_pose:\n"
+        f"    shoulder_pan.pos: {c['shoulder_pan.pos']:.1f}\n"
+        f"    shoulder_lift.pos: {c['shoulder_lift.pos']:.1f}\n"
+        f"    elbow_flex.pos: {c['elbow_flex.pos']:.1f}\n"
+        f"    wrist_flex.pos: {c['wrist_flex.pos']:.1f}\n"
+        f"    wrist_roll.pos: {c['wrist_roll.pos']:.1f}\n"
+        f"    gripper.pos: {c['gripper.pos']:.1f}\n"
+    )
+
+    new_scan_poses_block = (
+        "  scan_poses:\n"
+        "    center:\n"
+        f"      shoulder_pan.pos: {c['shoulder_pan.pos']:.1f}\n"
+        f"      shoulder_lift.pos: {c['shoulder_lift.pos']:.1f}\n"
+        f"      elbow_flex.pos: {c['elbow_flex.pos']:.1f}\n"
+        f"      wrist_flex.pos: {c['wrist_flex.pos']:.1f}\n"
+        f"      wrist_roll.pos: {c['wrist_roll.pos']:.1f}\n"
+        f"      gripper.pos: {c['gripper.pos']:.1f}\n"
+        "    left:\n"
+        f"      shoulder_pan.pos: {l['shoulder_pan.pos']:.1f}\n"
+        f"      shoulder_lift.pos: {l['shoulder_lift.pos']:.1f}\n"
+        f"      elbow_flex.pos: {l['elbow_flex.pos']:.1f}\n"
+        f"      wrist_flex.pos: {l['wrist_flex.pos']:.1f}\n"
+        f"      wrist_roll.pos: {l['wrist_roll.pos']:.1f}\n"
+        f"      gripper.pos: {l['gripper.pos']:.1f}\n"
+        "    right:\n"
+        f"      shoulder_pan.pos: {r['shoulder_pan.pos']:.1f}\n"
+        f"      shoulder_lift.pos: {r['shoulder_lift.pos']:.1f}\n"
+        f"      elbow_flex.pos: {r['elbow_flex.pos']:.1f}\n"
+        f"      wrist_flex.pos: {r['wrist_flex.pos']:.1f}\n"
+        f"      wrist_roll.pos: {r['wrist_roll.pos']:.1f}\n"
+        f"      gripper.pos: {r['gripper.pos']:.1f}\n"
+    )
+
+    pattern_scan_poses = r"  scan_poses:\n(?:    [a-z0-9_]+:\n(?:      [a-z_.]+: -?[0-9.]+\n)+)+"
+    if re.search(pattern_scan_poses, content):
+        content = re.sub(pattern_scan_poses, lambda _: new_scan_poses_block, content, count=1)
+    else:
+        pattern_sweep = r"(  scan_sweep_angles:[^\n]*\n)"
+        if re.search(pattern_sweep, content):
+            content = re.sub(pattern_sweep, lambda m: new_scan_poses_block + "\n" + m.group(1), content, count=1)
+        else:
+            pattern_sp = r"(  scan_pose:\n(?:    [a-z_.]+: -?[0-9.]+\n)+)"
+            if re.search(pattern_sp, content):
+                content = re.sub(pattern_sp, lambda m: m.group(1) + "\n" + new_scan_poses_block, content, count=1)
+            else:
+                try:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        cfg = yaml.safe_load(f) or {}
+                    cfg.setdefault("case4", {})["scan_pose"] = {k: round(v, 1) for k, v in c.items()}
+                    cfg.setdefault("case4", {})["scan_poses"] = {
+                        "center": {k: round(v, 1) for k, v in c.items()},
+                        "left": {k: round(v, 1) for k, v in l.items()},
+                        "right": {k: round(v, 1) for k, v in r.items()},
+                    }
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+                    return True
+                except Exception as e:
+                    logging.error("Failed to update config.yaml: %s", e)
+                    return False
+
+    pattern_scan_pose = r"  scan_pose:\n(?:    [a-z_.]+: -?[0-9.]+\n)+"
+    if re.search(pattern_scan_pose, content):
+        content = re.sub(pattern_scan_pose, lambda _: new_scan_pose_block, content, count=1)
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(content)
     return True
 
 
@@ -371,6 +484,147 @@ def teach_grasp(config_path: str, dry_run: bool = False):
             print(f"\n[ERROR] Failed to save pose to '{config_path}'.")
     else:
         print("\nPose was NOT saved.")
+
+
+def teach_scan(config_path: str, dry_run: bool = False):
+    """Interactive utility to teach and record 3 floor scan poses (Middle, Left, Right) with live camera feed."""
+    print("\n" + "=" * 64)
+    print("      TEACH 3-POINT FLOOR SCAN POSES (CASE 4 CALIBRATION)")
+    print("=" * 64)
+    print("1. Connecting to SO-100 Follower arm...")
+    config = load_config(config_path)
+    arm = ArmController(config, dry_run=dry_run)
+
+    if not arm.connect_follower():
+        print(f"Error: Could not connect to Follower Arm on {arm.follower_port}")
+        return
+
+    print("2. Disabling motor torque so you can move the arm freely by hand...")
+    if not dry_run and arm.follower is not None:
+        try:
+            arm.follower.bus.disable_torque()
+            print("   >>> TORQUE DISABLED! Arm is now limp. <<<")
+        except Exception as e:
+            print(f"   Warning: Could not disable torque automatically: {e}")
+    else:
+        print("   [DRY RUN] Simulation mode.")
+
+    def get_local_ip() -> str:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
+    # 3. Connect Camera & Start Live Stream
+    camera = None
+    stop_gui = threading.Event()
+    gui_thread = None
+    try:
+        cam_cfg = config.get("case4", {}).get("camera", {})
+        det_cfg = config.get("case4", {}).get("detection", {})
+        camera = WristCamera(
+            device_path=cam_cfg.get("device", "/dev/video0"),
+            fallback_index=int(cam_cfg.get("fallback", 0)),
+            width=int(cam_cfg.get("width", 640)),
+            height=int(cam_cfg.get("height", 480)),
+            fps=int(cam_cfg.get("fps", 30)),
+            dry_run=dry_run,
+        )
+        detector = SockDetector(
+            mode=det_cfg.get("mode", "auto"),
+            min_area=float(det_cfg.get("min_area", 1000.0)),
+            max_area=float(det_cfg.get("max_area", 80000.0)),
+            contrast_threshold=float(det_cfg.get("contrast_threshold", 38.0)),
+            enable_web_stream=True,
+            web_stream_port=int(det_cfg.get("web_stream_port", 8080)),
+        )
+        if camera.connect():
+            camera.start_stream(detector=detector)
+            robot_ip = get_local_ip()
+            print("\n" + "=" * 64)
+            print("   >>> [LIVE CAMERA FEED ACTIVE] <<<")
+            print(f"   * Web Browser: http://{robot_ip}:8080/ (open on phone, laptop, or PC)")
+            print(f"   * Snapshots:   /tmp/sock_raw.jpg & /tmp/sock_detection.jpg")
+            if os.environ.get("DISPLAY") and cv2 is not None:
+                print("   * Local Window: Opening X11 preview window...")
+                def _gui_worker():
+                    try:
+                        while not stop_gui.is_set():
+                            with camera._frame_lock:
+                                f = camera._latest_raw_frame
+                            if f is not None:
+                                cv2.imshow("Wrist Camera Feed - Teach Scan", f)
+                                cv2.waitKey(30)
+                            else:
+                                time.sleep(0.05)
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            cv2.destroyAllWindows()
+                        except Exception:
+                            pass
+                gui_thread = threading.Thread(target=_gui_worker, daemon=True)
+                gui_thread.start()
+            print("=" * 64)
+    except Exception as e:
+        print(f"Note: Camera live stream setup: {e}")
+
+    points = [
+        ("center", "MIDDLE (CENTER)", "Aim camera down at the floor directly in front of the robot chassis."),
+        ("left", "LEFT", "Aim camera down towards the floor on the LEFT side of the robot chassis."),
+        ("right", "RIGHT", "Aim camera down towards the floor on the RIGHT side of the robot chassis."),
+    ]
+    captured_poses = {}
+
+    try:
+        for idx, (key, name, hint) in enumerate(points, 1):
+            print(f"\n[{idx}/3] {name} SCAN POSE:")
+            print(f"   - {hint}")
+            print("   - Check the live camera stream to ensure proper floor visibility.")
+            try:
+                input(f"   Press [ENTER] to capture {name} pose (or Ctrl+C to cancel)... ")
+            except (KeyboardInterrupt, EOFError):
+                print("\nTeaching cancelled.")
+                return
+
+            p = arm.get_follower_pose()
+            captured_poses[key] = p
+            print(f"   Captured: pan={float(p.get('shoulder_pan.pos', 0.0)):+.1f}°, lift={float(p.get('shoulder_lift.pos', 0.0)):+.1f}°, elbow={float(p.get('elbow_flex.pos', 0.0)):+.1f}°, wrist_flex={float(p.get('wrist_flex.pos', 0.0)):+.1f}°")
+
+        print("\n" + "=" * 68)
+        print(">>> CAPTURED 3-POINT SCAN POSES SUMMARY <<<")
+        print("=" * 68)
+        joints = ["shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos", "wrist_flex.pos", "wrist_roll.pos"]
+        print(f"{'Joint':<20} | {'Middle (Center)':<16} | {'Left':<12} | {'Right':<12}")
+        print("-" * 68)
+        for j in joints:
+            c_v = f"{float(captured_poses['center'].get(j, 0.0)):+.1f}°"
+            l_v = f"{float(captured_poses['left'].get(j, 0.0)):+.1f}°"
+            r_v = f"{float(captured_poses['right'].get(j, 0.0)):+.1f}°"
+            print(f"{j:<20} | {c_v:<16} | {l_v:<12} | {r_v:<12}")
+        print("=" * 68)
+
+        confirm = input("\nSave these 3 poses to config.yaml as case4.scan_poses? [Y/n]: ").strip().lower()
+        if confirm in ("", "y", "yes"):
+            if update_config_scan_poses(config_path, captured_poses["center"], captured_poses["left"], captured_poses["right"]):
+                print(f"\n[SUCCESS] 3-point scan poses saved to '{config_path}'!")
+                print("Autonomous Case 4 will now sweep through these 3 calibrated poses during sock search.\n")
+            else:
+                print(f"\n[ERROR] Failed to save poses to '{config_path}'.")
+        else:
+            print("\nPoses were NOT saved.")
+
+    finally:
+        stop_gui.set()
+        if gui_thread and gui_thread.is_alive():
+            gui_thread.join(timeout=1.0)
+        if camera is not None:
+            camera.release()
 
 
 def test_pick(config_path: str, dry_run: bool = False):
@@ -494,9 +748,9 @@ def parse_args():
     parser.add_argument(
         "-C", "--case",
         type=int,
-        choices=[1, 2, 3, 4, 5, 6, 7],
+        choices=[1, 2, 3, 4, 5, 6, 7, 8],
         default=None,
-        help="Demo case to run (1: Leader Arm, 2: Gamepad Arm, 3: Network Teleop, 4: Vision Autonomous Grasp, 5: Teach Basket, 6: Teach Grasp, 7: Test Pick). If omitted, displays interactive menu."
+        help="Demo case to run (1: Leader Arm, 2: Gamepad Arm, 3: Network Teleop, 4: Vision Autonomous Grasp, 5: Teach Basket, 6: Teach Grasp, 7: Test Pick, 8: Teach Scan). If omitted, displays interactive menu."
     )
     parser.add_argument(
         "-c", "--config",
@@ -517,6 +771,11 @@ def parse_args():
         "--teach-grasp",
         action="store_true",
         help="Interactively calibrate and save the floor grasp pose (reaching below base) in config.yaml"
+    )
+    parser.add_argument(
+        "--teach-scan",
+        action="store_true",
+        help="Interactively calibrate and save 3-point floor scan poses (Middle, Left, Right) with live camera view in config.yaml"
     )
     parser.add_argument(
         "--test-pick",
@@ -552,6 +811,10 @@ def main():
         teach_grasp(args.config, dry_run=dry_run)
         return
 
+    if args.teach_scan:
+        teach_scan(args.config, dry_run=dry_run)
+        return
+
     if args.test_pick:
         test_pick(args.config, dry_run=dry_run)
         return
@@ -560,7 +823,7 @@ def main():
     case = args.case
     if case is None:
         cfg_case = config.get("case")
-        if cfg_case in (1, 2, 3, 4, 5, 6, 7):
+        if cfg_case in (1, 2, 3, 4, 5, 6, 7, 8):
             case = cfg_case
         else:
             case = select_case_interactive(default_case=1)
@@ -573,6 +836,9 @@ def main():
         return
     elif case == 7:
         test_pick(args.config, dry_run=dry_run)
+        return
+    elif case == 8:
+        teach_scan(args.config, dry_run=dry_run)
         return
 
     case_names = {

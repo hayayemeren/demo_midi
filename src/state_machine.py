@@ -425,9 +425,10 @@ class DemoStateMachine:
             self.state = DemoState.PARKING
             return
 
-        sweep_angles = getattr(self.planner, "scan_sweep_angles", [0.0, -28.0, 28.0])
+        scan_targets = self.planner.get_scan_targets() if hasattr(self.planner, "get_scan_targets") else [("Scan Pose", self.planner.scan_pose)]
+        labels_str = ", ".join([label for label, _ in scan_targets])
         logger.info(
-            f"\n{COLOR_BOLD}{COLOR_MAGENTA}>>> [CASE 4] EXECUTING FULL FLOOR SCAN SWEEP (Angles: {sweep_angles}) <<<{COLOR_RESET}"
+            f"\n{COLOR_BOLD}{COLOR_MAGENTA}>>> [CASE 4] EXECUTING 3-POINT FLOOR SCAN SWEEP ({labels_str}) <<<{COLOR_RESET}"
         )
 
         detected_sock = None
@@ -436,13 +437,12 @@ class DemoStateMachine:
             self.camera.ensure_healthy()
 
         scan_t = getattr(self.planner, "scan_move_duration_s", 1.5)
-        for angle in sweep_angles:
+        for label, scan_target in scan_targets:
             if (not self.running and not self.arm.dry_run) or gp.brake or gp.button_b_held:
                 break
 
-            logger.info(f"[SCAN] Sweeping camera to pan angle: {angle:+.1f}°...")
-            scan_target = dict(self.planner.scan_pose)
-            scan_target["shoulder_pan.pos"] = float(angle)
+            pan_val = scan_target.get("shoulder_pan.pos", 0.0)
+            logger.info(f"[SCAN] Moving camera to {label} scan pose (pan: {pan_val:+.1f}°)...")
             self.arm.move_to_pose(
                 scan_target,
                 duration_s=scan_t,
@@ -459,13 +459,13 @@ class DemoStateMachine:
             if det.found:
                 detected_sock = det
                 logger.info(
-                    f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [VISION] SOCK DETECTED AT {angle:+.1f}° SWEEP! <<<{COLOR_RESET}\n"
+                    f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [VISION] SOCK DETECTED AT {label.upper()} POSE! <<<{COLOR_RESET}\n"
                     f"Position: ({det.cx:.0f}, {det.cy:.0f}) | Offset: eX={det.error_x:+.2f}, eY={det.error_y:+.2f} | Area: {det.area:.0f}px\n"
                     f"Debug image saved to: {self.detector.debug_image_path}\n"
                 )
                 break
             else:
-                logger.info(f"[SCAN] No sock at {angle:+.1f}°. Continuing sweep...")
+                logger.info(f"[SCAN] No sock detected at {label}. Continuing sweep...")
 
         if detected_sock is not None:
             self.last_detection = detected_sock

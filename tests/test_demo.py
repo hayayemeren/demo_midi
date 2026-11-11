@@ -594,6 +594,85 @@ def test_arm_safety_and_stow_recovery():
         assert abs(arm.sim_follower_pose[k] - v) < 1e-3, f"Joint {k} did not reach stow pose"
 
 
+def test_scan_poses_teaching_and_execution():
+    """Verify 3-point floor scan poses configuration, clamping, planner targets, and state machine sweep."""
+    import tempfile
+    from main import update_config_scan_poses
+
+    # 1. Test get_scan_targets fallback when scan_poses not present
+    cfg_fallback = {
+        "case4": {
+            "scan_pose": {"shoulder_pan.pos": 0.0, "shoulder_lift.pos": -50.0},
+            "scan_sweep_angles": [0.0, -25.0, 25.0],
+        }
+    }
+    planner_fb = VisionGraspPlanner(cfg_fallback)
+    targets_fb = planner_fb.get_scan_targets()
+    assert len(targets_fb) == 3
+    assert targets_fb[0][0] == "Middle (Center)"
+    assert targets_fb[0][1]["shoulder_pan.pos"] == 0.0
+    assert targets_fb[1][1]["shoulder_pan.pos"] == -25.0
+    assert targets_fb[2][1]["shoulder_pan.pos"] == 25.0
+
+    # 2. Test get_scan_targets when 3-point scan_poses are explicitly defined
+    cfg_discrete = {
+        "case4": {
+            "scan_poses": {
+                "center": {"shoulder_pan.pos": 0.0, "shoulder_lift.pos": -48.0},
+                "left": {"shoulder_pan.pos": 30.0, "shoulder_lift.pos": -52.0},
+                "right": {"shoulder_pan.pos": -30.0, "shoulder_lift.pos": -50.0},
+            }
+        }
+    }
+    planner_disc = VisionGraspPlanner(cfg_discrete)
+    targets_disc = planner_disc.get_scan_targets()
+    assert len(targets_disc) == 3
+    labels = [t[0] for t in targets_disc]
+    assert labels == ["Middle (Center)", "Left", "Right"]
+    assert targets_disc[1][1]["shoulder_pan.pos"] == 30.0
+    assert targets_disc[2][1]["shoulder_pan.pos"] == -30.0
+
+    # 3. Test update_config_scan_poses with a temporary config file
+    with tempfile.NamedTemporaryFile("w+", suffix=".yaml", delete=False) as tf:
+        tf.write("""# Demo test config
+case4:
+  scan_pose:
+    shoulder_pan.pos: 0.0
+    shoulder_lift.pos: -50.0
+    elbow_flex.pos: 35.0
+    wrist_flex.pos: 70.0
+    wrist_roll.pos: 0.0
+    gripper.pos: 10.0
+  scan_sweep_angles: [0.0, -28.0, 28.0]
+""")
+        temp_cfg_path = tf.name
+
+    try:
+        center_raw = {"shoulder_pan.pos": 1.5, "shoulder_lift.pos": -52.0, "wrist_flex.pos": 75.0, "wrist_roll.pos": 0.0}
+        left_raw = {"shoulder_pan.pos": 29.0, "shoulder_lift.pos": -50.0, "wrist_flex.pos": 72.0, "wrist_roll.pos": 0.0}
+        right_raw = {"shoulder_pan.pos": -29.0, "shoulder_lift.pos": -51.0, "wrist_flex.pos": 73.0, "wrist_roll.pos": -190.0} # Needs clamping!
+
+        ok = update_config_scan_poses(temp_cfg_path, center_raw, left_raw, right_raw)
+        assert ok is True
+
+        import yaml
+        with open(temp_cfg_path, "r") as f:
+            saved_cfg = yaml.safe_load(f)
+
+        assert "scan_poses" in saved_cfg["case4"]
+        sp = saved_cfg["case4"]["scan_poses"]
+        assert sp["center"]["shoulder_pan.pos"] == 1.5
+        assert sp["left"]["shoulder_pan.pos"] == 29.0
+        assert sp["right"]["shoulder_pan.pos"] == -29.0
+        # Check wrist_roll was clamped to max -175.0
+        assert sp["right"]["wrist_roll.pos"] == -175.0
+        # Check baseline scan_pose matches center
+        assert saved_cfg["case4"]["scan_pose"]["shoulder_pan.pos"] == 1.5
+    finally:
+        if os.path.exists(temp_cfg_path):
+            os.remove(temp_cfg_path)
+
+
 if __name__ == "__main__":
     test_ddsm_crc8_spec()
     print("  [PASS] test_ddsm_crc8_spec")
@@ -623,6 +702,8 @@ if __name__ == "__main__":
     print("  [PASS] test_case4_autonomous_state_machine_simulation")
     test_arm_safety_and_stow_recovery()
     print("  [PASS] test_arm_safety_and_stow_recovery")
+    test_scan_poses_teaching_and_execution()
+    print("  [PASS] test_scan_poses_teaching_and_execution")
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
 
 

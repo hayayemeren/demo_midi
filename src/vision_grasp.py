@@ -724,6 +724,8 @@ class WristCamera:
         self.is_opened = False
         logger.debug("Wrist camera released.")
 
+    disconnect = release
+
 
 class SockDetector:
     """Robust sock detector using color segmentation, contrast saliency, and geometric filtering."""
@@ -1027,6 +1029,7 @@ class VisionGraspPlanner:
             "wrist_roll.pos": 0.0,
             "gripper.pos": 10.0,
         })
+        self.scan_poses = c4.get("scan_poses", None)
         # Basket is mounted directly behind the gripper centerline and slightly elevated
         self.basket_pose = c4.get("basket_pose", {
             "shoulder_pan.pos": 0.0,
@@ -1055,6 +1058,32 @@ class VisionGraspPlanner:
         self.basket_duration_s = float(mot.get("basket_duration_s", 3.2))
         self.release_duration_s = float(mot.get("release_duration_s", 0.8))
         self.stow_duration_s = float(mot.get("stow_duration_s", 2.5))
+
+    def get_scan_targets(self) -> list[Tuple[str, Dict[str, float]]]:
+        """Return sequential list of scan poses [(label, pose_dict)] for floor sweep.
+
+        If 3-point scan_poses (center, left, right) are configured, returns those discrete poses.
+        Otherwise falls back to applying scan_sweep_angles to the baseline scan_pose.
+        """
+        if self.scan_poses and isinstance(self.scan_poses, dict):
+            targets = []
+            if "center" in self.scan_poses and isinstance(self.scan_poses["center"], dict):
+                targets.append(("Middle (Center)", dict(self.scan_poses["center"])))
+            if "left" in self.scan_poses and isinstance(self.scan_poses["left"], dict):
+                targets.append(("Left", dict(self.scan_poses["left"])))
+            if "right" in self.scan_poses and isinstance(self.scan_poses["right"], dict):
+                targets.append(("Right", dict(self.scan_poses["right"])))
+            if targets:
+                return targets
+
+        # Fallback: multi-angle sweep angles applied to baseline scan_pose
+        targets = []
+        for angle in self.scan_sweep_angles:
+            p = dict(self.scan_pose)
+            p["shoulder_pan.pos"] = float(angle)
+            label = "Middle (Center)" if abs(angle) < 1e-3 else (f"Left ({angle:+.1f}°)" if angle > 0 else f"Right ({angle:+.1f}°)")
+            targets.append((label, p))
+        return targets
 
     def compute_aligned_pose(
         self,
