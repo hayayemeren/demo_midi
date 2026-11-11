@@ -660,8 +660,12 @@ class WristCamera:
             if sleep_t > 0:
                 time.sleep(sleep_t)
 
-    def capture_frame(self, max_staleness_s: float = 0.5) -> Tuple[bool, Optional[np.ndarray]]:
-        """Read a frame: returns latest frame if fresh, or triggers fresh capture/recovery."""
+    def capture_frame(
+        self,
+        max_staleness_s: float = 0.25,
+        min_timestamp: Optional[float] = None,
+    ) -> Tuple[bool, Optional[np.ndarray]]:
+        """Read a fresh frame, waiting for post-timestamp update if streaming or flushing V4L2 queue."""
         now = time.time()
         if self._streaming:
             # Check if thread is healthy
@@ -670,19 +674,36 @@ class WristCamera:
                 self._streaming = False
                 self.start_stream(detector=self._detector, target_fps=self._target_fps)
 
-            # Check if cached frame is fresh
-            with self._frame_lock:
-                is_fresh = (self._latest_raw_frame is not None) and ((now - self._latest_frame_time) <= max_staleness_s)
-                if is_fresh:
-                    return True, self._latest_raw_frame.copy()
+            # Wait briefly for a fresh frame captured strictly after min_timestamp (if requested)
+            deadline = time.time() + 0.35
+            while True:
+                now = time.time()
+                with self._frame_lock:
+                    has_frame = self._latest_raw_frame is not None
+                    after_min = (min_timestamp is None) or (self._latest_frame_time >= min_timestamp)
+                    is_fresh = has_frame and after_min and ((now - self._latest_frame_time) <= max_staleness_s)
+                    if is_fresh:
+                        return True, self._latest_raw_frame.copy()
+                if self.dry_run:
+                    frame = self._generate_synthetic_frame()
+                    with self._frame_lock:
+                        self._latest_raw_frame = frame
+                        self._latest_frame_time = time.time()
+                    return True, frame.copy()
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.02)
 
-            # If stale (> max_staleness_s):
+            now = time.time()
+            # If still stale/older than min_timestamp, grab directly from hardware
             logger.warning("[CAMERA] Buffered frame is stale (age: %.2fs). Forcing fresh frame grab...", now - self._latest_frame_time)
             if not self.dry_run:
                 if self.cap is None or not self.cap.isOpened():
                     self._reconnect_camera()
                 if self.cap is not None and self.cap.isOpened():
                     try:
+                        for _ in range(4):
+                            self.cap.grab()
                         ret, frame = self.cap.read()
                         if ret and frame is not None:
                             with self._frame_lock:
@@ -703,6 +724,13 @@ class WristCamera:
         if not self.is_opened or self.cap is None:
             if not self.connect():
                 return False, None
+
+        # Flush V4L2 ring buffer so single-shot captures never return pre-motion stale frames
+        for _ in range(5):
+            try:
+                self.cap.grab()
+            except Exception:
+                break
 
         ret, frame = self.cap.read()
         if not ret or frame is None:
@@ -773,7 +801,14 @@ class SockDetector:
             server = VisionDebugServer.get_instance(self.web_stream_port)
             server.start()
 
-    def detect(self, frame: np.ndarray, force_save: bool = False) -> DetectionResult:
+    def detect(
+        self,
+        frame: np.ndarray,
+        force_save: bool = False,
+        allow_border_touch: bool = False,
+        max_area_override: Optional[float] = None,
+        contrast_override: Optional[float] = None,
+    ) -> DetectionResult:
         """Process image frame to locate the sock on the floor."""
         if frame is None or frame.size == 0:
             return DetectionResult(found=False)
@@ -783,10 +818,12 @@ class SockDetector:
         center_y = h / 2.0
 
         # 1. Define active floor Region of Interest (ROI)
+        roi_top = 0.02 if allow_border_touch else self.roi_top_pct
+        roi_bottom = max(self.roi_bottom_pct, 0.78) if allow_border_touch else self.roi_bottom_pct
         x_min = int(w * self.roi_left_pct)
         x_max = int(w * self.roi_right_pct)
-        y_min = int(h * self.roi_top_pct)
-        y_max = int(h * self.roi_bottom_pct)
+        y_min = int(h * roi_top)
+        y_max = int(h * roi_bottom)
 
         roi = frame[y_min:y_max, x_min:x_max]
         roi_h, roi_w = roi.shape[:2]
@@ -795,15 +832,19 @@ class SockDetector:
         hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         cyan_mask = cv2.inRange(hsv_roi, np.array([75, 70, 70]), np.array([115, 255, 255]))
 
+        eff_contrast = float(contrast_override) if contrast_override is not None else float(self.contrast_threshold)
+        eff_max_area = float(max_area_override) if max_area_override is not None else float(self.max_area)
+
         # 3. Create foreground candidate mask
+        diff = None
         if self.mode == "contrast" or self.mode == "auto":
             gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
             blurred = cv2.GaussianBlur(gray, (9, 9), 0)
-            
+
             # Detect objects darker or brighter than median floor background
             floor_median = np.median(blurred)
             diff = np.abs(blurred.astype(np.float32) - floor_median).astype(np.uint8)
-            _, thresh = cv2.threshold(diff, self.contrast_threshold, 255, cv2.THRESH_BINARY)
+            _, thresh = cv2.threshold(diff, eff_contrast, 255, cv2.THRESH_BINARY)
         else:
             # Color mode: general dark / colored object mask
             sat = hsv_roi[:, :, 1]
@@ -826,21 +867,24 @@ class SockDetector:
 
         best_contour = None
         best_area = 0.0
+        best_score = 0.0
         best_center = (0.0, 0.0)
         best_bbox = (0, 0, 0, 0)
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if self.min_area <= area <= self.max_area:
+            if self.min_area <= area <= eff_max_area:
                 bx, by, bw, bh = cv2.boundingRect(cnt)
 
-                # RULE A: Discard contours touching the ROI boundary (vignetting, lens borders, background objects)
-                if (
+                touches_border = (
                     bx <= self.border_margin
                     or by <= self.border_margin
                     or (bx + bw) >= (roi_w - self.border_margin)
                     or (by + bh) >= (roi_h - self.border_margin)
-                ):
+                )
+                # RULE A: Discard contours touching the ROI boundary during normal scan,
+                # or tiny vignette slivers in close-up hover mode
+                if touches_border and (not allow_border_touch or area < 2500.0):
                     continue
 
                 # RULE B: Discard abnormal aspect ratios (thin vertical/horizontal edge shadows or scratches)
@@ -853,6 +897,16 @@ class SockDetector:
                 if extent < 0.25:
                     continue
 
+                # Measure local contrast strength so faint floor shadows cannot beat real cloth
+                contrast_weight = 1.0
+                if diff is not None:
+                    patch_mask = np.zeros((bh, bw), dtype=np.uint8)
+                    cv2.drawContours(patch_mask, [cnt - np.array([bx, by])], -1, 255, -1)
+                    mean_diff = float(cv2.mean(diff[by:by + bh, bx:bx + bw], mask=patch_mask)[0])
+                    if allow_border_touch and mean_diff < max(eff_contrast, 50.0):
+                        continue
+                    contrast_weight = max(1.0, mean_diff / 40.0) ** 1.3
+
                 # Find centroid using image moments
                 M = cv2.moments(cnt)
                 if M["m00"] > 0:
@@ -861,8 +915,9 @@ class SockDetector:
                     global_bx = bx + x_min
                     global_by = by + y_min
 
-                    # Prioritize larger valid cloth contours
-                    if area > best_area:
+                    score = area * contrast_weight
+                    if score > best_score:
+                        best_score = score
                         best_area = area
                         best_contour = cnt
                         best_center = (cx, cy)
@@ -1006,7 +1061,7 @@ class VisionGraspPlanner:
     def __init__(self, config: Dict[str, Any]):
         c4 = config.get("case4", {})
         serv = c4.get("servoing", {})
-        self.pan_gain = float(serv.get("pan_gain", 22.0))
+        self.pan_gain = float(serv.get("pan_gain", 60.0))
         self.lift_gain = float(serv.get("lift_gain", 15.0))
         self.align_tolerance = float(serv.get("align_tolerance", 0.12))
         self.grasp_verification_threshold = float(c4.get("grasp_verification_threshold_pct", 5.8))
@@ -1024,12 +1079,12 @@ class VisionGraspPlanner:
 
         # Default poses
         self.scan_pose = c4.get("scan_pose", {
-            "shoulder_pan.pos": 0.0,
-            "shoulder_lift.pos": -50.0,
-            "elbow_flex.pos": 35.0,
-            "wrist_flex.pos": 70.0,
-            "wrist_roll.pos": 0.0,
-            "gripper.pos": 10.0,
+            "shoulder_pan.pos": -7.1,
+            "shoulder_lift.pos": -63.7,
+            "elbow_flex.pos": 17.3,
+            "wrist_flex.pos": 96.0,
+            "wrist_roll.pos": 1.5,
+            "gripper.pos": 5.0,
         })
         self.scan_poses = c4.get("scan_poses", None)
 
@@ -1066,23 +1121,35 @@ class VisionGraspPlanner:
             "gripper.pos": 0.0,
         })
 
-        # Inverse Kinematics Engine (SO-100 Planar + Base-Yaw)
+        # Inverse Kinematics Engine (SO-100 URDF Planar + Base-Yaw + 3D Ray Projection)
         kin_cfg = c4.get("kinematics", {})
+        cam_cfg = c4.get("camera", {})
         self.use_ik = bool(kin_cfg.get("enabled", True))
+        cam_offset = tuple(kin_cfg.get("cam_offset_gf", (-0.0900, -0.0010, -0.1045)))
+        cam_w = float(cam_cfg.get("width", 640))
+        cam_h = float(cam_cfg.get("height", 480))
         self.kinematics = SO100Kinematics(
-            l1_m=float(kin_cfg.get("l1_m", 0.116)),
-            l2_m=float(kin_cfg.get("l2_m", 0.135)),
-            l3_m=float(kin_cfg.get("l3_m", 0.135)),
-            ground_clearance_m=float(kin_cfg.get("ground_clearance_m", 0.018)),
-            hover_height_m=float(kin_cfg.get("hover_height_m", 0.080)),
-            lift_height_m=float(kin_cfg.get("lift_height_m", 0.120)),
+            l1_m=float(kin_cfg.get("l1_m", 0.1160)),
+            l2_m=float(kin_cfg.get("l2_m", 0.1350)),
+            l3_m=float(kin_cfg.get("l3_m", 0.1594)),
+            ground_clearance_m=float(kin_cfg.get("ground_clearance_m", 0.024)),
+            hover_height_m=float(kin_cfg.get("hover_height_m", 0.115)),
+            lift_height_m=float(kin_cfg.get("lift_height_m", 0.125)),
             radial_gain_m=float(kin_cfg.get("radial_gain_m", 0.050)),
-            pan_gain_deg=float(serv.get("pan_gain", kin_cfg.get("pan_gain_deg", 25.0))),
-            r_near_m=float(kin_cfg.get("r_near_m", 0.115)),
-            r_far_m=float(kin_cfg.get("r_far_m", 0.215)),
+            pan_gain_deg=float(serv.get("pan_gain", kin_cfg.get("pan_gain_deg", 60.0))),
+            r_near_m=float(kin_cfg.get("r_min_m", kin_cfg.get("r_near_m", 0.145))),
+            r_far_m=float(kin_cfg.get("r_max_m", kin_cfg.get("r_far_m", 0.315))),
             y_near_px=float(kin_cfg.get("y_near_px", 330.0)),
             y_far_px=float(kin_cfg.get("y_far_px", 60.0)),
             floor_grasp_pose=self.floor_grasp_pose,
+            scan_pose=self.scan_pose,
+            cam_offset_gf=cam_offset,
+            cam_pitch_deg=float(kin_cfg.get("cam_pitch_deg", -33.01)),
+            cam_fx=float(kin_cfg.get("cam_fx", 531.5)),
+            cam_fy=float(kin_cfg.get("cam_fy", kin_cfg.get("cam_fx", 531.5))),
+            cam_cx=float(kin_cfg.get("cam_cx", cam_w / 2.0)),
+            cam_cy=float(kin_cfg.get("cam_cy", cam_h / 2.0)),
+            sock_height_offset_m=float(kin_cfg.get("sock_height_offset_m", 0.015)),
         )
 
         # Motion timing (seconds) - Slow and gentle for stability
@@ -1154,12 +1221,14 @@ class VisionGraspPlanner:
         self,
         detection: Optional[DetectionResult],
         scan_pan_deg: float,
+        scan_pose: Optional[Dict[str, float]] = None,
     ) -> Tuple[float, float, float]:
         """Compute the 3D ground target coordinates (r_m, pan_deg, roll_deg) from detection."""
         return self.kinematics.compute_sock_target(
             detection,
             scan_pan_deg=scan_pan_deg,
             pan_direction=self.pan_direction,
+            scan_pose=scan_pose,
         )
 
     def compute_grasp_pose(
@@ -1171,6 +1240,7 @@ class VisionGraspPlanner:
         r_target: Optional[float] = None,
         pan_target: Optional[float] = None,
         roll_target: Optional[float] = None,
+        scan_pose: Optional[Dict[str, float]] = None,
         descent_lift_deg: float = 16.0,
         descent_elbow_deg: float = 12.0,
     ) -> Dict[str, float]:
@@ -1184,6 +1254,7 @@ class VisionGraspPlanner:
                     detection,
                     scan_pan_deg=target_pan,
                     pan_direction=self.pan_direction,
+                    scan_pose=scan_pose,
                 )
                 if r_target is None:
                     r_target = r_calc
@@ -1282,3 +1353,142 @@ class VisionGraspPlanner:
         """
         return measured_gripper_pct >= self.grasp_verification_threshold
 
+    def execute_scan_sweep(
+        self,
+        arm: Any,
+        camera: Any,
+        detector: Any,
+        feedback_cb: Optional[Any] = None,
+        abort_cb: Optional[Any] = None,
+        open_gripper_pct: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Sweep configured scan poses, capture post-settle frames, and return best floor detection.
+
+        Returns a dict containing `det`, `coords` `(r_target, pan_target, roll_target)`,
+        `label`, `pose`, and `frame`, or None if no sock was found.
+        """
+        if camera is None or detector is None:
+            return None
+
+        camera.ensure_healthy()
+        candidates = []
+        settle_s = 0.0 if getattr(arm, "dry_run", False) else 0.35
+
+        for label, target in self.get_scan_targets():
+            if abort_cb is not None and abort_cb():
+                break
+
+            scan_cmd = dict(target)
+            if open_gripper_pct is not None:
+                scan_cmd["gripper.pos"] = float(open_gripper_pct)
+
+            pan_val = scan_cmd.get("shoulder_pan.pos", 0.0)
+            logger.info("[SCAN] Moving camera to %s scan pose (pan: %+.1f°)...", label, pan_val)
+            arm.move_to_pose(scan_cmd, duration_s=self.scan_move_duration_s, feedback_cb=feedback_cb)
+            if settle_s > 0.0:
+                time.sleep(settle_s)
+            if feedback_cb is not None:
+                feedback_cb(1.0)
+
+            meas_pose = scan_cmd if getattr(arm, "dry_run", False) else arm.get_follower_pose()
+            t_settled = time.time()
+            ok, frame = camera.capture_frame(max_staleness_s=0.15, min_timestamp=t_settled)
+            if not ok or frame is None:
+                continue
+
+            det = detector.detect(frame, force_save=True)
+            if det.found:
+                score = det.area * (1.0 - 0.4 * abs(det.error_x))
+                logger.info(
+                    "[SCAN CANDIDATE] Sock found at %s: Area=%.0fpx, eX=%+.2f, eY=%+.2f, Score=%.0f",
+                    label, det.area, det.error_x, det.error_y, score,
+                )
+                candidates.append({
+                    "score": score,
+                    "det": det,
+                    "pose": meas_pose,
+                    "pan_val": meas_pose.get("shoulder_pan.pos", pan_val),
+                    "label": label,
+                    "frame": frame,
+                })
+            else:
+                logger.info("[SCAN] No sock detected at %s. Continuing sweep...", label)
+
+        if not candidates:
+            return None
+
+        best = max(candidates, key=lambda c: c["score"])
+        best_det = best["det"]
+        best_pose = best["pose"]
+        r_target, pan_target, roll_target = self.kinematics.compute_sock_target(
+            best_det,
+            scan_pan_deg=best["pan_val"],
+            pan_direction=self.pan_direction,
+            scan_pose=best_pose,
+        )
+        best["coords"] = (r_target, pan_target, roll_target)
+
+        if best.get("frame") is not None:
+            detector.detect(best["frame"], force_save=True)
+
+        return best
+
+    def refine_target_in_hover(
+        self,
+        arm: Any,
+        camera: Any,
+        detector: Any,
+        r_target: float,
+        pan_target: float,
+        roll_target: float,
+        hover_pose: Dict[str, float],
+        feedback_cb: Optional[Any] = None,
+    ) -> Tuple[float, float, float, Optional[DetectionResult]]:
+        """Close-up visual refinement while hovering above target sock before final descent."""
+        if not self.enable_hover_refinement or camera is None or detector is None or getattr(arm, "dry_run", False):
+            return r_target, pan_target, roll_target, None
+
+        time.sleep(0.30)
+        if feedback_cb is not None:
+            feedback_cb(1.0)
+
+        meas_hover = arm.get_follower_pose()
+        t_settled = time.time()
+        ok, h_frame = camera.capture_frame(max_staleness_s=0.15, min_timestamp=t_settled)
+        if not ok or h_frame is None:
+            return r_target, pan_target, roll_target, None
+
+        det_hov = detector.detect(
+            h_frame,
+            force_save=True,
+            allow_border_touch=True,
+            max_area_override=220000.0,
+        )
+        if not det_hov.found:
+            return r_target, pan_target, roll_target, det_hov
+
+        r_new, pan_new, _ = self.kinematics.compute_sock_target(
+            det_hov,
+            scan_pan_deg=meas_hover.get("shoulder_pan.pos", pan_target),
+            pan_direction=self.pan_direction,
+            scan_pose=meas_hover,
+        )
+
+        # Reject noisy outliers far away from scan lock
+        if abs(r_new - r_target) <= 0.10 and abs(pan_new - pan_target) <= 22.0:
+            if abs(r_new - r_target) > 0.012 or abs(pan_new - pan_target) > 2.5:
+                logger.info(
+                    "[HOVER REFINE] Adjusting target: R %.1f->%.1fcm, Pan %+.1f->%+.1f°",
+                    r_target * 100.0, r_new * 100.0, pan_target, pan_new,
+                )
+                refined_hover = self.kinematics.compute_cartesian_pose(
+                    r_target=r_new,
+                    z_target=self.kinematics.z_floor + self.kinematics.hover_height_m,
+                    pan_target=pan_new,
+                    roll_target=roll_target,
+                    gripper_pct=85.0,
+                )
+                arm.move_to_pose(refined_hover, duration_s=0.8, feedback_cb=feedback_cb)
+            return r_new, pan_new, roll_target, det_hov
+
+        return r_target, pan_target, roll_target, det_hov

@@ -651,6 +651,7 @@ def test_pick(config_path: str, dry_run: bool = False):
 
     # Start live camera and vision web debugger if available
     camera = None
+    detector = None
     try:
         cam_cfg = config.get("case4", {}).get("camera", {})
         det_cfg = config.get("case4", {}).get("detection", {})
@@ -690,34 +691,45 @@ def test_pick(config_path: str, dry_run: bool = False):
         release_t = planner.release_duration_s
         stow_t = planner.stow_duration_s
 
-        print("\n[TEST] 1. Moving to scan/approach pose (gripper open 85%)...")
-        scan_p = dict(planner.scan_pose)
-        scan_p["gripper.pos"] = 85.0
-        arm.move_to_pose(scan_p, duration_s=1.8, feedback_cb=lambda _: base.hold_lock())
-
-        # If camera is available, check for sock in camera frame
-        det = None
-        if camera is not None:
-            time.sleep(0.3)
-            ok, frame = camera.capture_frame()
-            if ok and frame is not None:
-                det_res = detector.detect(frame, force_save=True)
-                if det_res.found:
-                    det = det_res
-                    print(f"\n>>> [TEST VISION] Sock detected at ({det.cx:.0f}, {det.cy:.0f}), area={det.area:.0f}px! Centering gripper onto sock! <<<\n")
-
-        if det is not None:
-            r_tgt, pan_tgt, roll_tgt = planner.kinematics.compute_sock_target(
-                det,
-                scan_pan_deg=scan_p.get("shoulder_pan.pos", 0.0),
-                pan_direction=planner.pan_direction,
+        print("\n[TEST] 1. Executing 3-point floor scan sweep (gripper open 85%)...")
+        best = None
+        if camera is not None and detector is not None:
+            best = planner.execute_scan_sweep(
+                arm=arm,
+                camera=camera,
+                detector=detector,
+                feedback_cb=lambda _: base.hold_lock(),
+                open_gripper_pct=85.0,
             )
+
+        if best is not None:
+            det = best["det"]
+            r_tgt, pan_tgt, roll_tgt = best["coords"]
+            print(f"\n>>> [TEST VISION] Sock detected at {best['label']} ({det.cx:.0f}, {det.cy:.0f}), area={det.area:.0f}px! <<<")
+            print(f"[TEST] Initial Floor Target: R={r_tgt*100:.1f}cm, Pan={pan_tgt:+.1f}°, Roll={roll_tgt:+.1f}°")
             stages = planner.kinematics.get_trajectory_stages(r_tgt, pan_tgt, roll_tgt)
+            hover_p = stages["hover"]
+            print(f"[TEST] 1b. Moving to pre-grasp hover (~{planner.kinematics.hover_height_m*100:.0f}cm above sock)...")
+            arm.move_to_pose(hover_p, duration_s=max(1.0, descend_t * 0.5), feedback_cb=lambda _: base.hold_lock())
+            r_tgt, pan_tgt, roll_tgt, det_hov = planner.refine_target_in_hover(
+                arm=arm,
+                camera=camera,
+                detector=detector,
+                r_target=r_tgt,
+                pan_target=pan_tgt,
+                roll_target=roll_tgt,
+                hover_pose=hover_p,
+                feedback_cb=lambda _: base.hold_lock(),
+            )
+            if det_hov is not None and det_hov.found:
+                stages = planner.kinematics.get_trajectory_stages(r_tgt, pan_tgt, roll_tgt)
             grasp_open = stages["descent"]
             grasp_clamp = stages["clamp"]
             lift_p = stages["lift"]
-            print(f"[TEST] Target Floor Coordinates: R={r_tgt*100:.1f}cm, Pan={pan_tgt:+.1f}°, Roll={roll_tgt:+.1f}°")
         else:
+            scan_p = dict(planner.scan_pose)
+            scan_p["gripper.pos"] = 85.0
+            arm.move_to_pose(scan_p, duration_s=1.8, feedback_cb=lambda _: base.hold_lock())
             grasp_p = planner.compute_grasp_pose(scan_p)
             grasp_open = dict(grasp_p)
             grasp_open["gripper.pos"] = 85.0

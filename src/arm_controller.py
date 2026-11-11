@@ -261,15 +261,31 @@ class ArmController:
     def move_to_stow(self, duration_s: Optional[float] = None, feedback_cb = None):
         """Smoothly park the follower arm into the safe stowed travel pose.
         
-        If currently in a rear/basket posture (elbow or wrist flex < 0), first uncurls
-        and lifts the forearm to clear the chassis and basket before folding into stow.
+        Handles both rear/basket postures (uncurling elbow/wrist forward) and forward
+        floor-reach postures (raising shoulder above chassis before folding wrist/elbow
+        so the jaws never hook underneath the front chassis bar).
         """
         duration = duration_s or self.interpolation_time
         start_pose = self.get_follower_pose()
 
+        lift = start_pose.get("shoulder_lift.pos", -95.0)
         elbow = start_pose.get("elbow_flex.pos", 25.0)
         wrist = start_pose.get("wrist_flex.pos", 95.0)
-        if elbow < -10.0 or wrist < -10.0:
+
+        if lift > 15.0:
+            logger.info("[ARM] Elevating from forward floor reach cleanly before stowing...")
+            clear_front = dict(start_pose)
+            clear_front["shoulder_pan.pos"] = 0.0
+            clear_front["shoulder_lift.pos"] = -35.0
+            # Keep forearm gently folded upward/compact to reduce shoulder gravity torque without tucking under bar
+            clear_front["elbow_flex.pos"] = 10.0
+            clear_front["wrist_flex.pos"] = -35.0
+            clear_front["wrist_roll.pos"] = 0.0
+            clear_front["gripper.pos"] = min(20.0, start_pose.get("gripper.pos", 20.0))
+            clear_t = 0.05 if self.dry_run else max(2.0, duration)
+            self.smooth_trajectory(start_pose, clear_front, duration_s=clear_t, feedback_cb=feedback_cb)
+            start_pose = self.get_follower_pose() if not self.dry_run else clear_front
+        elif elbow < -10.0 or wrist < -10.0:
             logger.info("[ARM] Clearing chassis/basket before parking into stow pose...")
             clearance_pose = dict(start_pose)
             # Elevate shoulder slightly, uncurl elbow and wrist forward, reset roll
@@ -284,6 +300,14 @@ class ArmController:
 
         logger.info("[ARM] Moving Follower to Stow Pose over %.1fs...", duration)
         self.smooth_trajectory(start_pose, self.stow_pose, duration, feedback_cb=feedback_cb)
+        if not self.dry_run:
+            # Allow brief settle check so shoulder passes behind center of gravity before releasing
+            t_wait = time.time()
+            while time.time() - t_wait < 0.6:
+                cur_l = self.get_follower_pose().get("shoulder_lift.pos", 0.0)
+                if cur_l <= self.stow_pose.get("shoulder_lift.pos", -95.0) + 15.0:
+                    break
+                time.sleep(0.05)
         self.current_gamepad_target = dict(self.stow_pose)
         logger.info("[ARM] Follower is parked safely at Stow Pose.")
 

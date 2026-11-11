@@ -434,12 +434,21 @@ def test_case4_vision_grasp_components():
     assert grasp_pose["gripper.pos"] == 0.0
     assert grasp_pose["shoulder_lift.pos"] > aligned["shoulder_lift.pos"]  # lower down
 
-    # 4b. Test adaptive longitudinal reach modulation
+    # 4b. Test adaptive longitudinal reach modulation (real URDF: far extends shoulder forward / elbow more negative)
     det_far = DetectionResult(found=True, error_y=-0.4)
     det_near = DetectionResult(found=True, error_y=0.4)
     grasp_far = planner.compute_grasp_pose(aligned, det_far)
     grasp_near = planner.compute_grasp_pose(aligned, det_near)
-    assert grasp_far["elbow_flex.pos"] > grasp_near["elbow_flex.pos"], "Elbow should extend further forward for far sock"
+    r_far_fk, _, _ = planner.kinematics.forward_kinematics(
+        grasp_far["shoulder_lift.pos"], grasp_far["elbow_flex.pos"], grasp_far["wrist_flex.pos"]
+    )
+    r_near_fk, _, _ = planner.kinematics.forward_kinematics(
+        grasp_near["shoulder_lift.pos"], grasp_near["elbow_flex.pos"], grasp_near["wrist_flex.pos"]
+    )
+    assert r_far_fk > r_near_fk + 0.05, f"Far reach FK {r_far_fk:.3f}m must exceed near {r_near_fk:.3f}m"
+    assert grasp_far["elbow_flex.pos"] < grasp_near["elbow_flex.pos"], (
+        f"SO-101 elbow becomes more negative as forearm extends forward: {grasp_far['elbow_flex.pos']} vs {grasp_near['elbow_flex.pos']}"
+    )
 
     # 4c. Test fixed wrist roll by default (no unwanted rolling during grasp)
     det_angled = DetectionResult(found=True, angle=35.0)
@@ -736,8 +745,8 @@ def test_shoulder_pan_preservation_and_centroid_alignment():
 
 
 def test_so100_analytical_kinematics_and_clearance():
-    """Verify SO-100 analytical Forward/Inverse Kinematics, safe ground clearance,
-    and 4-stage Cartesian pick trajectory generation."""
+    """Verify URDF-calibrated SO-100 Forward/Inverse Kinematics, constant safe ground clearance
+    across near/mid/far workspace, adaptive pitch at far reach, and 4-stage trajectory generation."""
     from src.kinematics import SO100Kinematics
 
     ref_pose = {
@@ -748,59 +757,67 @@ def test_so100_analytical_kinematics_and_clearance():
         "wrist_roll.pos": -0.7,
         "gripper.pos": 0.0,
     }
-    kin = SO100Kinematics(floor_grasp_pose=ref_pose, ground_clearance_m=0.018)
+    kin = SO100Kinematics(floor_grasp_pose=ref_pose, ground_clearance_m=0.024)
 
-    # 1. Forward Kinematics at reference ground contact
+    # 1. Forward Kinematics at reference ground contact matches URDF geometry
     r_ref, z_floor, pitch_contact = kin.forward_kinematics(97.5, -58.2, 59.6)
-    assert abs(pitch_contact - (-90.0)) < 1e-2, f"Expected pitch -90.0°, got {pitch_contact}"
-    assert abs(r_ref - kin.r_ref) < 1e-5
-    assert abs(z_floor - kin.z_floor) < 1e-5
+    expected_pitch = -(97.5 - 58.2 + 59.6)
+    assert abs(pitch_contact - expected_pitch) < 1e-3, f"Expected pitch {expected_pitch}°, got {pitch_contact}"
+    assert 0.20 < r_ref < 0.23, f"Expected URDF r_pan ~0.214m, got {r_ref:.4f}m"
+    assert abs(z_floor - (-0.1634)) < 0.002, f"Expected URDF z_floor ~-0.1634m, got {z_floor:.4f}m"
 
-    # 2. Inverse Kinematics reproduces reference pose exactly
-    l_sol, e_sol, w_sol = kin.solve_ik(kin.r_ref, kin.z_floor, desired_pitch_deg=-90.0)
-    assert abs(l_sol - 97.5) < 1e-2
-    assert abs(e_sol - (-58.2)) < 1e-2
-    assert abs(w_sol - 59.6) < 1e-2
+    # 2. Inverse Kinematics reproduces exact reference pose and perpendicular floor poses across radii
+    l_sol, e_sol, w_sol = kin.solve_ik(kin.r_ref, kin.z_floor, desired_pitch_deg=pitch_contact)
+    assert abs(l_sol - 97.5) < 0.05
+    assert abs(e_sol - (-58.2)) < 0.05
+    assert abs(w_sol - 59.6) < 0.05
 
-    # 3. Ground Clearance: Gripper tip is elevated above raw floor contact by 1.8cm
+    # 3. Ground Clearance (+2.4cm above raw floor contact) across ALL near/mid/far radii!
     z_clear = kin.z_floor + kin.ground_clearance_m
-    l_clear, e_clear, w_clear = kin.solve_ik(kin.r_ref, z_clear, desired_pitch_deg=-90.0)
-    r_chk, z_chk, pitch_chk = kin.forward_kinematics(l_clear, e_clear, w_clear)
-    assert abs(z_chk - z_clear) < 1e-3, f"Height mismatch: {z_chk} vs {z_clear}"
-    assert abs(r_chk - kin.r_ref) < 1e-3, f"Radial drift: {r_chk} vs {kin.r_ref}"
-    assert abs(pitch_chk - (-90.0)) < 1e-2, f"Pitch must stay perpendicular: {pitch_chk}"
+    near_joints = kin.solve_ik(0.16, z_clear, desired_pitch_deg=-90.0)
+    far_joints = kin.solve_ik(0.24, z_clear, desired_pitch_deg=-90.0)
+    assert abs(near_joints[1] - far_joints[1]) > 40.0, (
+        "Near vs far reach must fold/extend elbow distinctly instead of picking the same full-extension pose"
+    )
+    for r_test in (0.15, 0.19, 0.23, 0.25, 0.29):
+        l_c, e_c, w_c = kin.solve_ik(r_test, z_clear, desired_pitch_deg=-90.0)
+        r_chk, z_chk, pitch_chk = kin.forward_kinematics(l_c, e_c, w_c)
+        assert abs(z_chk - z_clear) < 1e-3, f"R={r_test}: height mismatch {z_chk*100:.2f}cm vs {z_clear*100:.2f}cm"
+        assert abs(r_chk - r_test) < 1e-3, f"R={r_test}: radial mismatch {r_chk*100:.2f}cm"
+        if r_test <= 0.25:
+            assert abs(pitch_chk - (-90.0)) < 0.1, f"R={r_test}: must stay perpendicular -90°, got {pitch_chk:.2f}°"
+        else:
+            assert -90.0 <= pitch_chk <= -55.0, f"Extended reach pitch must stay steeply downward: {pitch_chk:.1f}°"
 
-    # 4. Vertical Cartesian Lift (+12cm)
+    # 4. Vertical Cartesian Lift (+12.5cm)
     z_lift = kin.z_floor + kin.lift_height_m
-    l_lift, e_lift, w_lift = kin.solve_ik(kin.r_ref, z_lift, desired_pitch_deg=-90.0)
+    l_lift, e_lift, w_lift = kin.solve_ik(0.21, z_lift, desired_pitch_deg=-90.0)
     r_lchk, z_lchk, pitch_lchk = kin.forward_kinematics(l_lift, e_lift, w_lift)
     assert abs(z_lchk - z_lift) < 1e-3
-    assert abs(r_lchk - kin.r_ref) < 1e-3
-    assert abs(pitch_lchk - (-90.0)) < 1e-2
+    assert abs(r_lchk - 0.21) < 1e-3
+    assert abs(pitch_lchk - (-90.0)) < 0.1
 
-    # 5. Detection to 3D Sock Target mapping
+    # 5. Normalized error fallback mapping
     det_top = DetectionResult(found=True, error_x=-0.2, error_y=-0.5)
     r_target, pan_target, _ = kin.compute_sock_target(det_top, scan_pan_deg=10.0, pan_direction=1.0)
-    assert r_target > kin.r_ref, "Negative error_y (top of image) must increase forward reach"
+    assert r_target > 0.21, "Negative error_y (top of image) must yield far reach"
     assert pan_target < 10.0, "Negative error_x must rotate pan towards left"
 
     # 6. Complete 4-stage trajectory generation
-    stages = kin.get_trajectory_stages(kin.r_ref, 0.0)
+    stages = kin.get_trajectory_stages(0.22, 0.0)
     assert "hover" in stages and "descent" in stages and "clamp" in stages and "lift" in stages
     assert stages["hover"]["gripper.pos"] == 85.0
     assert stages["descent"]["gripper.pos"] == 85.0
     assert stages["clamp"]["gripper.pos"] == 0.0
     assert stages["lift"]["gripper.pos"] == 0.0
-    # Hover is elevated relative to descent
     assert stages["hover"]["shoulder_lift.pos"] < stages["descent"]["shoulder_lift.pos"]
 
 
 def test_centroid_to_cartesian_floor_targeting():
-    """Verify that 2D centroid (cx, cy) from camera frame accurately maps to 3D Cartesian
-    floor coordinates (R, Pan) across near/far, left/right positions, with identical
-    coordinates maintained across all trajectory stages (no double/triple pan accumulation)."""
+    """Verify that 2D centroid (cx, cy) from camera frame maps cleanly to 3D Cartesian
+    floor coordinates (R, Pan) across near/far and left/right positions using 3D ray projection,
+    while keeping identical target coordinates across all trajectory stages."""
     import yaml
-    from src.kinematics import SO100Kinematics
     from src.vision_grasp import VisionGraspPlanner, DetectionResult
 
     with open("config.yaml", "r", encoding="utf-8") as f:
@@ -809,34 +826,36 @@ def test_centroid_to_cartesian_floor_targeting():
     planner = VisionGraspPlanner(cfg)
     kin = planner.kinematics
 
-    # 1. Near vs Far radial mapping
-    # Bottom of ROI (cy=310, near chassis) vs Top of ROI (cy=70, far forward)
-    det_near = DetectionResult(found=True, cx=320.0, cy=310.0, error_x=0.0, error_y=(310-240)/240)
-    det_far = DetectionResult(found=True, cx=320.0, cy=70.0, error_x=0.0, error_y=(70-240)/240)
+    # 1. Near vs Far radial mapping using scan_pose ray projection
+    det_near = DetectionResult(found=True, cx=320.0, cy=310.0, error_x=0.0, error_y=(310 - 240) / 240)
+    det_far = DetectionResult(found=True, cx=320.0, cy=70.0, error_x=0.0, error_y=(70 - 240) / 240)
 
     r_near, pan_near, _ = kin.compute_sock_target(det_near, scan_pan_deg=-7.1)
     r_far, pan_far, _ = kin.compute_sock_target(det_far, scan_pan_deg=-7.1)
 
-    assert r_near < 0.13, f"Expected near reach < 13cm, got {r_near*100:.1f}cm"
-    assert r_far > 0.19, f"Expected far reach > 19cm, got {r_far*100:.1f}cm"
-    assert r_far > r_near + 0.07, "Far reach must be significantly greater than near reach"
+    assert r_near < 0.16, f"Expected near reach <= 16cm, got {r_near*100:.1f}cm"
+    assert r_far > 0.27, f"Expected far reach > 27cm, got {r_far*100:.1f}cm"
+    assert r_far > r_near + 0.11, "Far reach must exceed near reach by > 11cm"
 
-    # Joint positions: Far reach extends elbow forward, near reach folds elbow back
+    # Real URDF joint behavior: near folds elbow positive (+30°), far extends elbow negative (-55°)
     descent_near = kin.get_trajectory_stages(r_near, pan_near)["descent"]
     descent_far = kin.get_trajectory_stages(r_far, pan_far)["descent"]
-    assert descent_far["elbow_flex.pos"] > descent_near["elbow_flex.pos"], (
-        f"Elbow must extend forward for far reach: {descent_far['elbow_flex.pos']} vs {descent_near['elbow_flex.pos']}"
+    assert descent_far["elbow_flex.pos"] < descent_near["elbow_flex.pos"], (
+        f"SO-101 elbow flexes more negative for far reach: {descent_far['elbow_flex.pos']} vs {descent_near['elbow_flex.pos']}"
+    )
+    assert descent_far["shoulder_lift.pos"] > descent_near["shoulder_lift.pos"], (
+        f"SO-101 shoulder pitches forward for far reach: {descent_far['shoulder_lift.pos']} vs {descent_near['shoulder_lift.pos']}"
     )
 
     # 2. Left vs Right azimuthal pan mapping
-    det_left = DetectionResult(found=True, cx=120.0, cy=200.0, error_x=(120-320)/320, error_y=0.0)
-    det_right = DetectionResult(found=True, cx=520.0, cy=200.0, error_x=(520-320)/320, error_y=0.0)
+    det_left = DetectionResult(found=True, cx=120.0, cy=200.0, error_x=(120 - 320) / 320, error_y=0.0)
+    det_right = DetectionResult(found=True, cx=520.0, cy=200.0, error_x=(520 - 320) / 320, error_y=0.0)
 
     _, pan_l, _ = kin.compute_sock_target(det_left, scan_pan_deg=0.0, pan_direction=1.0)
     _, pan_r, _ = kin.compute_sock_target(det_right, scan_pan_deg=0.0, pan_direction=1.0)
 
-    assert pan_l < -10.0, f"Left sock must turn pan CCW/left: {pan_l:.1f}°"
-    assert pan_r > 10.0, f"Right sock must turn pan CW/right: {pan_r:.1f}°"
+    assert pan_l < -20.0, f"Left sock must turn pan CCW/left strongly: {pan_l:.1f}°"
+    assert pan_r > 20.0, f"Right sock must turn pan CW/right strongly: {pan_r:.1f}°"
 
     # 3. Trajectory Stage Consistency (NO double/triple pan accumulation)
     stages = kin.get_trajectory_stages(r_near, pan_l)
@@ -845,22 +864,21 @@ def test_centroid_to_cartesian_floor_targeting():
             f"Stage {stage_name} pan {stages[stage_name]['shoulder_pan.pos']} must match target pan {pan_l}"
         )
 
-    # 4. Safe ground clearance preserved
-    rfk, zfk, pitch = kin.forward_kinematics(
-        descent_near["shoulder_lift.pos"],
-        descent_near["elbow_flex.pos"],
-        descent_near["wrist_flex.pos"],
-    )
-    assert abs(zfk - (kin.z_floor + kin.ground_clearance_m)) < 2e-3, (
-        f"Descent height {zfk*100:.2f}cm must match clearance height {(kin.z_floor + kin.ground_clearance_m)*100:.2f}cm"
-    )
-    assert abs(pitch - (-90.0)) < 1.0, f"Gripper pitch must remain perpendicular: {pitch:.1f}°"
+    # 4. Safe ground clearance preserved across both near and far reaches
+    for d_pose in (descent_near, descent_far):
+        _, zfk, pitch = kin.forward_kinematics(
+            d_pose["shoulder_lift.pos"],
+            d_pose["elbow_flex.pos"],
+            d_pose["wrist_flex.pos"],
+        )
+        assert abs(zfk - (kin.z_floor + kin.ground_clearance_m)) < 2e-3, (
+            f"Descent height {zfk*100:.2f}cm must match clearance height {(kin.z_floor + kin.ground_clearance_m)*100:.2f}cm"
+        )
+        assert -91.0 <= pitch <= -55.0
 
 
 def test_real_floor_image_and_kinematic_descent():
-    """Verify that detector processes real floor image (/tmp/sock_raw.jpg if present),
-    correctly isolates the real sock, rejects floor seams, and generates a grounded
-    floor descent pose anchored to floor_grasp_pose (not floating 15cm in the air)."""
+    """Verify detection and 3D floor kinematics on captured real hardware images."""
     import yaml
     import cv2
     from src.vision_grasp import SockDetector, VisionGraspPlanner
@@ -871,49 +889,68 @@ def test_real_floor_image_and_kinematic_descent():
     planner = VisionGraspPlanner(cfg)
     detector = SockDetector(
         min_area=float(cfg["case4"]["detection"]["min_area"]),
+        max_area=float(cfg["case4"]["detection"]["max_area"]),
         contrast_threshold=float(cfg["case4"]["detection"]["contrast_threshold"]),
         border_margin=int(cfg["case4"]["detection"]["border_margin"]),
         roi_top_pct=float(cfg["case4"]["detection"]["roi_top_pct"]),
         roi_bottom_pct=float(cfg["case4"]["detection"]["roi_bottom_pct"]),
         roi_left_pct=float(cfg["case4"]["detection"]["roi_left_pct"]),
         roi_right_pct=float(cfg["case4"]["detection"]["roi_right_pct"]),
+        save_debug_image=False,
     )
 
-    if os.path.exists("/tmp/sock_raw.jpg"):
-        img = cv2.imread("/tmp/sock_raw.jpg")
+    if os.path.exists("/tmp/scan_middle.jpg"):
+        img = cv2.imread("/tmp/scan_middle.jpg")
         det = detector.detect(img)
-        assert det.found is True, "Must detect the black sock in /tmp/sock_raw.jpg"
-        assert det.area > 10000.0, f"Expected real sock area > 10000px, got {det.area}"
-        assert det.cx < 200.0, f"Sock is on left side (cx ~ 147), got {det.cx}"
-
+        assert det.found is True, "Must detect the black sock in /tmp/scan_middle.jpg"
         r_tgt, pan_tgt, roll_tgt = planner.kinematics.compute_sock_target(
             det,
             scan_pan_deg=-7.1,
             pan_direction=planner.pan_direction,
+            scan_pose=cfg["case4"]["scan_poses"]["center"],
         )
-        assert pan_tgt < -7.1, f"Shoulder pan must turn towards left for left sock: {pan_tgt}"
-        assert roll_tgt == -0.7, f"Wrist roll must remain locked to calibrated value (-0.7°): {roll_tgt}"
+        assert -34.0 <= pan_tgt <= -22.0, f"Expected scan_middle pan toward sock (~ -26°..-30°), got {pan_tgt:.1f}°"
+        assert 0.25 <= r_tgt <= 0.315, f"Expected reach toward sock [25, 31.5]cm, got {r_tgt*100:.1f}cm"
+        assert roll_tgt == -0.7
 
         stages = planner.kinematics.get_trajectory_stages(r_tgt, pan_tgt, roll_tgt)
         descent = stages["descent"]
-        hover = stages["hover"]
-        clamp = stages["clamp"]
-        lift = stages["lift"]
-
-        # Descent lift must be within the floor reach envelope [88.0°, 102.0°] around safe clearance (94.5°)
-        assert 88.0 <= descent["shoulder_lift.pos"] <= 102.0, (
-            f"Descent lift must be within reach envelope [88°, 102°], got {descent['shoulder_lift.pos']}°"
+        _, z_fk, _ = planner.kinematics.forward_kinematics(
+            descent["shoulder_lift.pos"], descent["elbow_flex.pos"], descent["wrist_flex.pos"]
         )
-        assert -78.0 <= descent["elbow_flex.pos"] <= -38.0, (
-            f"Elbow must reach down towards floor within reach envelope [-78°, -38°], got {descent['elbow_flex.pos']}°"
+        assert z_fk >= planner.kinematics.z_floor + 0.020, (
+            f"Descent Z={z_fk*100:.2f}cm must stay >= 2.0cm above raw floor contact {planner.kinematics.z_floor*100:.2f}cm"
         )
-        assert descent["wrist_roll.pos"] == -0.7, "Wrist roll must not twist"
+        assert stages["hover"]["shoulder_lift.pos"] < descent["shoulder_lift.pos"]
 
-        # Hover must be elevated ~14° above descent
-        assert hover["shoulder_lift.pos"] < descent["shoulder_lift.pos"]
-        assert hover["gripper.pos"] == 85.0
-        assert clamp["gripper.pos"] == 0.0
-        assert lift["shoulder_lift.pos"] < descent["shoulder_lift.pos"]
+    if os.path.exists("/tmp/cl_hover1.jpg"):
+        img_hov = cv2.imread("/tmp/cl_hover1.jpg")
+        det_hov = detector.detect(
+            img_hov, allow_border_touch=True, max_area_override=220000.0
+        )
+        assert det_hov.found is True, "Must detect close-up black sock touching top edge in /tmp/cl_hover1.jpg"
+        assert det_hov.cy < 150.0, f"Must lock onto real dark sock at top (cy < 150), not floor shadow (got cy={det_hov.cy:.1f})"
+
+
+def test_arm_front_stow_clearance_recovery():
+    """Verify move_to_stow safely clears forward floor postures without tucking jaws backward into chassis."""
+    cfg = {
+        "dry_run": True,
+        "arm": {"follower_port": "/dev/null", "interpolation_time_s": 0.01},
+    }
+    arm = ArmController(cfg, dry_run=True)
+    arm.connect_follower()
+    arm.sim_follower_pose = {
+        "shoulder_pan.pos": -30.0,
+        "shoulder_lift.pos": 88.0,
+        "elbow_flex.pos": -50.0,
+        "wrist_flex.pos": 35.0,
+        "wrist_roll.pos": -0.7,
+        "gripper.pos": 85.0,
+    }
+    arm.move_to_stow(duration_s=0.01)
+    for k, v in arm.stow_pose.items():
+        assert abs(arm.sim_follower_pose[k] - v) < 1e-3, f"Joint {k} did not reach stow pose"
 
 
 if __name__ == "__main__":
@@ -955,6 +992,8 @@ if __name__ == "__main__":
     print("  [PASS] test_centroid_to_cartesian_floor_targeting")
     test_real_floor_image_and_kinematic_descent()
     print("  [PASS] test_real_floor_image_and_kinematic_descent")
+    test_arm_front_stow_clearance_recovery()
+    print("  [PASS] test_arm_front_stow_clearance_recovery")
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
 
 

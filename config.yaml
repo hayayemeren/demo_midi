@@ -148,19 +148,23 @@ case4:
 
   # SO-100 Analytical Inverse Kinematics (IK) Pick Engine
   kinematics:
-    enabled: true               # Enable closed-form 2D/3D planar Inverse Kinematics for picking
-    l1_m: 0.116                 # Upper arm length: shoulder pitch axis to elbow pitch axis (meters)
-    l2_m: 0.135                 # Forearm length: elbow pitch axis to wrist pitch axis (meters)
-    l3_m: 0.135                 # Gripper length: wrist pitch axis to fingertips (meters)
-    ground_clearance_m: 0.018   # Safe elevation above raw floor contact (18mm) to prevent scraping/collision
-    hover_height_m: 0.080       # Pre-grasp hover height above floor (80mm)
-    lift_height_m: 0.120        # Post-grasp vertical lift height above floor (120mm)
-    radial_gain_m: 0.050        # Distance compensation across camera vertical FOV (meters)
-    pan_gain_deg: 25.0          # Azimuthal pan compensation across camera horizontal FOV (degrees)
-    r_near_m: 0.115             # Floor radial distance at bottom of camera ROI (meters)
-    r_far_m: 0.215              # Floor radial distance at top of camera ROI (meters)
-    y_near_px: 330.0            # Pixel Y corresponding to near floor edge
-    y_far_px: 60.0              # Pixel Y corresponding to far floor edge
+    enabled: true               # Enable closed-form SO-100/SO-101 URDF Inverse Kinematics for picking
+    l1_m: 0.1160                # Upper arm length: shoulder pitch axis to elbow pitch axis (meters)
+    l2_m: 0.1350                # Forearm length: elbow pitch axis to wrist pitch axis (meters)
+    l3_m: 0.1594                # Effective gripper length: wrist pitch axis to fingertips (meters)
+    ground_clearance_m: 0.024   # Safe elevation above raw floor contact (24mm -> ~20mm actual clearance with servo droop)
+    hover_height_m: 0.115       # Pre-grasp hover height above floor (115mm) for clean close-up framing
+    lift_height_m: 0.125        # Post-grasp vertical lift height above floor (125mm)
+    radial_gain_m: 0.050        # Legacy fallback distance gain (meters)
+    pan_gain_deg: 60.0          # Azimuthal pan compensation across camera horizontal FOV (degrees)
+    r_near_m: 0.145             # Minimum floor reach from shoulder_pan axis (clears front aluminum bumper)
+    r_far_m: 0.315              # Maximum floor reach from shoulder_pan axis along floor (meters)
+    y_near_px: 330.0            # Fallback pixel Y for near floor edge
+    y_far_px: 60.0              # Fallback pixel Y for far floor edge
+    sock_height_offset_m: 0.015 # Target sock surface elevation above bare floor for ray-plane projection (meters)
+    cam_offset_gf: [-0.0900, -0.0010, -0.1045] # Calibrated wrist camera offset in gripper_frame_link (meters)
+    cam_pitch_deg: -33.01       # Calibrated wrist camera pitch tilt relative to gripper axis (degrees)
+    cam_fx: 531.5               # Calibrated wrist camera focal length (pixels)
 
   # Basket Pose: Chassis-mounted collection basket on the mobile base
   # Located directly behind the gripper centerline and elevated
@@ -197,7 +201,7 @@ case4:
 
   # Visual Servoing Gains
   servoing:
-    pan_gain: 22.0              # max pan angle correction in degrees
+    pan_gain: 60.0              # max pan angle correction across horizontal FOV in degrees
     pan_direction: 1.0          # pan direction multiplier (+1.0: right is positive pan, -1.0: right is negative pan)
     lift_gain: 15.0             # max lift angle correction in degrees
     align_tolerance: 0.12       # normalized centering threshold [-1.0, 1.0]

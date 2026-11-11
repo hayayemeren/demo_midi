@@ -436,68 +436,22 @@ class DemoStateMachine:
             f"\n{COLOR_BOLD}{COLOR_MAGENTA}>>> [CASE 4] EXECUTING 3-POINT FLOOR SCAN SWEEP ({labels_str}) <<<{COLOR_RESET}"
         )
 
-        detected_sock = None
         self.last_detection = None
         self.target_pick_coords = None
-        if self.camera is not None:
-            self.camera.ensure_healthy()
+        best = self.planner.execute_scan_sweep(
+            arm=self.arm,
+            camera=self.camera,
+            detector=self.detector,
+            feedback_cb=lambda _: self.base.hold_lock(),
+            abort_cb=lambda: (not self.running and not self.arm.dry_run) or gp.brake or gp.button_b_held,
+        )
 
-        scan_t = getattr(self.planner, "scan_move_duration_s", 1.5)
-        candidates = []
-
-        for label, scan_target in scan_targets:
-            if (not self.running and not self.arm.dry_run) or gp.brake or gp.button_b_held:
-                break
-
-            pan_val = scan_target.get("shoulder_pan.pos", 0.0)
-            logger.info(f"[SCAN] Moving camera to {label} scan pose (pan: {pan_val:+.1f}°)...")
-            self.arm.move_to_pose(
-                scan_target,
-                duration_s=scan_t,
-                feedback_cb=lambda _: self.base.hold_lock(),
-            )
-            time.sleep(0.25)
-            self.base.hold_lock()
-
-            ok, frame = self.camera.capture_frame()
-            if not ok or frame is None:
-                continue
-
-            det = self.detector.detect(frame, force_save=True)
-            if det.found:
-                score = det.area * (1.0 - 0.4 * abs(det.error_x))
-                logger.info(
-                    f"[SCAN CANDIDATE] Sock found at {label}: Area={det.area:.0f}px, eX={det.error_x:+.2f}, eY={det.error_y:+.2f}, Score={score:.0f}"
-                )
-                candidates.append({
-                    "score": score,
-                    "det": det,
-                    "pan_val": pan_val,
-                    "label": label,
-                    "frame": frame,
-                })
-            else:
-                logger.info(f"[SCAN] No sock detected at {label}. Continuing sweep...")
-
-        if candidates:
-            # Select candidate with highest confidence score (largest centered sock)
-            best = max(candidates, key=lambda c: c["score"])
+        if best is not None:
             best_det = best["det"]
-            best_pan = best["pan_val"]
             best_label = best["label"]
-
-            # Compute and lock 3D floor target coordinates once from best detection
-            r_target, pan_target, roll_target = self.planner.kinematics.compute_sock_target(
-                best_det,
-                scan_pan_deg=best_pan,
-                pan_direction=self.planner.pan_direction,
-            )
+            r_target, pan_target, roll_target = best["coords"]
             self.target_pick_coords = (r_target, pan_target, roll_target)
             self.last_detection = best_det
-
-            # Re-save best frame as canonical debug view
-            if best.get("frame") is not None:
-                self.detector.detect(best["frame"], force_save=True)
 
             logger.info(
                 f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [VISION] BEST SOCK DETECTED AT {best_label.upper()} POSE! <<<{COLOR_RESET}\n"
@@ -553,7 +507,7 @@ class DemoStateMachine:
         self.state = DemoState.AUTONOMOUS_PICK_GRASP
 
     def _handle_autonomous_grasp(self, gp: GamepadState):
-        """Case 4: Opens gripper, executes pre-grasp hover directly above sock, descends to safe floor clearance, clamps sock, and elevates off floor."""
+        """Case 4: Opens gripper, executes pre-grasp hover directly above sock (with visual refinement), descends to safe floor clearance, clamps sock, and elevates off floor."""
         self.base.hold_lock()
 
         if gp.brake or gp.button_b_held:
@@ -593,7 +547,7 @@ class DemoStateMachine:
         open_pose["gripper.pos"] = 85.0
         self.arm.move_to_pose(open_pose, duration_s=0.6, feedback_cb=lambda _: self.base.hold_lock())
 
-        # Stage 2a: Pre-Grasp Hover directly above sock
+        # Stage 2a: Pre-Grasp Hover directly above sock + closed-loop camera refinement
         hover_pose = stages["hover"]
         logger.info(
             f"[GRASP] 2a. Pre-Grasp Hover ~{self.planner.kinematics.hover_height_m*100:.0f}cm above sock: "
@@ -601,6 +555,24 @@ class DemoStateMachine:
             f"lift={hover_pose.get('shoulder_lift.pos', 0.0):.1f}°, elbow={hover_pose.get('elbow_flex.pos', 0.0):.1f}°..."
         )
         self.arm.move_to_pose(hover_pose, duration_s=max(1.0, descend_t * 0.5), feedback_cb=lambda _: self.base.hold_lock())
+
+        r_target, pan_target, roll_target, det_hov = self.planner.refine_target_in_hover(
+            arm=self.arm,
+            camera=self.camera,
+            detector=self.detector,
+            r_target=r_target,
+            pan_target=pan_target,
+            roll_target=roll_target,
+            hover_pose=hover_pose,
+            feedback_cb=lambda _: self.base.hold_lock(),
+        )
+        if det_hov is not None and det_hov.found:
+            self.target_pick_coords = (r_target, pan_target, roll_target)
+            stages = self.planner.kinematics.get_trajectory_stages(
+                r_target=r_target,
+                pan_target=pan_target,
+                roll_target=roll_target,
+            )
 
         # Stage 2b: Smooth vertical descent to safe floor clearance
         descent_pose = stages["descent"]
