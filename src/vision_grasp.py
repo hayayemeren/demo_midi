@@ -452,6 +452,8 @@ class WristCamera:
                 if self.cap.isOpened():
                     try:
                         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("M", "J", "P", "G"))
+                        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+                            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     except Exception:
                         pass
                     self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
@@ -598,7 +600,7 @@ class WristCamera:
 
     def _stream_worker(self):
         """Background thread continuously pulling frames with auto-recovery and live stream updates."""
-        interval = 1.0 / max(1.0, self._target_fps)
+        base_interval = 1.0 / max(1.0, self._target_fps)
         frame_count = 0
         fps_t0 = time.time()
 
@@ -606,6 +608,9 @@ class WristCamera:
             loop_start = time.time()
             frame = None
             ret = False
+            web_active = bool(self._detector is not None and getattr(self._detector, "enable_web_stream", False))
+            # Throttle capture to ~10 FPS when web streaming is disabled to avoid saturating the Pi 4 shared USB 2.0 hub
+            interval = base_interval if web_active else max(base_interval, 0.10)
 
             if self.dry_run:
                 frame = self._generate_synthetic_frame()
@@ -640,7 +645,7 @@ class WristCamera:
                     fps_t0 = now
 
                 # Process detection continuously to update the web debugger in real time only if web stream is enabled
-                if self._detector is not None and getattr(self._detector, "enable_web_stream", False):
+                if web_active:
                     try:
                         self._detector.detect(frame)
                         srv = VisionDebugServer._instance
@@ -775,7 +780,7 @@ class SockDetector:
         enable_web_stream: bool = False,
         web_stream_port: int = 8080,
         roi_top_pct: float = 0.06,
-        roi_bottom_pct: float = 0.74,
+        roi_bottom_pct: float = 0.86,
         roi_left_pct: float = 0.04,
         roi_right_pct: float = 0.96,
     ):
@@ -819,7 +824,7 @@ class SockDetector:
 
         # 1. Define active floor Region of Interest (ROI)
         roi_top = 0.02 if allow_border_touch else self.roi_top_pct
-        roi_bottom = max(self.roi_bottom_pct, 0.82) if allow_border_touch else self.roi_bottom_pct
+        roi_bottom = max(self.roi_bottom_pct, 0.86) if allow_border_touch else self.roi_bottom_pct
         x_min = int(w * self.roi_left_pct)
         x_max = int(w * self.roi_right_pct)
         y_min = int(h * roi_top)
@@ -836,11 +841,10 @@ class SockDetector:
         eff_max_area = float(max_area_override) if max_area_override is not None else float(self.max_area)
 
         # 3. Create foreground candidate mask
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (9, 9), 0)
         diff = None
         if self.mode == "contrast" or self.mode == "auto":
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            blurred = cv2.GaussianBlur(gray, (9, 9), 0)
-
             # Anchor floor median in the lower 70% of ROI so distant dark horizon/furniture
             # in upper frames cannot depress the median and light up the floor itself.
             floor_region = blurred[int(roi_h * 0.30):, :] if roi_h >= 20 else blurred
@@ -858,6 +862,16 @@ class SockDetector:
 
         # Exclude cyan gripper areas
         thresh = cv2.bitwise_and(thresh, cv2.bitwise_not(cyan_mask))
+
+        # Mask out bright/metallic robot chassis front bar in bottom-center between gripper jaws during scan
+        if not allow_border_touch:
+            y_bumper = max(0, int(h * 0.74) - y_min)
+            x_b1 = max(0, int(w * 0.25) - x_min)
+            x_b2 = min(roi_w, int(w * 0.75) - x_min)
+            if y_bumper < roi_h and x_b2 > x_b1:
+                bumper_sub = thresh[y_bumper:, x_b1:x_b2]
+                gray_sub = blurred[y_bumper:, x_b1:x_b2]
+                bumper_sub[gray_sub > 65] = 0
 
         # Morphological filtering to clean noise and bridge cloth folds
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -877,6 +891,21 @@ class SockDetector:
             area = cv2.contourArea(cnt)
             if self.min_area <= area <= eff_max_area:
                 bx, by, bw, bh = cv2.boundingRect(cnt)
+                aspect = float(bw) / max(1, bh)
+                extent = area / float(max(1, bw * bh))
+
+                # Measure local contrast and intensity so faint floor shadows/glare cannot beat real cloth
+                contrast_weight = 1.0
+                mean_diff = eff_contrast
+                mean_gray = 100.0
+                patch_mask = np.zeros((bh, bw), dtype=np.uint8)
+                cv2.drawContours(patch_mask, [cnt - np.array([bx, by])], -1, 255, -1)
+                mean_gray = float(cv2.mean(blurred[by:by + bh, bx:bx + bw], mask=patch_mask)[0])
+                if diff is not None:
+                    mean_diff = float(cv2.mean(diff[by:by + bh, bx:bx + bw], mask=patch_mask)[0])
+                    if allow_border_touch and mean_diff < max(eff_contrast, 50.0):
+                        continue
+                    contrast_weight = max(1.0, mean_diff / 40.0) ** 1.3
 
                 touches_border = (
                     bx <= self.border_margin
@@ -884,35 +913,40 @@ class SockDetector:
                     or (bx + bw) >= (roi_w - self.border_margin)
                     or (by + bh) >= (roi_h - self.border_margin)
                 )
-                # RULE A: Discard contours touching the ROI boundary during normal scan,
+                # Allow a border-touching contour during scan ONLY if it is a strongly contrasting,
+                # compact dark sock (e.g. near the bottom-left/right of Left/Right scan views)
+                is_strong_border_sock = (
+                    not allow_border_touch
+                    and area >= 2500.0
+                    and extent >= 0.52
+                    and mean_diff >= 90.0
+                    and mean_gray < 48.0
+                    and not (by <= self.border_margin and bw > (0.50 * roi_w))
+                )
+                # RULE A: Discard contours touching the ROI boundary during normal scan (unless strong sock),
                 # or tiny vignette slivers in close-up hover mode
-                if touches_border and (not allow_border_touch or area < 2500.0):
+                if touches_border and ((not allow_border_touch and not is_strong_border_sock) or area < 2500.0):
                     continue
 
                 # RULE A2: Discard wide top-edge horizon / room-background contours spanning
-                # across the frame top or nearly full ROI width
-                if (by <= self.border_margin and bw > (0.68 * roi_w)) or bw > (0.80 * roi_w):
+                # across the frame top or nearly full ROI width, unless in close-up hover directly over a compact dark sock
+                is_closeup_hover_sock = (
+                    allow_border_touch
+                    and extent >= 0.55
+                    and mean_diff >= 115.0
+                    and mean_gray < 35.0
+                    and aspect < 2.5
+                )
+                if ((by <= self.border_margin and bw > (0.68 * roi_w)) or bw > (0.80 * roi_w)) and not is_closeup_hover_sock:
                     continue
 
                 # RULE B: Discard abnormal aspect ratios (thin vertical/horizontal edge shadows or scratches)
-                aspect = float(bw) / max(1, bh)
                 if aspect < 0.25 or aspect > 4.0:
                     continue
 
-                # RULE C: Discard non-compact contours (stringy noise or floor seams)
-                extent = area / float(max(1, bw * bh))
+                # RULE C: Discard non-compact contours (stringy noise, cables, or floor seams)
                 if extent < 0.25:
                     continue
-
-                # Measure local contrast strength so faint floor shadows cannot beat real cloth
-                contrast_weight = 1.0
-                if diff is not None:
-                    patch_mask = np.zeros((bh, bw), dtype=np.uint8)
-                    cv2.drawContours(patch_mask, [cnt - np.array([bx, by])], -1, 255, -1)
-                    mean_diff = float(cv2.mean(diff[by:by + bh, bx:bx + bw], mask=patch_mask)[0])
-                    if allow_border_touch and mean_diff < max(eff_contrast, 50.0):
-                        continue
-                    contrast_weight = max(1.0, mean_diff / 40.0) ** 1.3
 
                 # Find centroid using image moments
                 M = cv2.moments(cnt)
@@ -1071,7 +1105,7 @@ class VisionGraspPlanner:
         self.pan_gain = float(serv.get("pan_gain", 60.0))
         self.lift_gain = float(serv.get("lift_gain", 15.0))
         self.align_tolerance = float(serv.get("align_tolerance", 0.12))
-        self.grasp_verification_threshold = float(c4.get("grasp_verification_threshold_pct", 5.8))
+        self.grasp_verification_threshold = float(c4.get("grasp_verification_threshold_pct", 4.8))
         self.abort_on_miss = bool(c4.get("abort_on_miss", False))
         self.scan_sweep_angles = c4.get("scan_sweep_angles", [0.0, -28.0, 28.0])
 
@@ -1114,8 +1148,8 @@ class VisionGraspPlanner:
             "shoulder_pan.pos": -3.3,
             "shoulder_lift.pos": -36.4,
             "elbow_flex.pos": -80.4,
-            "wrist_flex.pos": -101.5,
-            "wrist_roll.pos": -179.1,
+            "wrist_flex.pos": -95.0,
+            "wrist_roll.pos": 0.0,
             "gripper.pos": 85.0,
         })
         # Calibrated floor reach to grasp sock from floor below the mobile base
@@ -1132,14 +1166,15 @@ class VisionGraspPlanner:
         kin_cfg = c4.get("kinematics", {})
         cam_cfg = c4.get("camera", {})
         self.use_ik = bool(kin_cfg.get("enabled", True))
-        cam_offset = tuple(kin_cfg.get("cam_offset_gf", (-0.0900, -0.0010, -0.1045)))
+        cam_offset = tuple(kin_cfg.get("cam_offset_gf", (-0.0700, 0.0110, -0.1260)))
         cam_w = float(cam_cfg.get("width", 640))
         cam_h = float(cam_cfg.get("height", 480))
+        raw_base_h = kin_cfg.get("base_height_m", None)
         self.kinematics = SO100Kinematics(
             l1_m=float(kin_cfg.get("l1_m", 0.1160)),
             l2_m=float(kin_cfg.get("l2_m", 0.1350)),
             l3_m=float(kin_cfg.get("l3_m", 0.1594)),
-            ground_clearance_m=float(kin_cfg.get("ground_clearance_m", 0.024)),
+            ground_clearance_m=float(kin_cfg.get("ground_clearance_m", 0.016 if raw_base_h is not None else 0.024)),
             hover_height_m=float(kin_cfg.get("hover_height_m", 0.115)),
             lift_height_m=float(kin_cfg.get("lift_height_m", 0.125)),
             radial_gain_m=float(kin_cfg.get("radial_gain_m", 0.050)),
@@ -1151,12 +1186,13 @@ class VisionGraspPlanner:
             floor_grasp_pose=self.floor_grasp_pose,
             scan_pose=self.scan_pose,
             cam_offset_gf=cam_offset,
-            cam_pitch_deg=float(kin_cfg.get("cam_pitch_deg", -33.01)),
-            cam_fx=float(kin_cfg.get("cam_fx", 531.5)),
-            cam_fy=float(kin_cfg.get("cam_fy", kin_cfg.get("cam_fx", 531.5))),
+            cam_pitch_deg=float(kin_cfg.get("cam_pitch_deg", -30.0)),
+            cam_fx=float(kin_cfg.get("cam_fx", 457.6)),
+            cam_fy=float(kin_cfg.get("cam_fy", kin_cfg.get("cam_fx", 457.6))),
             cam_cx=float(kin_cfg.get("cam_cx", cam_w / 2.0)),
             cam_cy=float(kin_cfg.get("cam_cy", cam_h / 2.0)),
             sock_height_offset_m=float(kin_cfg.get("sock_height_offset_m", 0.015)),
+            base_height_m=float(raw_base_h) if raw_base_h is not None else None,
         )
 
         # Motion timing (seconds) - Slow and gentle for stability
@@ -1355,8 +1391,8 @@ class VisionGraspPlanner:
         """Verify if sock is caught between jaws while elevated off floor.
         
         When elevated:
-        - If empty, jaws close fully to < 8%.
-        - If holding cloth, jaws are blocked at >= 12%.
+        - If empty, jaws close fully to ~4.5%.
+        - If holding cloth, jaws are blocked at >= 4.8%.
         """
         return measured_gripper_pct >= self.grasp_verification_threshold
 
@@ -1474,6 +1510,21 @@ class VisionGraspPlanner:
         if not det_hov.found:
             return r_target, pan_target, roll_target, det_hov
 
+        # If the close-up sock contour fills a large portion of the hover frame or is clipped by the top/side
+        # ROI boundary (which happens when the gripper is already hovering directly over the sock at 9cm),
+        # keep the unclipped 3D target computed from the full-view scan pose.
+        h_img, w_img = h_frame.shape[:2]
+        bx, by, bw, bh = det_hov.bbox
+        margin_top = int(h_img * 0.02) + getattr(detector, "border_margin", 4)
+        margin_left = int(w_img * getattr(detector, "roi_left_pct", 0.04)) + getattr(detector, "border_margin", 4)
+        margin_right = int(w_img * getattr(detector, "roi_right_pct", 0.96)) - getattr(detector, "border_margin", 4)
+        if det_hov.area > 35000.0 or by <= margin_top or bx <= margin_left or (bx + bw) >= margin_right:
+            logger.info(
+                "[HOVER REFINE] Sock confirmed directly beneath gripper (area=%.0fpx); keeping unclipped scan target R=%.1fcm, Pan=%+.1f°",
+                det_hov.area, r_target * 100.0, pan_target,
+            )
+            return r_target, pan_target, roll_target, det_hov
+
         r_new, pan_new, _ = self.kinematics.compute_sock_target(
             det_hov,
             scan_pan_deg=meas_hover.get("shoulder_pan.pos", pan_target),
@@ -1482,7 +1533,7 @@ class VisionGraspPlanner:
         )
 
         # Reject noisy outliers far away from scan lock
-        if abs(r_new - r_target) <= 0.10 and abs(pan_new - pan_target) <= 22.0:
+        if abs(r_new - r_target) <= 0.06 and abs(pan_new - pan_target) <= 15.0:
             if abs(r_new - r_target) > 0.012 or abs(pan_new - pan_target) > 2.5:
                 logger.info(
                     "[HOVER REFINE] Adjusting target: R %.1f->%.1fcm, Pan %+.1f->%+.1f°",

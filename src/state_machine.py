@@ -117,7 +117,7 @@ class DemoStateMachine:
                 contrast_threshold=float(det_cfg.get("contrast_threshold", 35.0)),
                 border_margin=int(det_cfg.get("border_margin", 4)),
                 roi_top_pct=float(det_cfg.get("roi_top_pct", 0.06)),
-                roi_bottom_pct=float(det_cfg.get("roi_bottom_pct", 0.74)),
+                roi_bottom_pct=float(det_cfg.get("roi_bottom_pct", 0.86)),
                 roi_left_pct=float(det_cfg.get("roi_left_pct", 0.04)),
                 roi_right_pct=float(det_cfg.get("roi_right_pct", 0.96)),
                 save_debug_image=bool(det_cfg.get("save_debug_image", True)),
@@ -133,6 +133,7 @@ class DemoStateMachine:
     def start(self):
         """Initial check and launch of the control loop."""
         self.running = True
+        self._stopped = False
         logger.info("Initializing Demonstration State Machine for Case %d...", self.demo_case)
 
         # 1. Start Follower at stow pose
@@ -226,6 +227,11 @@ class DemoStateMachine:
             # 1. Lock base immediately
             self.base.lock_brakes()
 
+            # 2. Connect Follower Arm on demand if not yet connected
+            if not self.arm.is_follower_connected():
+                logger.info("\n[ARM] Connecting LeRobot Follower Arm...")
+                self.arm.connect_follower()
+
             # Case 1: Switch to Leader Arm Teleoperation
             if self.demo_case == 1:
                 logger.info("\n[SWITCH] Button [Y] pressed -> Switching to LEADER ARM TELEOPERATION!")
@@ -261,12 +267,16 @@ class DemoStateMachine:
                 self.align_iterations = 0
                 if self.camera is not None:
                     self.camera.ensure_healthy()
+                    self.camera.start_stream(detector=self.detector)
                 self.state = DemoState.AUTONOMOUS_PICK_SCAN
             return
 
         # Case 4 shortcut: Button X triggers manual direct basket dump macro
         if self.demo_case == 4 and gp.button_x_pressed:
             self.base.lock_brakes()
+            if not self.arm.is_follower_connected():
+                logger.info("\n[ARM] Connecting LeRobot Follower Arm...")
+                self.arm.connect_follower()
             logger.info("\n[CASE 4] Button [X] pressed -> Initiating Direct Basket Deposit macro!")
             self.state = DemoState.AUTONOMOUS_BASKET_DUMP
             return
@@ -664,13 +674,13 @@ class DemoStateMachine:
             duration_s=stow_t,
             feedback_cb=lambda _: self.base.hold_lock(),
         )
-        self.base.release_brakes()
         self.last_detection = None
         self.target_pick_coords = None
         self.align_iterations = 0
         self.scan_retries = 0
         if self.camera is not None:
             self.camera.ensure_healthy()
+        self.base.release_brakes()
         logger.info(
             f"\n{COLOR_BOLD}{COLOR_CYAN}>>> BASE DRIVE ACTIVE! Mobile base is ready to drive! <<<{COLOR_RESET}\n"
         )
@@ -696,16 +706,17 @@ class DemoStateMachine:
         conn_tag = f"{COLOR_GREEN}GP:OK{COLOR_RESET}" if gp.connected else f"{COLOR_RED}GP:DISC{COLOR_RESET}"
         leader_tag = f"{COLOR_GREEN}LDR:OK{COLOR_RESET}" if self.arm.is_leader_connected() else f"{COLOR_YELLOW}LDR:--{COLOR_RESET}"
 
+        cached_pose = getattr(self.arm, "last_known_follower_pose", None) or self.arm.stow_pose
         if self.state == DemoState.BASE_DRIVE:
             info = f"Cmd: L={int(self.base.cur_left_rpm):+4d} R={int(self.base.cur_right_rpm):+4d} RPM | Gear: {gp.speed_rpm:.0f} RPM"
         elif self.state == DemoState.ARM_TELEOP_LEADER:
-            f_pose = self.arm.get_follower_pose()
+            f_pose = cached_pose
             pan = f_pose.get("shoulder_pan.pos", 0.0)
             lift = f_pose.get("shoulder_lift.pos", 0.0)
             grip = f_pose.get("gripper.pos", 0.0)
             info = f"Leader Mirror | Pan:{pan:+5.1f}° Lift:{lift:+5.1f}° Grip:{grip:4.1f}% | Base: LOCKED"
         elif self.state == DemoState.ARM_TELEOP_GAMEPAD:
-            f_pose = self.arm.get_follower_pose()
+            f_pose = getattr(self.arm, "current_gamepad_target", None) or cached_pose
             pan = f_pose.get("shoulder_pan.pos", 0.0)
             lift = f_pose.get("shoulder_lift.pos", 0.0)
             elbow = f_pose.get("elbow_flex.pos", 0.0)
@@ -717,7 +728,7 @@ class DemoStateMachine:
             if self._net_mode == "base":
                 info = f"Net Base | Cmd: L={int(self.base.cur_left_rpm):+4d} R={int(self.base.cur_right_rpm):+4d} RPM"
             else:
-                f_pose = self.arm.get_follower_pose()
+                f_pose = cached_pose
                 pan = f_pose.get("shoulder_pan.pos", 0.0)
                 lift = f_pose.get("shoulder_lift.pos", 0.0)
                 info = f"Net Arm  | Pan:{pan:+5.1f}° Lift:{lift:+5.1f}° | Base: LOCKED"
@@ -728,7 +739,7 @@ class DemoStateMachine:
             DemoState.AUTONOMOUS_PICK_VERIFY,
             DemoState.AUTONOMOUS_BASKET_DUMP,
         ):
-            f_pose = self.arm.get_follower_pose()
+            f_pose = cached_pose
             grip = f_pose.get("gripper.pos", 0.0)
             det_str = f"SOCK@({self.last_detection.cx:.0f},{self.last_detection.cy:.0f})" if (self.last_detection and self.last_detection.found) else "SEARCHING"
             info = f"Auton: {det_str} | Grip:{grip:3.0f}% | Base: LOCKED"
@@ -746,6 +757,9 @@ class DemoStateMachine:
 
     def stop(self):
         """Safely bring everything to a stop."""
+        if getattr(self, "_stopped", False):
+            return
+        self._stopped = True
         self.running = False
         print("\n\nShutting down demonstration...")
         if self.server:
@@ -758,11 +772,12 @@ class DemoStateMachine:
                 self.camera.release()
             except Exception:
                 pass
-        try:
-            self.arm.move_to_stow(duration_s=1.0)
-        except Exception:
-            pass
-        self.arm.disconnect()
+        if self.arm.dry_run or self.arm.follower is not None or self.arm.leader is not None:
+            try:
+                self.arm.move_to_stow(duration_s=1.0)
+            except Exception:
+                pass
+            self.arm.disconnect()
         self.base.stop()
         self.gamepad.close()
         print("Demo shut down cleanly.")

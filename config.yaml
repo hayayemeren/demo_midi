@@ -21,7 +21,7 @@ serial:
   port: "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BH002HMM-if00-port0"
   fallback_port: "/dev/ttyUSB0"
   baudrate: 115200
-  timeout: 0.012
+  timeout: 0.015
 
 # DDSM Motors Configuration
 motors:
@@ -36,7 +36,7 @@ robot:
   turn_ratio: 0.65              # Pivot turn speed ratio
   turn_dir: 1                   # Turn direction multiplier
   accel_rate: 1500.0            # Acceleration in RPM/s (smooth takeoff)
-  decel_rate: 1000.0            # Deceleration in RPM/s on releasing stick
+  decel_rate: 1200.0            # Deceleration in RPM/s on releasing stick
   brake_rate: 3000.0            # Emergency brake rate in RPM/s
   wheel_radius: 0.0575          # meters (115mm diameter / 2)
   wheel_base: 0.350             # meters (track width)
@@ -44,7 +44,7 @@ robot:
 # Logitech F710 Wireless Gamepad (evdev)
 gamepad:
   device_path: null             # null = auto-detect (/dev/input/by-id/*F710*)
-  deadzone: 0.10                # Analog stick center deadzone
+  deadzone: 0.10                # Analog stick center deadzone (prevents drift)
   speed_levels: [50.0, 100.0, 150.0, 200.0]  # RPM levels (LB = speed up, RB = speed down)
   default_speed_level: 1        # Starting index (Level 2 = 100 RPM)
   switch_button: "Y"            # Button to toggle modes ("Y", "X", "A", "BACK")
@@ -103,36 +103,36 @@ case4:
 
   # Observation / Scan Pose: Wrist camera looks down at floor in front of base
   scan_pose:
-    shoulder_pan.pos: -7.1
-    shoulder_lift.pos: -63.7
-    elbow_flex.pos: 17.3
+    shoulder_pan.pos: -1.5
+    shoulder_lift.pos: -84.6
+    elbow_flex.pos: 20.0
     wrist_flex.pos: 96.0
-    wrist_roll.pos: 1.5
-    gripper.pos: 5.0
+    wrist_roll.pos: 3.1
+    gripper.pos: 5.1
 
   # 3-Point Calibrated Floor Scan Poses (Middle, Left, Right)
   scan_poses:
     center:
-      shoulder_pan.pos: -7.1
-      shoulder_lift.pos: -63.7
-      elbow_flex.pos: 17.3
+      shoulder_pan.pos: -1.5
+      shoulder_lift.pos: -84.6
+      elbow_flex.pos: 20.0
       wrist_flex.pos: 96.0
-      wrist_roll.pos: 1.5
-      gripper.pos: 5.0
+      wrist_roll.pos: 3.1
+      gripper.pos: 5.1
     left:
-      shoulder_pan.pos: -67.3
-      shoulder_lift.pos: -68.9
-      elbow_flex.pos: 17.3
+      shoulder_pan.pos: -73.1
+      shoulder_lift.pos: -84.6
+      elbow_flex.pos: 20.0
       wrist_flex.pos: 96.0
-      wrist_roll.pos: 1.5
-      gripper.pos: 5.0
+      wrist_roll.pos: 3.1
+      gripper.pos: 5.1
     right:
-      shoulder_pan.pos: 65.1
-      shoulder_lift.pos: -68.9
-      elbow_flex.pos: 17.3
+      shoulder_pan.pos: 66.3
+      shoulder_lift.pos: -84.6
+      elbow_flex.pos: 20.0
       wrist_flex.pos: 96.0
-      wrist_roll.pos: 1.5
-      gripper.pos: 5.0
+      wrist_roll.pos: 3.1
+      gripper.pos: 5.1
 
   # Multi-angle floor search sweep (shoulder_pan angles in degrees fallback)
   scan_sweep_angles: [0.0, -28.0, 28.0]
@@ -149,10 +149,11 @@ case4:
   # SO-100 Analytical Inverse Kinematics (IK) Pick Engine
   kinematics:
     enabled: true               # Enable closed-form SO-100/SO-101 URDF Inverse Kinematics for picking
+    base_height_m: 0.155        # Height of SO-100 base_link above floor=0 (15.5cm -> z_floor = -0.155m)
     l1_m: 0.1160                # Upper arm length: shoulder pitch axis to elbow pitch axis (meters)
     l2_m: 0.1350                # Forearm length: elbow pitch axis to wrist pitch axis (meters)
     l3_m: 0.1594                # Effective gripper length: wrist pitch axis to fingertips (meters)
-    ground_clearance_m: 0.024   # Safe elevation above raw floor contact (24mm -> ~20mm actual clearance with servo droop)
+    ground_clearance_m: 0.01   # Safe elevation above floor=0 (-0.155m + 0.016m = -0.139m descent height)
     hover_height_m: 0.090       # Pre-grasp hover height above floor (90mm) to keep horizon out of hover frame
     lift_height_m: 0.125        # Post-grasp vertical lift height above floor (125mm)
     radial_gain_m: 0.050        # Legacy fallback distance gain (meters)
@@ -162,22 +163,21 @@ case4:
     y_near_px: 330.0            # Fallback pixel Y for near floor edge
     y_far_px: 60.0              # Fallback pixel Y for far floor edge
     sock_height_offset_m: 0.015 # Target sock surface elevation above bare floor for ray-plane projection (meters)
-    cam_offset_gf: [-0.0900, -0.0010, -0.1045] # Calibrated wrist camera offset in gripper_frame_link (meters)
-    cam_pitch_deg: -33.01       # Calibrated wrist camera pitch tilt relative to gripper axis (degrees)
-    cam_fx: 531.5               # Calibrated wrist camera focal length (pixels)
+    cam_offset_gf: [-0.0700, 0.0110, -0.1260] # Multi-view calibrated wrist camera offset in gripper_frame_link (meters)
+    cam_pitch_deg: -30.0        # Multi-view calibrated wrist camera pitch tilt relative to gripper axis (degrees)
+    cam_fx: 457.6               # Multi-view calibrated wrist camera focal length (pixels)
 
   # Basket Pose: Chassis-mounted collection basket on the mobile base
   # Located directly behind the gripper centerline and elevated
   basket_pose:
-    shoulder_pan.pos: -3.3
-    shoulder_lift.pos: -36.4
-    elbow_flex.pos: -80.4
-    wrist_flex.pos: -101.5
-    wrist_roll.pos: -179.1
-    gripper.pos: 85.0
-  # Suggestion 2: Tactile / Position grasp verification threshold (%)
-  # Empty jaws close to ~5.2%; trapped cloth holds jaws >= 5.8%
-  grasp_verification_threshold_pct: 5.8
+    shoulder_pan.pos: -0.6
+    shoulder_lift.pos: -30.3
+    elbow_flex.pos: -92.0
+    wrist_flex.pos: -96.0
+    wrist_roll.pos: -175.0
+    gripper.pos: 85.0  # Suggestion 2: Tactile / Position grasp verification threshold (%)
+  # Empty jaws close to ~4.5%; trapped cloth holds jaws >= 4.8%
+  grasp_verification_threshold_pct: 4.8
   abort_on_miss: false         # If false, always proceeds to basket without dropping on floor
 
   # Vision Detection Settings
@@ -188,7 +188,7 @@ case4:
     contrast_threshold: 35.0    # threshold against median floor background (rejects floor seams diff ~26)
     border_margin: 4            # pixels from ROI edge to reject border vignetting
     roi_top_pct: 0.06           # Active floor ROI top margin
-    roi_bottom_pct: 0.74        # Active floor ROI bottom margin
+    roi_bottom_pct: 0.86        # Active floor ROI bottom margin (expanded for Left/Right/Near floor coverage)
     roi_left_pct: 0.04          # Active floor ROI left margin (expanded for wide sock coverage)
     roi_right_pct: 0.96         # Active floor ROI right margin
     save_debug_image: true      # save annotated frame for live operator inspection

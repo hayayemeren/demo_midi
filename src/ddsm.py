@@ -107,7 +107,7 @@ class DDSMDriver:
         self,
         port: str = "/dev/ttyUSB0",
         baudrate: int = 115200,
-        timeout: float = 0.02,
+        timeout: float = 0.015,
         dry_run: bool = False,
         motor_type: str = "ddsm115",
     ):
@@ -119,7 +119,7 @@ class DDSMDriver:
         self.speed_scale = 0.1 if "210" in self.motor_type else 1.0
 
         self.serial = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.latest_feedback: Dict[int, MotorFeedback] = {}
 
     def connect(self) -> bool:

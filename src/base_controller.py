@@ -30,7 +30,7 @@ class BaseController:
         self.driver = DDSMDriver(
             port=serial_cfg.get("port", "/dev/ttyUSB0"),
             baudrate=int(serial_cfg.get("baudrate", 115200)),
-            timeout=float(serial_cfg.get("timeout", 0.02)),
+            timeout=float(serial_cfg.get("timeout", 0.015)),
             dry_run=self.dry_run,
             motor_type=motors_cfg.get("type", "ddsm115"),
         )
@@ -39,7 +39,7 @@ class BaseController:
         self.turn_ratio = float(robot_cfg.get("turn_ratio", 0.65))
         self.turn_dir = int(robot_cfg.get("turn_dir", -1))
         self.accel_rate = float(robot_cfg.get("accel_rate", 1500.0))    # RPM / s
-        self.decel_rate = float(robot_cfg.get("decel_rate", 1000.0))   # RPM / s on release
+        self.decel_rate = float(robot_cfg.get("decel_rate", 1200.0))   # RPM / s on release
         self.brake_rate = float(robot_cfg.get("brake_rate", 3000.0))   # RPM / s on brake
 
         self.cur_left_rpm = 0.0
@@ -93,6 +93,12 @@ class BaseController:
 
         self.cur_left_rpm = slew(self.cur_left_rpm, target_l, self.accel_rate, dec, dt)
         self.cur_right_rpm = slew(self.cur_right_rpm, target_r, self.accel_rate, dec, dt)
+
+        # Snap tiny residual RPM to exact 0.0 when target is 0.0 so wheels never creep
+        if target_l == 0.0 and abs(self.cur_left_rpm) < 0.5:
+            self.cur_left_rpm = 0.0
+        if target_r == 0.0 and abs(self.cur_right_rpm) < 0.5:
+            self.cur_right_rpm = 0.0
 
         self.last_fb_l = self.driver.set_velocity(
             self.left_id,

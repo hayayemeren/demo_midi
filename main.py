@@ -267,6 +267,24 @@ def update_config_grasp_pose(config_path: str, pose: dict) -> bool:
                 logging.error("Failed to update config.yaml: %s", e)
                 return False
 
+    # Also update ground_clearance_m so IK descends to the exact taught height above z_floor (-0.155m)
+    try:
+        from src.kinematics import SO100Kinematics
+        cfg_parsed = yaml.safe_load(new_content) or {}
+        kin_cfg = cfg_parsed.get("case4", {}).get("kinematics", {})
+        base_h = float(kin_cfg.get("base_height_m", 0.155))
+        kin = SO100Kinematics(base_height_m=base_h)
+        _, z_taught, _ = kin.forward_kinematics(s_lift, e_flex, w_flex)
+        new_clearance = max(-0.015, min(0.060, z_taught - (-abs(base_h))))
+        new_content = re.sub(
+            r"(ground_clearance_m:\s*)-?[0-9.]+",
+            f"\\g<1>{new_clearance:.3f}",
+            new_content,
+            count=1,
+        )
+    except Exception as e:
+        logging.debug("Could not auto-compute ground_clearance_m from taught pose: %s", e)
+
     with open(config_path, "w", encoding="utf-8") as f:
         f.write(new_content)
     return True
@@ -541,7 +559,7 @@ def teach_scan(config_path: str, dry_run: bool = False):
             contrast_threshold=float(det_cfg.get("contrast_threshold", 35.0)),
             border_margin=int(det_cfg.get("border_margin", 4)),
             roi_top_pct=float(det_cfg.get("roi_top_pct", 0.06)),
-            roi_bottom_pct=float(det_cfg.get("roi_bottom_pct", 0.74)),
+            roi_bottom_pct=float(det_cfg.get("roi_bottom_pct", 0.86)),
             roi_left_pct=float(det_cfg.get("roi_left_pct", 0.04)),
             roi_right_pct=float(det_cfg.get("roi_right_pct", 0.96)),
             enable_web_stream=True,
@@ -670,7 +688,7 @@ def test_pick(config_path: str, dry_run: bool = False):
             contrast_threshold=float(det_cfg.get("contrast_threshold", 35.0)),
             border_margin=int(det_cfg.get("border_margin", 4)),
             roi_top_pct=float(det_cfg.get("roi_top_pct", 0.06)),
-            roi_bottom_pct=float(det_cfg.get("roi_bottom_pct", 0.74)),
+            roi_bottom_pct=float(det_cfg.get("roi_bottom_pct", 0.86)),
             roi_left_pct=float(det_cfg.get("roi_left_pct", 0.04)),
             roi_right_pct=float(det_cfg.get("roi_right_pct", 0.96)),
             enable_web_stream=True,
@@ -930,8 +948,7 @@ def main():
 
     def handle_signal(sig, frame):
         print(f"\nCaught signal {sig}. Stopping demo...")
-        sm.stop()
-        sys.exit(0)
+        sm.running = False
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)

@@ -101,6 +101,9 @@ class ArmController:
         self.leader = None
         self.sim_follower_pose: Dict[str, float] = dict(self.stow_pose)
         self.sim_leader_pose: Dict[str, float] = dict(self.stow_pose)
+        self.last_known_follower_pose: Dict[str, float] = dict(self.stow_pose)
+        self._last_sent_gamepad_pose: Optional[Dict[str, float]] = None
+        self._last_gamepad_tx_time: float = 0.0
 
     def is_follower_port_available(self) -> bool:
         """Check if follower serial device exists."""
@@ -118,6 +121,9 @@ class ArmController:
         """Connect to the Follower robot arm."""
         if self.dry_run:
             logger.info("[DRY RUN] Follower Arm initialized in simulation.")
+            return True
+
+        if self.is_follower_connected():
             return True
 
         if not self.is_follower_port_available():
@@ -139,6 +145,14 @@ class ArmController:
             logger.error("Failed to connect Follower Arm: %s", e)
             self.follower = None
             return False
+
+    def is_follower_connected(self) -> bool:
+        """Return True if follower is active and connected."""
+        if self.dry_run:
+            return True
+        if self.follower is None or not getattr(self.follower, "is_connected", True):
+            return False
+        return True
 
     def connect_leader(self) -> bool:
         """Connect to the Leader teleoperator arm."""
@@ -177,6 +191,7 @@ class ArmController:
     def get_follower_pose(self) -> Dict[str, float]:
         """Read current Follower joint angles."""
         if self.dry_run or self.follower is None:
+            self.last_known_follower_pose = dict(self.sim_follower_pose)
             return dict(self.sim_follower_pose)
 
         try:
@@ -185,10 +200,11 @@ class ArmController:
             for k, v in obs.items():
                 if not hasattr(v, "shape"):  # filter out camera images if any
                     pose[k] = float(v)
+            self.last_known_follower_pose = dict(pose)
             return pose
         except Exception as e:
             logger.warning("Error reading follower pose: %s", e)
-            return dict(self.sim_follower_pose)
+            return dict(self.last_known_follower_pose)
 
     def get_leader_pose(self) -> Dict[str, float]:
         """Read current Leader joint angles, applying joint inversions if configured."""
@@ -224,6 +240,7 @@ class ArmController:
     def send_follower_action(self, action: Dict[str, float]):
         """Send joint position command to Follower arm, clamped to safe hardware limits."""
         clamped = self.clamp_to_joint_limits(action)
+        self.last_known_follower_pose.update(clamped)
         if self.dry_run or self.follower is None:
             self.sim_follower_pose.update(clamped)
             return
@@ -246,7 +263,8 @@ class ArmController:
         effective_dt = min(step_dt, 0.01) if self.dry_run else step_dt
         t0 = time.time()
         while True:
-            elapsed = time.time() - t0
+            step_start = time.time()
+            elapsed = step_start - t0
             progress = min(1.0, elapsed / max(0.001, effective_duration))
             cmd_pose = cosine_interpolate(start_pose, target_pose, progress)
             self.send_follower_action(cmd_pose)
@@ -256,7 +274,9 @@ class ArmController:
 
             if progress >= 1.0:
                 break
-            time.sleep(effective_dt)
+            rest = effective_dt - (time.time() - step_start)
+            if rest > 0:
+                time.sleep(rest)
 
     def move_to_stow(self, duration_s: Optional[float] = None, feedback_cb = None):
         """Smoothly park the follower arm into the safe stowed travel pose.
@@ -333,6 +353,7 @@ class ArmController:
             k: cur.get(k, self.stow_pose.get(k, 0.0))
             for k in self.stow_pose
         }
+        self._last_sent_gamepad_pose = None
         logger.info("[ARM] Gamepad teleop initialized at: %s",
                     {k: round(v, 1) for k, v in self.current_gamepad_target.items()})
 
@@ -343,6 +364,7 @@ class ArmController:
         logger.info("[ARM] Moving Follower to Ready Pose over %.1fs...", duration)
         self.smooth_trajectory(start_pose, self.ready_pose, duration, feedback_cb=feedback_cb)
         self.current_gamepad_target = dict(self.ready_pose)
+        self._last_sent_gamepad_pose = dict(self.ready_pose)
         logger.info("[ARM] Follower is ready for manipulation.")
 
     def move_to_pose(
@@ -373,7 +395,11 @@ class ArmController:
           - LB (held): Open Gripper
           - Button A: Toggle Gripper (Open <-> Close)
           - Button X: Move to Ready Pose
+          - Button B: Emergency Freeze
         """
+        if not getattr(gp, "connected", True) or getattr(gp, "brake", False) or getattr(gp, "button_b_held", False):
+            return dict(self.current_gamepad_target)
+
         # 1. Preset shortcut: Button X moves to Ready Pose
         if gp.button_x_pressed:
             logger.info("[ARM] Button [X] pressed -> Moving to Ready Pose...")
@@ -424,8 +450,16 @@ class ArmController:
                     j_min, min(j_max, self.current_gamepad_target[joint])
                 )
 
-        # 8. Command follower arm
-        self.send_follower_action(self.current_gamepad_target)
+        # 8. Command follower arm (skip redundant 50Hz serial writes when target hasn't changed)
+        now = time.time()
+        changed = (
+            self._last_sent_gamepad_pose is None
+            or any(abs(self.current_gamepad_target.get(k, 0.0) - self._last_sent_gamepad_pose.get(k, 0.0)) > 1e-3 for k in self.current_gamepad_target)
+        )
+        if self.dry_run or changed or (now - self._last_gamepad_tx_time >= 0.15):
+            self.send_follower_action(self.current_gamepad_target)
+            self._last_sent_gamepad_pose = dict(self.current_gamepad_target)
+            self._last_gamepad_tx_time = now
         return dict(self.current_gamepad_target)
 
     def disconnect(self):

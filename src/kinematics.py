@@ -86,13 +86,14 @@ class SO100Kinematics:
         y_far_px: float = 60.0,
         floor_grasp_pose: Optional[Dict[str, float]] = None,
         scan_pose: Optional[Dict[str, float]] = None,
-        cam_offset_gf: Tuple[float, float, float] = (-0.0900, -0.0010, -0.1045),
-        cam_pitch_deg: float = -33.01,
-        cam_fx: float = 531.5,
+        cam_offset_gf: Tuple[float, float, float] = (-0.0700, 0.0110, -0.1260),
+        cam_pitch_deg: float = -30.0,
+        cam_fx: float = 457.6,
         cam_fy: Optional[float] = None,
         cam_cx: float = 320.0,
         cam_cy: float = 240.0,
         sock_height_offset_m: float = 0.015,
+        base_height_m: Optional[float] = None,
     ):
         """Initialize URDF-calibrated SO-100 kinematics and camera-floor projection model.
 
@@ -118,6 +119,7 @@ class SO100Kinematics:
             cam_cx: Camera principal point X (pixels).
             cam_cy: Camera principal point Y (pixels).
             sock_height_offset_m: Target elevation of sock surface above bare floor for ray intersection.
+            base_height_m: Height of SO-100 base_link above floor=0 (e.g. 0.155m -> z_floor = -0.155m).
         """
         self.L1 = float(l1_m)
         self.L2 = float(l2_m)
@@ -132,6 +134,7 @@ class SO100Kinematics:
         self.y_near_px = float(y_near_px)
         self.y_far_px = float(y_far_px)
         self.sock_height_offset_m = float(sock_height_offset_m)
+        self.base_height_m = float(base_height_m) if base_height_m is not None else None
 
         # Camera intrinsics & rigid mount transform on gripper_frame_link
         self.cam_offset_gf = np.asarray(cam_offset_gf, dtype=float)
@@ -182,9 +185,14 @@ class SO100Kinematics:
         )
 
         # Evaluate true URDF FK at the user-calibrated floor_grasp_pose
-        self.r_ref, self.z_floor, self.pitch_ref = self.forward_kinematics(
+        self.r_ref, self.z_floor_fk, self.pitch_ref = self.forward_kinematics(
             self.lift_ref, self.elbow_ref, self.wrist_ref
         )
+        # If explicit base height above floor (e.g. 15.5cm -> z_floor = -0.155m) is provided, anchor floor to -base_height_m
+        if self.base_height_m is not None:
+            self.z_floor = -abs(self.base_height_m)
+        else:
+            self.z_floor = self.z_floor_fk
 
         # Scale DZ3_VERT_M proportionally only if user supplies a custom non-default L3
         self._dz3_vert_m = -abs(self.L3) if abs(self.L3 - 0.1594) > 0.02 else self.DZ3_VERT_M
