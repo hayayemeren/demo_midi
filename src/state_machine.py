@@ -589,10 +589,8 @@ class DemoStateMachine:
         time.sleep(0.3)
         self.base.hold_lock()
 
-        logger.info("[GRASP] 4. Elevating arm off floor to verify grasp (%.1fs)...", lift_t)
-        lift_verify_pose = dict(grasp_clamp)
-        cur_lift = lift_verify_pose.get("shoulder_lift.pos", 0.0)
-        lift_verify_pose["shoulder_lift.pos"] = cur_lift - 20.0 if cur_lift > 0 else cur_lift - 15.0
+        logger.info("[GRASP] 4. Elevating arm vertically off floor via IK to verify grasp (%.1fs)...", lift_t)
+        lift_verify_pose = self.planner.compute_grasp_pose(grasp_clamp, detection=self.last_detection, is_lift=True)
         self.arm.move_to_pose(lift_verify_pose, duration_s=lift_t, feedback_cb=lambda _: self.base.hold_lock())
         time.sleep(0.3)
         self.base.hold_lock()

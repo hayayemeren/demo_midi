@@ -26,15 +26,15 @@ serial:
 # DDSM Motors Configuration
 motors:
   type: "ddsm115"               # ddsm115 or ddsm210
-  left_id: 1                    # RS485 ID of Left Motor
-  right_id: 2                   # RS485 ID of Right Motor
+  left_id: 2                    # RS485 ID of Left Motor
+  right_id: 1                   # RS485 ID of Right Motor
   invert_left: false            # Invert direction if mounted mirrored
   invert_right: true
 
 # Mobile Base Dynamics & Kinematics
 robot:
   turn_ratio: 0.65              # Pivot turn speed ratio
-  turn_dir: -1                  # Turn direction multiplier (-1 = Left stick left -> turn CCW/Left)
+  turn_dir: 1                   # Turn direction multiplier
   accel_rate: 1500.0            # Acceleration in RPM/s (smooth takeoff)
   decel_rate: 1000.0            # Deceleration in RPM/s on releasing stick
   brake_rate: 3000.0            # Emergency brake rate in RPM/s
@@ -103,56 +103,69 @@ case4:
 
   # Observation / Scan Pose: Wrist camera looks down at floor in front of base
   scan_pose:
-    shoulder_pan.pos: 0.0
-    shoulder_lift.pos: -50.0
-    elbow_flex.pos: 35.0
-    wrist_flex.pos: 70.0
-    wrist_roll.pos: 0.0
-    gripper.pos: 10.0
+    shoulder_pan.pos: -7.1
+    shoulder_lift.pos: -63.7
+    elbow_flex.pos: 17.3
+    wrist_flex.pos: 96.0
+    wrist_roll.pos: 1.5
+    gripper.pos: 5.0
 
   # 3-Point Calibrated Floor Scan Poses (Middle, Left, Right)
   scan_poses:
     center:
-      shoulder_pan.pos: 0.0
-      shoulder_lift.pos: -50.0
-      elbow_flex.pos: 35.0
-      wrist_flex.pos: 70.0
-      wrist_roll.pos: 0.0
-      gripper.pos: 10.0
+      shoulder_pan.pos: -7.1
+      shoulder_lift.pos: -63.7
+      elbow_flex.pos: 17.3
+      wrist_flex.pos: 96.0
+      wrist_roll.pos: 1.5
+      gripper.pos: 5.0
     left:
-      shoulder_pan.pos: 28.0
-      shoulder_lift.pos: -50.0
-      elbow_flex.pos: 35.0
-      wrist_flex.pos: 70.0
-      wrist_roll.pos: 0.0
-      gripper.pos: 10.0
+      shoulder_pan.pos: -67.3
+      shoulder_lift.pos: -68.9
+      elbow_flex.pos: 17.3
+      wrist_flex.pos: 96.0
+      wrist_roll.pos: 1.5
+      gripper.pos: 5.0
     right:
-      shoulder_pan.pos: -28.0
-      shoulder_lift.pos: -50.0
-      elbow_flex.pos: 35.0
-      wrist_flex.pos: 70.0
-      wrist_roll.pos: 0.0
-      gripper.pos: 10.0
+      shoulder_pan.pos: 65.1
+      shoulder_lift.pos: -68.9
+      elbow_flex.pos: 17.3
+      wrist_flex.pos: 96.0
+      wrist_roll.pos: 1.5
+      gripper.pos: 5.0
 
   # Multi-angle floor search sweep (shoulder_pan angles in degrees fallback)
   scan_sweep_angles: [0.0, -28.0, 28.0]
 
-  # Floor Grasp Pose: Calibrated downward reach to pick sock from floor below the base
+  # Floor Grasp Pose: Calibrated downward reach to touch floor perpendicularly below the base
   floor_grasp_pose:
-    shoulder_pan.pos: 0.0
-    shoulder_lift.pos: -30.0
-    elbow_flex.pos: 45.0
-    wrist_flex.pos: 80.0
-    wrist_roll.pos: 0.0
+    shoulder_pan.pos: -4.4
+    shoulder_lift.pos: 97.5
+    elbow_flex.pos: -58.2
+    wrist_flex.pos: 59.6
+    wrist_roll.pos: -0.7
     gripper.pos: 0.0
+
+  # SO-100 Analytical Inverse Kinematics (IK) Pick Engine
+  kinematics:
+    enabled: true               # Enable closed-form 2D/3D planar Inverse Kinematics for picking
+    l1_m: 0.116                 # Upper arm length: shoulder pitch axis to elbow pitch axis (meters)
+    l2_m: 0.135                 # Forearm length: elbow pitch axis to wrist pitch axis (meters)
+    l3_m: 0.135                 # Gripper length: wrist pitch axis to fingertips (meters)
+    ground_clearance_m: 0.018   # Safe elevation above raw floor contact (18mm) to prevent scraping/collision
+    hover_height_m: 0.080       # Pre-grasp hover height above floor (80mm)
+    lift_height_m: 0.120        # Post-grasp vertical lift height above floor (120mm)
+    radial_gain_m: 0.050        # Distance compensation across camera vertical FOV (meters)
+    pan_gain_deg: 22.0          # Azimuthal pan compensation across camera horizontal FOV (degrees)
+
   # Basket Pose: Chassis-mounted collection basket on the mobile base
   # Located directly behind the gripper centerline and elevated
   basket_pose:
-    shoulder_pan.pos: 0.0
-    shoulder_lift.pos: -80.0
-    elbow_flex.pos: 20.0
-    wrist_flex.pos: 50.0
-    wrist_roll.pos: 0.0
+    shoulder_pan.pos: -3.3
+    shoulder_lift.pos: -36.4
+    elbow_flex.pos: -80.4
+    wrist_flex.pos: -101.5
+    wrist_roll.pos: -179.1
     gripper.pos: 85.0
   # Suggestion 2: Tactile / Position grasp verification threshold (%)
   # Empty jaws close to ~5.2%; trapped cloth holds jaws >= 5.8%

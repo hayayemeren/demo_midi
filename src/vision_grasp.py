@@ -21,6 +21,8 @@ from typing import Dict, Optional, Tuple, Any
 import cv2
 import numpy as np
 
+from src.kinematics import SO100Kinematics
+
 logger = logging.getLogger("demo.vision")
 
 
@@ -1047,22 +1049,37 @@ class VisionGraspPlanner:
 
         # Basket is mounted directly behind the gripper centerline and slightly elevated
         self.basket_pose = c4.get("basket_pose", {
-            "shoulder_pan.pos": 0.0,
-            "shoulder_lift.pos": -80.0,
-            "elbow_flex.pos": 20.0,
-            "wrist_flex.pos": 50.0,
-            "wrist_roll.pos": 0.0,
+            "shoulder_pan.pos": -3.3,
+            "shoulder_lift.pos": -36.4,
+            "elbow_flex.pos": -80.4,
+            "wrist_flex.pos": -101.5,
+            "wrist_roll.pos": -179.1,
             "gripper.pos": 85.0,
         })
         # Calibrated floor reach to grasp sock from floor below the mobile base
         self.floor_grasp_pose = c4.get("floor_grasp_pose", {
-            "shoulder_pan.pos": 0.0,
-            "shoulder_lift.pos": -30.0,
-            "elbow_flex.pos": 45.0,
-            "wrist_flex.pos": 80.0,
-            "wrist_roll.pos": 0.0,
+            "shoulder_pan.pos": -4.4,
+            "shoulder_lift.pos": 97.5,
+            "elbow_flex.pos": -58.2,
+            "wrist_flex.pos": 59.6,
+            "wrist_roll.pos": -0.7,
             "gripper.pos": 0.0,
         })
+
+        # Inverse Kinematics Engine (SO-100 Planar + Base-Yaw)
+        kin_cfg = c4.get("kinematics", {})
+        self.use_ik = bool(kin_cfg.get("enabled", True))
+        self.kinematics = SO100Kinematics(
+            l1_m=float(kin_cfg.get("l1_m", 0.116)),
+            l2_m=float(kin_cfg.get("l2_m", 0.135)),
+            l3_m=float(kin_cfg.get("l3_m", 0.135)),
+            ground_clearance_m=float(kin_cfg.get("ground_clearance_m", 0.018)),
+            hover_height_m=float(kin_cfg.get("hover_height_m", 0.080)),
+            lift_height_m=float(kin_cfg.get("lift_height_m", 0.120)),
+            radial_gain_m=float(kin_cfg.get("radial_gain_m", 0.050)),
+            pan_gain_deg=float(serv.get("pan_gain", kin_cfg.get("pan_gain_deg", 25.0))),
+            floor_grasp_pose=self.floor_grasp_pose,
+        )
 
         # Motion timing (seconds) - Slow and gentle for stability
         mot = c4.get("motion", {})
@@ -1134,16 +1151,46 @@ class VisionGraspPlanner:
         aligned_pose: Dict[str, float],
         detection: Optional[DetectionResult] = None,
         is_hover: bool = False,
+        is_lift: bool = False,
         descent_lift_deg: float = 16.0,
         descent_elbow_deg: float = 12.0,
     ) -> Dict[str, float]:
-        """Compute final downward descent pose to hover right at floor level below chassis base,
-        dynamically adapting reach (elbow/lift) and gripper orientation (roll) to detected cloth."""
-        grasp = dict(aligned_pose)
-
-        # 1. Shoulder pan: NEVER reset to 0.0 (middle) from floor_grasp_pose!
-        # Always maintain the pan angle pointing at the detected sock from aligned_pose.
+        """Compute downward descent pose to hover right at safe ground clearance below chassis,
+        or elevated pre-grasp hover, or post-grasp vertical lift, using Inverse Kinematics."""
         target_pan = float(aligned_pose.get("shoulder_pan.pos", 0.0))
+
+        if self.use_ik:
+            r_target, pan_target, roll_target = self.kinematics.compute_sock_target(
+                detection,
+                scan_pan_deg=target_pan,
+                pan_direction=self.pan_direction,
+            )
+
+            if is_hover:
+                z_target = self.kinematics.z_floor + self.kinematics.hover_height_m
+                gripper_pct = 85.0
+            elif is_lift:
+                z_target = self.kinematics.z_floor + self.kinematics.lift_height_m
+                gripper_pct = 0.0
+            else:
+                # Safe ground clearance: gripper tip hovers above floor without touching/scraping
+                z_target = self.kinematics.z_floor + self.kinematics.ground_clearance_m
+                gripper_pct = 0.0
+
+            if not self.enable_roll_alignment:
+                roll_target = float(self.floor_grasp_pose.get("wrist_roll.pos", aligned_pose.get("wrist_roll.pos", 0.0)))
+
+            return self.kinematics.compute_cartesian_pose(
+                r_target=r_target,
+                z_target=z_target,
+                pan_target=pan_target,
+                roll_target=roll_target,
+                gripper_pct=gripper_pct,
+                desired_pitch_deg=-90.0,
+            )
+
+        # Fallback heuristic if IK is disabled
+        grasp = dict(aligned_pose)
 
         if self.floor_grasp_pose:
             base_lift = float(self.floor_grasp_pose.get("shoulder_lift.pos", -30.0))
@@ -1162,14 +1209,11 @@ class VisionGraspPlanner:
         grasp["wrist_flex.pos"] = base_wrist
         grasp["wrist_roll.pos"] = base_roll
 
-        # Dynamic adaptation if detection is provided
         if detection is not None and detection.found:
-            # 1. Rotate shoulder_pan to center the sock centroid horizontally with the arm base
             if abs(detection.error_x) > 0.02:
                 pan_trim = self.pan_direction * self.pan_gain * float(detection.error_x)
                 grasp["shoulder_pan.pos"] = float(np.clip(target_pan + pan_trim, -110.0, 110.0))
 
-            # 2. Longitudinal reach modulation (negative error_y = sock further away)
             longitudinal_error = -float(detection.error_y)
             elbow_reach_delta = float(np.clip(self.reach_elbow_gain * longitudinal_error, -self.max_reach_delta_deg, self.max_reach_delta_deg))
             lift_reach_delta = float(np.clip(self.reach_lift_gain * longitudinal_error, -self.max_reach_delta_deg * 0.5, self.max_reach_delta_deg * 0.5))
@@ -1179,19 +1223,20 @@ class VisionGraspPlanner:
             grasp["shoulder_lift.pos"] = float(base_lift + lift_reach_delta)
             grasp["wrist_flex.pos"] = float(base_wrist + wrist_reach_delta)
 
-            # 3. Gripper roll orientation: keep fixed to calibrated base_roll unless explicitly enabled
             if self.enable_roll_alignment and abs(detection.angle) > 2.0:
                 roll_offset = float(np.clip(detection.angle, -60.0, 60.0))
                 grasp["wrist_roll.pos"] = float(np.clip(base_roll + roll_offset, -180.0, 180.0))
             else:
                 grasp["wrist_roll.pos"] = base_roll
 
-        # If hover pose: elevate shoulder and open gripper wide
         if is_hover:
             grasp["shoulder_lift.pos"] = float(grasp["shoulder_lift.pos"] + self.hover_lift_offset_deg)
             grasp["gripper.pos"] = 85.0
+        elif is_lift:
+            grasp["shoulder_lift.pos"] = float(grasp["shoulder_lift.pos"] - 20.0)
+            grasp["gripper.pos"] = 0.0
         else:
-            grasp["gripper.pos"] = 0.0  # Clamp target
+            grasp["gripper.pos"] = 0.0
 
         return grasp
 

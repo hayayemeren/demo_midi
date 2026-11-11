@@ -685,11 +685,11 @@ def test_shoulder_pan_preservation_and_centroid_alignment():
                 "right": {"shoulder_pan.pos": 65.1},
             },
             "floor_grasp_pose": {
-                "shoulder_pan.pos": 0.0,
-                "shoulder_lift.pos": 93.5,
-                "elbow_flex.pos": -56.2,
-                "wrist_flex.pos": 75.4,
-                "wrist_roll.pos": -1.1,
+                "shoulder_pan.pos": -4.4,
+                "shoulder_lift.pos": 97.5,
+                "elbow_flex.pos": -58.2,
+                "wrist_flex.pos": 59.6,
+                "wrist_roll.pos": -0.7,
                 "gripper.pos": 0.0,
             },
             "servoing": {
@@ -713,7 +713,6 @@ def test_shoulder_pan_preservation_and_centroid_alignment():
     # Descend to floor without extra detection trim: must stay at +65.1, NOT 0.0!
     grasp_right = planner_user.compute_grasp_pose(right_aligned)
     assert abs(grasp_right["shoulder_pan.pos"] - 65.1) < 1e-3
-    assert abs(grasp_right["shoulder_lift.pos"] - 93.5) < 1e-3
 
     # 2. Sock on right with residual horizontal offset to the right (error_x = +0.10)
     # On this robot (pan_direction = 1.0), pan must INCREASE towards right: 65.1 + 22.0*0.10 = +67.3°
@@ -734,6 +733,66 @@ def test_shoulder_pan_preservation_and_centroid_alignment():
     det_left = DetectionResult(found=True, error_x=-0.10, error_y=0.0)
     aligned_left, _ = planner_user.compute_aligned_pose(left_aligned, det_left)
     assert abs(aligned_left["shoulder_pan.pos"] - (-69.5)) < 1e-2
+
+
+def test_so100_analytical_kinematics_and_clearance():
+    """Verify SO-100 analytical Forward/Inverse Kinematics, safe ground clearance,
+    and 4-stage Cartesian pick trajectory generation."""
+    from src.kinematics import SO100Kinematics
+
+    ref_pose = {
+        "shoulder_pan.pos": -4.4,
+        "shoulder_lift.pos": 97.5,
+        "elbow_flex.pos": -58.2,
+        "wrist_flex.pos": 59.6,
+        "wrist_roll.pos": -0.7,
+        "gripper.pos": 0.0,
+    }
+    kin = SO100Kinematics(floor_grasp_pose=ref_pose, ground_clearance_m=0.018)
+
+    # 1. Forward Kinematics at reference ground contact
+    r_ref, z_floor, pitch_contact = kin.forward_kinematics(97.5, -58.2, 59.6)
+    assert abs(pitch_contact - (-90.0)) < 1e-2, f"Expected pitch -90.0°, got {pitch_contact}"
+    assert abs(r_ref - kin.r_ref) < 1e-5
+    assert abs(z_floor - kin.z_floor) < 1e-5
+
+    # 2. Inverse Kinematics reproduces reference pose exactly
+    l_sol, e_sol, w_sol = kin.solve_ik(kin.r_ref, kin.z_floor, desired_pitch_deg=-90.0)
+    assert abs(l_sol - 97.5) < 1e-2
+    assert abs(e_sol - (-58.2)) < 1e-2
+    assert abs(w_sol - 59.6) < 1e-2
+
+    # 3. Ground Clearance: Gripper tip is elevated above raw floor contact by 1.8cm
+    z_clear = kin.z_floor + kin.ground_clearance_m
+    l_clear, e_clear, w_clear = kin.solve_ik(kin.r_ref, z_clear, desired_pitch_deg=-90.0)
+    r_chk, z_chk, pitch_chk = kin.forward_kinematics(l_clear, e_clear, w_clear)
+    assert abs(z_chk - z_clear) < 1e-3, f"Height mismatch: {z_chk} vs {z_clear}"
+    assert abs(r_chk - kin.r_ref) < 1e-3, f"Radial drift: {r_chk} vs {kin.r_ref}"
+    assert abs(pitch_chk - (-90.0)) < 1e-2, f"Pitch must stay perpendicular: {pitch_chk}"
+
+    # 4. Vertical Cartesian Lift (+12cm)
+    z_lift = kin.z_floor + kin.lift_height_m
+    l_lift, e_lift, w_lift = kin.solve_ik(kin.r_ref, z_lift, desired_pitch_deg=-90.0)
+    r_lchk, z_lchk, pitch_lchk = kin.forward_kinematics(l_lift, e_lift, w_lift)
+    assert abs(z_lchk - z_lift) < 1e-3
+    assert abs(r_lchk - kin.r_ref) < 1e-3
+    assert abs(pitch_lchk - (-90.0)) < 1e-2
+
+    # 5. Detection to 3D Sock Target mapping
+    det_top = DetectionResult(found=True, error_x=-0.2, error_y=-0.5)
+    r_target, pan_target, _ = kin.compute_sock_target(det_top, scan_pan_deg=10.0, pan_direction=1.0)
+    assert r_target > kin.r_ref, "Negative error_y (top of image) must increase forward reach"
+    assert pan_target < 10.0, "Negative error_x must rotate pan towards left"
+
+    # 6. Complete 4-stage trajectory generation
+    stages = kin.get_trajectory_stages(kin.r_ref, 0.0)
+    assert "hover" in stages and "descent" in stages and "clamp" in stages and "lift" in stages
+    assert stages["hover"]["gripper.pos"] == 85.0
+    assert stages["descent"]["gripper.pos"] == 85.0
+    assert stages["clamp"]["gripper.pos"] == 0.0
+    assert stages["lift"]["gripper.pos"] == 0.0
+    # Hover is elevated relative to descent
+    assert stages["hover"]["shoulder_lift.pos"] < stages["descent"]["shoulder_lift.pos"]
 
 
 if __name__ == "__main__":
@@ -769,6 +828,8 @@ if __name__ == "__main__":
     print("  [PASS] test_scan_poses_teaching_and_execution")
     test_shoulder_pan_preservation_and_centroid_alignment()
     print("  [PASS] test_shoulder_pan_preservation_and_centroid_alignment")
+    test_so100_analytical_kinematics_and_clearance()
+    print("  [PASS] test_so100_analytical_kinematics_and_clearance")
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
 
 
