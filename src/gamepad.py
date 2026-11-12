@@ -47,6 +47,10 @@ ABS_CODE_RZ    = E.ABS_RZ if E else 0x05
 ABS_CODE_HAT0X = E.ABS_HAT0X if E else 0x10
 ABS_CODE_HAT0Y = E.ABS_HAT0Y if E else 0x11
 
+# The F710 receiver drops off USB after every radio dropout and returns as a new device.
+# Look for it often: every second spent searching is a second the base sits braked.
+RECONNECT_INTERVAL_S = 0.2
+
 
 @dataclass
 class GamepadState:
@@ -106,6 +110,7 @@ class F710Gamepad:
         self.connected = False
         self.device_name = "Not Connected"
         self._last_reconnect_attempt = 0.0
+        self._disconnected_since: Optional[float] = None
 
     @staticmethod
     def inspect(path: str):
@@ -237,9 +242,11 @@ class F710Gamepad:
         now = time.time()
 
         if self.dev is None:
-            if now - self._last_reconnect_attempt > 1.0:
+            if now - self._last_reconnect_attempt > RECONNECT_INTERVAL_S:
                 self._last_reconnect_attempt = now
-                self.connect(self.device_path)
+                if self.connect(self.device_path) and self._disconnected_since is not None:
+                    logger.info("[GAMEPAD] Back after %.1f s without signal.", now - self._disconnected_since)
+                    self._disconnected_since = None
             if self.dev is None:
                 return GamepadState(
                     connected=False,
@@ -265,7 +272,8 @@ class F710Gamepad:
             except BlockingIOError:
                 pass
             except OSError:
-                logger.warning("Gamepad disconnected!")
+                logger.warning("Gamepad disconnected! Base brakes until it is back.")
+                self._disconnected_since = now
                 try:
                     self.dev.close()
                 except Exception:

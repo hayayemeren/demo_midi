@@ -170,11 +170,11 @@ case4:
   # Basket Pose: Chassis-mounted collection basket on the mobile base
   # Located directly behind the gripper centerline and elevated
   basket_pose:
-    shoulder_pan.pos: -0.6
-    shoulder_lift.pos: -30.3
-    elbow_flex.pos: -92.0
-    wrist_flex.pos: -96.0
-    wrist_roll.pos: -175.0
+    shoulder_pan.pos: -5.5
+    shoulder_lift.pos: -21.0
+    elbow_flex.pos: -84.8
+    wrist_flex.pos: -89.3
+    wrist_roll.pos: 87.5
     gripper.pos: 85.0  # Suggestion 2: Tactile / Position grasp verification threshold (%)
   # Empty jaws close to ~4.5%; trapped cloth holds jaws >= 4.8%
   grasp_verification_threshold_pct: 4.8

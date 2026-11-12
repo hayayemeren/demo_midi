@@ -11,6 +11,8 @@ from src.diff_drive import DifferentialDrive, RobotDimensions, slew
 
 logger = logging.getLogger("demo.base")
 
+MISSED_REPLIES_TO_REPORT = 3
+
 
 class BaseController:
     """Manages dual DDSM hub motors, kinematics, and electric braking."""
@@ -47,6 +49,9 @@ class BaseController:
         self.is_locked = False
         self.last_fb_l: Optional[MotorFeedback] = None
         self.last_fb_r: Optional[MotorFeedback] = None
+        # Last reported problem per wheel, so a cut-out names its cause once instead of every tick
+        self._motor_fault = {"left": "", "right": ""}
+        self._missed_replies = {"left": 0, "right": 0}
 
     def connect(self) -> bool:
         """Initialize RS485 communication and switch motors to Velocity Mode."""
@@ -113,6 +118,35 @@ class BaseController:
             acceleration=1,
             brake=brake,
         )
+
+        self._report_motor_fault("left", self.last_fb_l)
+        self._report_motor_fault("right", self.last_fb_r)
+
+    def _report_motor_fault(self, side: str, fb: Optional[MotorFeedback]):
+        """Log when a wheel motor reports a fault or stops answering, and when it recovers."""
+        if fb is None:
+            # A single lost reply is normal on RS485; several in a row is not
+            self._missed_replies[side] += 1
+            if self._missed_replies[side] < MISSED_REPLIES_TO_REPORT:
+                return
+            fault = "not answering on RS485"
+        else:
+            self._missed_replies[side] = 0
+            flags = (
+                ("sensor fault", fb.sensor_fault),
+                ("over-current", fb.over_current),
+                ("phase over-current", fb.phase_over_current),
+                ("stall", fb.stall_fault),
+                ("over-temperature", fb.over_temp),
+            )
+            fault = ", ".join(name for name, active in flags if active)
+
+        if fault != self._motor_fault[side]:
+            if fault:
+                logger.warning("[MOTOR %s] %s", side.upper(), fault)
+            else:
+                logger.info("[MOTOR %s] OK again", side.upper())
+            self._motor_fault[side] = fault
 
     def lock_brakes(self):
         """Engage electric brakes and lock wheels completely stationary."""
