@@ -289,6 +289,7 @@ class VisionDebugHandler(http.server.BaseHTTPRequestHandler):
             with srv._lock:
                 meta = dict(srv._latest_meta)
                 meta["locked_detection"] = dict(srv._latest_locked_meta)
+                meta["robot_stage"] = dict(srv._robot_stage)
             if srv.detector is not None:
                 meta["hsv_config"] = srv.detector.get_hsv_config()
             self.wfile.write(json.dumps(meta).encode("utf-8"))
@@ -397,6 +398,13 @@ class VisionDebugServer:
             "pan_deg": None,
             "timestamp": "--",
         }
+        self._robot_stage: Dict[str, Any] = {
+            "stage": "IDLE",
+            "detail": "Ready for command",
+            "r_cm": None,
+            "pan_deg": None,
+            "updated_at": time.strftime("%H:%M:%S"),
+        }
         self._latest_combined: Optional[bytes] = None
         self._latest_hsv_h: Optional[bytes] = None
         self._latest_hsv_s: Optional[bytes] = None
@@ -415,6 +423,27 @@ class VisionDebugServer:
             if cls._instance is None:
                 cls._instance = cls(port)
             return cls._instance
+
+    @classmethod
+    def set_stage(
+        cls,
+        stage: str,
+        detail: str = "",
+        r_cm: Optional[float] = None,
+        pan_deg: Optional[float] = None,
+    ):
+        """Update the live autonomous pick stage displayed on the Web Debug Dashboard."""
+        inst = cls._instance if cls._instance is not None else cls.get_instance()
+        with cls._lock:
+            prev_r = inst._robot_stage.get("r_cm")
+            prev_pan = inst._robot_stage.get("pan_deg")
+            inst._robot_stage = {
+                "stage": str(stage).upper(),
+                "detail": str(detail),
+                "r_cm": round(float(r_cm), 1) if r_cm is not None else (None if str(stage).upper() in ("IDLE", "SCAN") else prev_r),
+                "pan_deg": round(float(pan_deg), 1) if pan_deg is not None else (None if str(stage).upper() in ("IDLE", "SCAN") else prev_pan),
+                "updated_at": time.strftime("%H:%M:%S"),
+            }
 
     @classmethod
     def lock_detection(
@@ -475,7 +504,7 @@ class VisionDebugServer:
             }
 
     def execute_web_scan_action(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle interactive Scan or Pose buttons from the Web Debug Screen."""
+        """Handle interactive Scan, Pose, or Full Pick & Deposit buttons from the Web Debug Screen."""
         action = str(payload.get("action", "sweep")).strip().lower()
         if not self._scan_lock.acquire(blocking=False):
             return {"ok": False, "error": "A scan or arm motion is already in progress."}
@@ -494,7 +523,7 @@ class VisionDebugServer:
                     return {"ok": True, "found": det.found, "area": det.area, "message": "Captured snapshot."}
                 return {"ok": False, "error": "No camera frame available."}
 
-            # Ensure arm and planner are initialized for physical scan motions
+            # Ensure arm and planner are initialized for physical scan/pick motions
             if self.planner is None:
                 import yaml
                 cfg = {}
@@ -524,7 +553,9 @@ class VisionDebugServer:
             if action == "pose":
                 target_name = str(payload.get("target", "center")).strip().lower()
                 if target_name == "stow":
+                    self.set_stage("STOW", "Moving arm to Stow Pose...")
                     self.arm.move_to_stow(duration_s=1.8)
+                    self.set_stage("IDLE", "Arm stowed and ready")
                     return {"ok": True, "message": "Arm moved to Stow Pose."}
                 scan_targets = dict(self.planner.scan_poses or {})
                 pose_map = {
@@ -533,6 +564,7 @@ class VisionDebugServer:
                     "right": ("Right", scan_targets.get("right", self.planner.scan_pose)),
                 }
                 label, target_pose = pose_map.get(target_name, ("Middle (Center)", self.planner.scan_pose))
+                self.set_stage("SCAN", f"Moving to {label} Scan Pose...")
                 cmd_pose = dict(target_pose)
                 cmd_pose["gripper.pos"] = 85.0
                 self.arm.move_to_pose(cmd_pose, duration_s=self.planner.scan_move_duration_s)
@@ -549,6 +581,7 @@ class VisionDebugServer:
                                 scan_pose=meas,
                             )
                             self.lock_detection(det.annotated_frame, label=label, coords=coords, area=det.area, cx=det.cx, cy=det.cy)
+                            self.set_stage("IDLE", f"Sock locked at {label}", r_cm=coords[0] * 100.0, pan_deg=coords[1])
                             return {
                                 "ok": True,
                                 "found": True,
@@ -558,10 +591,100 @@ class VisionDebugServer:
                                 "pan_deg": round(coords[1], 1),
                                 "message": f"Moved to {label}: SOCK DETECTED ({int(det.area)}px, R={coords[0]*100:.1f}cm, Pan={coords[1]:+.1f}°)",
                             }
+                        self.set_stage("IDLE", f"At {label} Scan Pose (no sock)")
                         return {"ok": True, "found": False, "label": label, "message": f"Moved to {label} Scan Pose (no sock in view)."}
+                self.set_stage("IDLE", f"At {label} Scan Pose")
                 return {"ok": True, "found": False, "label": label, "message": f"Moved to {label} Scan Pose."}
 
+            if action == "pick":
+                # Full Autonomous Pick & Deposit cycle triggered from Web Dashboard
+                self.set_stage("SCAN", "Executing 3-point floor scan sweep...")
+                best = self.planner.execute_scan_sweep(
+                    arm=self.arm,
+                    camera=self.camera,
+                    detector=self.detector,
+                    open_gripper_pct=85.0,
+                )
+                if best is None:
+                    self.set_stage("STOW", "No sock detected -> Returning to Stow Pose")
+                    self.arm.move_to_stow(duration_s=self.planner.stow_duration_s)
+                    self.set_stage("IDLE", "Scan complete: No sock detected on floor")
+                    return {"ok": True, "found": False, "message": "3-Point Scan complete: No sock detected on floor. Returned to Stow."}
+
+                det = best["det"]
+                r_t, pan_t, roll_t = best["coords"]
+                stages = self.planner.kinematics.get_trajectory_stages(r_t, pan_t, roll_t)
+                descend_t = self.planner.descend_duration_s
+
+                self.set_stage("HOVER", f"Pre-grasp hover over sock ({best['label']})", r_cm=r_t * 100.0, pan_deg=pan_t)
+                self.arm.move_to_pose(stages["hover"], duration_s=max(1.0, descend_t * 0.5))
+                r_t, pan_t, roll_t, det_hov = self.planner.refine_target_in_hover(
+                    arm=self.arm,
+                    camera=self.camera,
+                    detector=self.detector,
+                    r_target=r_t,
+                    pan_target=pan_t,
+                    roll_target=roll_t,
+                    hover_pose=stages["hover"],
+                )
+                if det_hov is not None and det_hov.found:
+                    stages = self.planner.kinematics.get_trajectory_stages(r_t, pan_t, roll_t)
+
+                self.set_stage("DESCENT", "Lowering open jaws to floor grasp pose", r_cm=r_t * 100.0, pan_deg=pan_t)
+                self.arm.move_to_pose(stages["descent"], duration_s=max(1.0, descend_t * 0.6))
+
+                self.set_stage("CLAMP", "Clamping gripper jaws onto sock (0%)", r_cm=r_t * 100.0, pan_deg=pan_t)
+                self.arm.move_to_pose(stages["clamp"], duration_s=self.planner.clamp_duration_s)
+                if getattr(self.arm, "dry_run", False) and self.camera is not None:
+                    self.camera._sim_sock_picked = True
+                time.sleep(0.3)
+
+                self.set_stage("LIFT", "Elevating arm vertically off floor via IK", r_cm=r_t * 100.0, pan_deg=pan_t)
+                self.arm.move_to_pose(stages["lift"], duration_s=self.planner.lift_duration_s)
+                time.sleep(0.3)
+
+                self.set_stage("VERIFY", "Checking post-clamp camera image for sock on floor...", r_cm=r_t * 100.0, pan_deg=pan_t)
+                is_caught, det_verify = self.planner.verify_grasp_with_camera(
+                    arm=self.arm,
+                    camera=self.camera,
+                    detector=self.detector,
+                )
+
+                if is_caught:
+                    self.set_stage("BASKET", "Floor clear! Depositing sock into rear basket...", r_cm=r_t * 100.0, pan_deg=pan_t)
+                    deposited = self.planner.execute_basket_deposit(arm=self.arm)
+                    self.set_stage("STOW", "Returning arm to normal Stow Pose...")
+                    self.arm.move_to_stow(duration_s=self.planner.stow_duration_s)
+                    msg = (
+                        f"SUCCESS! Sock picked at {best['label']} (R={r_t*100:.1f}cm, Pan={pan_t:+.1f}°) and deposited into basket!"
+                        if deposited
+                        else f"Grasp verified, but basket deposit aborted by safety gate."
+                    )
+                    self.set_stage("IDLE", msg, r_cm=r_t * 100.0, pan_deg=pan_t)
+                    return {
+                        "ok": True,
+                        "found": True,
+                        "deposited": deposited,
+                        "r_cm": round(r_t * 100.0, 1),
+                        "pan_deg": round(pan_t, 1),
+                        "message": msg,
+                    }
+                else:
+                    self.set_stage("STOW", "Grasp failed (sock still on floor) -> Returning to Stow Pose...")
+                    self.arm.move_to_stow(duration_s=self.planner.stow_duration_s)
+                    msg = f"GRASP FAILED: Sock is still on the floor (unreachable or missed). Returned to Stow Pose."
+                    self.set_stage("IDLE", msg, r_cm=r_t * 100.0, pan_deg=pan_t)
+                    return {
+                        "ok": True,
+                        "found": False,
+                        "deposited": False,
+                        "r_cm": round(r_t * 100.0, 1),
+                        "pan_deg": round(pan_t, 1),
+                        "message": msg,
+                    }
+
             # Default action: "sweep" (3-Point Floor Scan Sweep across Middle, Left, Right)
+            self.set_stage("SCAN", "Executing 3-point floor scan sweep...")
             best = self.planner.execute_scan_sweep(
                 arm=self.arm,
                 camera=self.camera,
@@ -571,6 +694,8 @@ class VisionDebugServer:
             if best is not None:
                 det = best["det"]
                 r_t, pan_t, roll_t = best["coords"]
+                msg = f"SOCK DETECTED at {best['label']}! Area={int(det.area)}px | Target R={r_t*100:.1f}cm, Pan={pan_t:+.1f}°"
+                self.set_stage("IDLE", msg, r_cm=r_t * 100.0, pan_deg=pan_t)
                 return {
                     "ok": True,
                     "found": True,
@@ -579,11 +704,13 @@ class VisionDebugServer:
                     "r_cm": round(r_t * 100.0, 1),
                     "pan_deg": round(pan_t, 1),
                     "roll_deg": round(roll_t, 1),
-                    "message": f"SOCK DETECTED at {best['label']}! Area={int(det.area)}px | Target R={r_t*100:.1f}cm, Pan={pan_t:+.1f}°",
+                    "message": msg,
                 }
+            self.set_stage("IDLE", "3-Point Scan complete: No sock detected on floor.")
             return {"ok": True, "found": False, "message": "3-Point Scan complete: No sock detected on floor."}
         except Exception as e:
             logger.warning("Web scan action error: %s", e)
+            self.set_stage("IDLE", f"Error: {e}")
             return {"ok": False, "error": str(e)}
         finally:
             self._scan_lock.release()
@@ -781,6 +908,10 @@ class VisionDebugServer:
         .btn-blue { background: #0088ff; color: #fff; }
         .btn-gold { background: #ffcc00; color: #000; }
         .stat-pill { background: #121216; border: 1px solid #343444; border-radius: 5px; padding: 4px 9px; font-family: monospace; font-size: 13px; }
+        .stage-bar { background: #151922; border: 1px solid #2b384e; border-radius: 8px; padding: 10px 16px; margin-bottom: 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .stage-pill { background: #1e222d; color: #7f8799; border: 1px solid #32394a; border-radius: 4px; padding: 4px 9px; font-size: 12px; font-weight: 700; letter-spacing: 0.4px; transition: all 0.15s; }
+        .stage-pill.active { background: #00d26a; color: #000; border-color: #00ff80; box-shadow: 0 0 10px rgba(0, 210, 106, 0.45); }
+        .stage-arrow { color: #4b5366; font-size: 12px; font-weight: bold; }
         #save-toast, #scan-status { font-size: 13px; font-weight: 600; color: #00d26a; }
     </style>
 </head>
@@ -800,15 +931,32 @@ class VisionDebugServer:
         </div>
     </div>
 
-    <!-- FLOOR SCAN & ARM POSE BAR -->
+    <!-- FLOOR SCAN, FULL PICK & ARM POSE BAR -->
     <div class="scan-bar">
-        <strong style="color:#5ac8fa; font-size:14px;">Floor Scan Actions:</strong>
+        <strong style="color:#5ac8fa; font-size:14px;">Floor Scan &amp; Pick Actions:</strong>
+        <button class="btn" onclick="runScanAction({action:'pick'})">&#129302; Run Full Pick &amp; Deposit</button>
         <button class="btn btn-gold" onclick="runScanAction({action:'sweep'})">&#128269; Run 3-Point Floor Scan Sweep</button>
         <button class="btn btn-sec" onclick="runScanAction({action:'pose', target:'center'})">Move to Middle Scan</button>
         <button class="btn btn-sec" onclick="runScanAction({action:'pose', target:'left'})">Move to Left Scan</button>
         <button class="btn btn-sec" onclick="runScanAction({action:'pose', target:'right'})">Move to Right Scan</button>
         <button class="btn btn-sec" onclick="runScanAction({action:'pose', target:'stow'})">Park / Stow Arm</button>
         <span id="scan-status" style="margin-left: 8px;">Ready</span>
+    </div>
+
+    <!-- LIVE STAGE TRACKER BAR -->
+    <div class="stage-bar">
+        <strong style="color:#00d26a; font-size:13px; margin-right:4px;">Live Stage:</strong>
+        <span class="stage-pill active" id="st-IDLE">IDLE</span><span class="stage-arrow">&rarr;</span>
+        <span class="stage-pill" id="st-SCAN">SCAN</span><span class="stage-arrow">&rarr;</span>
+        <span class="stage-pill" id="st-HOVER">HOVER</span><span class="stage-arrow">&rarr;</span>
+        <span class="stage-pill" id="st-DESCENT">DESCENT</span><span class="stage-arrow">&rarr;</span>
+        <span class="stage-pill" id="st-CLAMP">CLAMP</span><span class="stage-arrow">&rarr;</span>
+        <span class="stage-pill" id="st-LIFT">LIFT</span><span class="stage-arrow">&rarr;</span>
+        <span class="stage-pill" id="st-VERIFY">VERIFY</span><span class="stage-arrow">&rarr;</span>
+        <span class="stage-pill" id="st-BASKET">BASKET</span><span class="stage-arrow">&rarr;</span>
+        <span class="stage-pill" id="st-STOW">STOW</span>
+        <span class="stat-pill" id="stage-target-pill" style="margin-left:10px; color:#5ac8fa;">Target: R=-- cm, Pan=--&deg;</span>
+        <span id="stage-detail-text" style="margin-left:8px; font-size:13px; color:#c8ccd8;">Ready for command</span>
     </div>
 
     <!-- CONSTANTS TUNING PANEL -->
@@ -1091,6 +1239,26 @@ class VisionDebugServer:
                             txt += ' -> R=' + lk.r_cm + 'cm, Pan=' + (lk.pan_deg >= 0 ? '+' : '') + lk.pan_deg + '°';
                         }
                         document.getElementById('locked-meta-text').innerText = txt;
+                    }
+                    const rs = d.robot_stage || {};
+                    const activeStage = (rs.stage || 'IDLE').toUpperCase();
+                    const stages = ['IDLE','SCAN','HOVER','DESCENT','CLAMP','LIFT','VERIFY','BASKET','STOW'];
+                    stages.forEach(s => {
+                        const el = document.getElementById('st-' + s);
+                        if (el) {
+                            el.className = (s === activeStage) ? 'stage-pill active' : 'stage-pill';
+                        }
+                    });
+                    if (rs.detail !== undefined) {
+                        document.getElementById('stage-detail-text').innerText = '[' + (rs.updated_at || '--') + '] ' + rs.detail;
+                    }
+                    const tp = document.getElementById('stage-target-pill');
+                    if (tp) {
+                        if (rs.r_cm !== null && rs.r_cm !== undefined) {
+                            tp.innerText = 'Target: R=' + rs.r_cm + ' cm, Pan=' + (rs.pan_deg >= 0 ? '+' : '') + rs.pan_deg + '°';
+                        } else {
+                            tp.innerText = 'Target: R=-- cm, Pan=--°';
+                        }
                     }
                 })
                 .catch(() => {});
@@ -1925,33 +2093,71 @@ class SockDetector:
                 if extent < 0.25 or solidity < min_solidity:
                     continue
 
-                # Find centroid using image moments + Distance Transform peak (center of thickest part of sock)
+                # Find grasp target using Longitudinal Midpoint + Center-of-Mass + Perspective-Compensated Distance Transform
                 M = cv2.moments(cnt)
                 if M["m00"] > 0:
-                    cx_mom = float(M["m10"] / M["m00"]) + x_min
-                    cy_mom = float(M["m01"] / M["m00"]) + y_min
+                    mx_f = float(M["m10"] / M["m00"]) - bx
+                    my_f = float(M["m01"] / M["m00"]) - by
+                    cx_mom = mx_f + bx + x_min
+                    cy_mom = my_f + by + y_min
 
-                    # Compute Euclidean Distance Transform inside contour to find thickest grasp core
+                    # Compute Euclidean Distance Transform inside contour
                     pad_mask = np.zeros((bh + 2, bw + 2), dtype=np.uint8)
                     pad_mask[1:bh + 1, 1:bw + 1] = patch_mask
                     dist_map = cv2.distanceTransform(pad_mask, cv2.DIST_L2, 5)
-                    _, max_dist, _, max_loc = cv2.minMaxLoc(dist_map)
-                    cx_dt = float(max_loc[0] - 1 + bx + x_min)
-                    cy_dt = float(max_loc[1] - 1 + by + y_min)
+                    dist_inner = dist_map[1:bh + 1, 1:bw + 1]
+
+                    # 1. Principal long-axis unit vector u = (ux, uy) from central moments
+                    theta = 0.5 * float(np.arctan2(2.0 * M["mu11"], M["mu20"] - M["mu02"]))
+                    ux, uy = float(np.cos(theta)), float(np.sin(theta))
+                    yy, xx = np.indices((bh, bw), dtype=np.float32)
+
+                    # Project contour pixels onto principal long axis to locate the 50% longitudinal midpoint
+                    s_proj = xx * ux + yy * uy
+                    valid_pts = patch_mask > 0
+                    if np.any(valid_pts):
+                        s_vals = s_proj[valid_pts]
+                        s_min_v, s_max_v = float(s_vals.min()), float(s_vals.max())
+                        s_mid = 0.5 * (s_min_v + s_max_v)
+                        half_len = max(1.0, 0.5 * (s_max_v - s_min_v))
+                        u_norm = np.abs(s_proj - s_mid) / half_len
+                        # Penalize moving toward either end of the sock so the grasp circle stays near the 50% middle
+                        w_long = np.exp(-2.5 * (u_norm ** 2))
+                    else:
+                        w_long = 1.0
+
+                    # 2. Center-of-Mass proximity weight (keeps grasp target balanced between both ends)
+                    sigma_com = max(4.0, 0.30 * float(max(bw, bh)))
+                    d2_com = (xx - mx_f) ** 2 + (yy - my_f) ** 2
+                    w_com = np.exp(-d2_com / (2.0 * (sigma_com ** 2)))
+
+                    # 3. Perspective depth compensation: counteracts camera foreshortening where the closer end
+                    # (larger y) projects to more pixels than the far end (smaller y)
+                    y_global = yy + float(by + y_min)
+                    w_persp = 1.0 / np.clip(1.0 + 0.35 * ((y_global - (h * 0.5)) / max(1.0, float(h))), 0.70, 1.35)
+
+                    # Combined grasp score map peaks on the thickest interior spine right at the middle of the sock
+                    weighted_dt = dist_inner * w_long * w_com * w_persp
+                    _, _, _, max_loc = cv2.minMaxLoc(weighted_dt)
+                    dt_x_local = int(max_loc[0])
+                    dt_y_local = int(max_loc[1])
+                    inscribed_r = float(dist_inner[dt_y_local, dt_x_local])
+                    cx_dt = float(dt_x_local + bx + x_min)
+                    cy_dt = float(dt_y_local + by + y_min)
 
                     # Check how deep the moment centroid sits inside the sock body
-                    mx_local = max(0, min(bw + 1, int(round(cx_mom - x_min - bx + 1))))
-                    my_local = max(0, min(bh + 1, int(round(cy_mom - y_min - by + 1))))
-                    dist_at_mom = float(dist_map[my_local, mx_local])
+                    mx_i = max(0, min(bw - 1, int(round(mx_f))))
+                    my_i = max(0, min(bh - 1, int(round(my_f))))
+                    dist_at_mom = float(dist_inner[my_i, mx_i])
 
                     # If the sock is L-shaped/curved so the moment centroid falls near the edge or outside,
-                    # pull the grasp point strongly onto the thickest interior core (Distance Transform peak).
-                    if max_dist > 2.0 and dist_at_mom < 0.65 * max_dist:
-                        cx = 0.75 * cx_dt + 0.25 * cx_mom
-                        cy = 0.75 * cy_dt + 0.25 * cy_mom
+                    # use the midpoint-weighted spine peak; otherwise blend smoothly at the middle.
+                    if inscribed_r > 2.0 and dist_at_mom < 0.70 * inscribed_r:
+                        cx = 0.85 * cx_dt + 0.15 * cx_mom
+                        cy = 0.85 * cy_dt + 0.15 * cy_mom
                     else:
-                        cx = 0.35 * cx_dt + 0.65 * cx_mom
-                        cy = 0.35 * cy_dt + 0.65 * cy_mom
+                        cx = 0.65 * cx_dt + 0.35 * cx_mom
+                        cy = 0.65 * cy_dt + 0.35 * cy_mom
 
                     global_bx = bx + x_min
                     global_by = by + y_min
@@ -1965,7 +2171,7 @@ class SockDetector:
                         best_center = (cx, cy)
                         best_bbox = (global_bx, global_by, bw, bh)
                         best_solidity = solidity
-                        best_inscribed_radius = float(max_dist)
+                        best_inscribed_radius = inscribed_r
                         best_dt_center = (cx_dt, cy_dt)
 
         # 4b. Compute telemetry readouts

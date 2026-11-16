@@ -1299,7 +1299,19 @@ def test_signed_floor_darkness_glare_solidity_and_distance_transform():
     )
     assert res_l.hsv_stats.get("sock_solidity", 0.0) >= 0.45
 
-    # 3. Verify VisionDebugServer.lock_detection stores captured snapshot
+    # 3. Elongated sock pointing away from robot where the closer end (y=260..320) is wider than the far end (y=140..260):
+    # Raw distanceTransform would place the circle at the bottom tip (y~290);
+    # Longitudinal Midpoint + Center-Weighted + Perspective-Compensated DT must keep grasp point near the middle (y~215..250).
+    taper_frame = np.full((480, 640, 3), 170, dtype=np.uint8)
+    taper_poly = np.array([[302, 140], [338, 140], [352, 320], [288, 320]], dtype=np.int32)
+    cv2.fillPoly(taper_frame, [taper_poly], (20, 20, 20))
+    res_taper = det.detect(taper_frame)
+    assert res_taper.found is True
+    assert 200.0 <= res_taper.cy <= 255.0, (
+        f"Expected grasp point near longitudinal middle (y~230), not at wide bottom tip (got cy={res_taper.cy:.1f})"
+    )
+
+    # 4. Verify VisionDebugServer.lock_detection stores captured snapshot
     VisionDebugServer.lock_detection(
         annotated_frame=res_l.annotated_frame,
         label="Unit Test Lock",
@@ -1371,8 +1383,25 @@ def test_post_clamp_camera_verification_aborts_basket_on_missed_or_unreachable_s
     sm._handle_parking()
     assert sm.state == DemoState.BASE_DRIVE
     assert base.is_locked is False
+    assert srv._robot_stage.get("stage") == "IDLE"
     for k, v in arm.stow_pose.items():
         assert abs(arm.sim_follower_pose[k] - v) < 1e-3, f"Joint {k} must return to normal stow position"
+
+    # 5. Verify Web Dashboard 'Run Full Pick & Deposit' button ({action: 'pick'}) and Live Stage Tracker
+    srv.arm = arm
+    srv.camera = WristCamera(dry_run=True)
+    srv.camera.connect()
+    srv.detector = sm.detector
+    srv.planner = sm.planner
+    srv.planner.scan_move_duration_s = 0.01
+    srv.planner.descend_duration_s = 0.01
+    srv.planner.clamp_duration_s = 0.01
+    srv.planner.lift_duration_s = 0.01
+    srv.planner.stow_duration_s = 0.01
+    pick_res = srv.execute_web_scan_action({"action": "pick"})
+    assert pick_res["ok"] is True and pick_res["found"] is True and pick_res["deposited"] is True
+    assert srv._robot_stage.get("stage") == "IDLE"
+    assert srv._robot_stage.get("r_cm") is not None
     sm.stop()
 
 

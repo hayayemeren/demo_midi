@@ -465,6 +465,7 @@ class DemoStateMachine:
         self.target_pick_coords = None
         if self.camera is not None:
             self.camera._sim_sock_picked = False
+        VisionDebugServer.set_stage("SCAN", f"Executing 3-point floor scan ({labels_str})...")
         best = self.planner.execute_scan_sweep(
             arm=self.arm,
             camera=self.camera,
@@ -479,6 +480,12 @@ class DemoStateMachine:
             r_target, pan_target, roll_target = best["coords"]
             self.target_pick_coords = (r_target, pan_target, roll_target)
             self.last_detection = best_det
+            VisionDebugServer.set_stage(
+                "HOVER",
+                f"Sock locked at {best_label} ({best_det.area:.0f}px) -> Aligning & hovering",
+                r_cm=r_target * 100.0,
+                pan_deg=pan_target,
+            )
 
             logger.info(
                 f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [VISION] BEST SOCK DETECTED AT {best_label.upper()} POSE! <<<{COLOR_RESET}\n"
@@ -489,6 +496,7 @@ class DemoStateMachine:
             self.align_iterations = 0
             self.state = DemoState.AUTONOMOUS_PICK_ALIGN
         else:
+            VisionDebugServer.set_stage("STOW", "No sock detected on floor -> Returning to Stow")
             logger.warning(
                 f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [SCAN COMPLETE] NO SOCK DETECTED ON FLOOR! <<<{COLOR_RESET}\n"
                 f"Halting autonomous sequence. Returning to BASE DRIVE mode.\n"
@@ -576,6 +584,12 @@ class DemoStateMachine:
 
         # Stage 2a: Pre-Grasp Hover directly above sock + closed-loop camera refinement
         hover_pose = stages["hover"]
+        VisionDebugServer.set_stage(
+            "HOVER",
+            f"Pre-grasp hover ~{self.planner.kinematics.hover_height_m*100:.0f}cm above sock",
+            r_cm=r_target * 100.0,
+            pan_deg=pan_target,
+        )
         logger.info(
             f"[GRASP] 2a. Pre-Grasp Hover ~{self.planner.kinematics.hover_height_m*100:.0f}cm above sock: "
             f"R={r_target*100:.1f}cm, pan={hover_pose.get('shoulder_pan.pos', 0.0):.1f}°, "
@@ -603,6 +617,7 @@ class DemoStateMachine:
 
         # Stage 2b: Smooth vertical descent to safe floor clearance
         descent_pose = stages["descent"]
+        VisionDebugServer.set_stage("DESCENT", "Lowering open jaws to floor grasp pose", r_cm=r_target * 100.0, pan_deg=pan_target)
         logger.info(
             f"[GRASP] 2b. Lowering arm to floor grasp pose (safe ground clearance {self.planner.kinematics.ground_clearance_m*1000:.0f}mm): "
             f"R={r_target*100:.1f}cm, pan={descent_pose.get('shoulder_pan.pos', 0.0):.1f}°, "
@@ -611,6 +626,7 @@ class DemoStateMachine:
         self.arm.move_to_pose(descent_pose, duration_s=max(1.0, descend_t * 0.6), feedback_cb=lambda _: self.base.hold_lock())
 
         # Stage 3: Clamp gripper onto sock
+        VisionDebugServer.set_stage("CLAMP", "Clamping gripper jaws onto sock (0%)", r_cm=r_target * 100.0, pan_deg=pan_target)
         logger.info("[GRASP] 3. Clamping gripper jaws onto sock (0%%) over %.1fs...", clamp_t)
         clamp_pose = stages["clamp"]
         self.arm.move_to_pose(clamp_pose, duration_s=clamp_t, feedback_cb=lambda _: self.base.hold_lock())
@@ -621,6 +637,7 @@ class DemoStateMachine:
 
         # Stage 4: Elevate arm off floor via IK to verify grasp
         lift_pose = stages["lift"]
+        VisionDebugServer.set_stage("LIFT", "Elevating arm vertically off floor via IK", r_cm=r_target * 100.0, pan_deg=pan_target)
         logger.info(f"[GRASP] 4. Elevating arm vertically off floor via IK (Z=+{self.planner.kinematics.lift_height_m*100:.0f}cm, %.1fs)...", lift_t)
         self.arm.move_to_pose(lift_pose, duration_s=lift_t, feedback_cb=lambda _: self.base.hold_lock())
         time.sleep(0.3)
@@ -640,6 +657,7 @@ class DemoStateMachine:
         if self.arm.dry_run:
             measured_grip = 25.0
 
+        VisionDebugServer.set_stage("VERIFY", "Checking post-clamp camera image for sock on floor...")
         logger.info("\n[VERIFY] Capturing post-clamp camera image to check if black sock was picked up off the floor...")
         if self.planner is not None and hasattr(self.planner, "verify_grasp_with_camera"):
             is_caught, det_verify = self.planner.verify_grasp_with_camera(
@@ -655,6 +673,7 @@ class DemoStateMachine:
         abort_on_miss = getattr(self.planner, "abort_on_miss", True)
 
         if is_caught or not abort_on_miss:
+            VisionDebugServer.set_stage("BASKET", "Floor clear! Transporting sock to rear basket...")
             logger.info(
                 f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [GRASP VERIFIED] Floor is clear — black sock was picked up off the floor (Grip: {measured_grip:.1f}%)! <<<{COLOR_RESET}\n"
                 f"Transporting sock to basket with clamped jaws..."
@@ -662,6 +681,7 @@ class DemoStateMachine:
             self.state = DemoState.AUTONOMOUS_BASKET_DUMP
         else:
             area_str = f" (Sock still on floor: {det_verify.area:.0f}px)" if (det_verify is not None and det_verify.found) else ""
+            VisionDebugServer.set_stage("STOW", f"Grasp failed (sock still on floor{area_str}) -> Returning to Stow")
             logger.warning(
                 f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP FAILED] Black sock is STILL on the floor after closing gripper{area_str} (unreachable or missed)! <<<{COLOR_RESET}\n"
                 f"Skipping basket dump -> Returning arm to normal position and waiting for command."
@@ -676,6 +696,7 @@ class DemoStateMachine:
             self.state = DemoState.PARKING
             return
 
+        VisionDebugServer.set_stage("BASKET", "Depositing sock into rear collection basket...")
         # Two-stage compact overhead clearance -> rear basket settle -> position-gated release
         deposited = self.planner.execute_basket_deposit(
             self.arm,
@@ -696,6 +717,7 @@ class DemoStateMachine:
         """Base is locked; smoothly park follower arm back to safe stow pose."""
         self.base.hold_lock()
         stow_t = getattr(self.planner, "stow_duration_s", 2.5) if self.planner else 2.5
+        VisionDebugServer.set_stage("STOW", "Returning arm to normal Stow Pose...")
         logger.info("\n[PARK] Returning Follower arm to safe Stow Pose over %.1fs...", stow_t)
         self.arm.move_to_stow(
             duration_s=stow_t,
@@ -707,6 +729,7 @@ class DemoStateMachine:
         self.scan_retries = 0
         if self.camera is not None:
             self.camera.ensure_healthy()
+        VisionDebugServer.set_stage("IDLE", "Ready for command (BASE_DRIVE)")
         self.base.release_brakes()
         logger.info(
             f"\n{COLOR_BOLD}{COLOR_CYAN}>>> BASE DRIVE ACTIVE! Mobile base is ready to drive! <<<{COLOR_RESET}\n"
