@@ -20,7 +20,7 @@ from src.arm_controller import ArmController
 from src.base_controller import BaseController
 from src.gamepad import F710Gamepad, GamepadState
 from src.network import RobotServer
-from src.vision_grasp import WristCamera, SockDetector, VisionGraspPlanner, DetectionResult
+from src.vision_grasp import WristCamera, SockDetector, VisionGraspPlanner, DetectionResult, VisionDebugServer
 
 logger = logging.getLogger("demo.statemachine")
 
@@ -110,25 +110,40 @@ class DemoStateMachine:
                 dry_run=self.base.dry_run,
             )
             det_cfg = c4.get("detection", {})
+            enable_web = bool(det_cfg.get("enable_web_stream", False))
+            web_port = int(det_cfg.get("web_stream_port", 8080))
             self.detector = SockDetector(
                 mode=det_cfg.get("mode", "auto"),
                 min_area=float(det_cfg.get("min_area", 800.0)),
                 max_area=float(det_cfg.get("max_area", 80000.0)),
                 contrast_threshold=float(det_cfg.get("contrast_threshold", 35.0)),
+                v_max=int(det_cfg.get("v_max", 75)),
+                max_floor_ratio=float(det_cfg.get("max_floor_ratio", 0.65)),
+                min_solidity=float(det_cfg.get("min_solidity", 0.45)),
                 border_margin=int(det_cfg.get("border_margin", 4)),
                 roi_top_pct=float(det_cfg.get("roi_top_pct", 0.06)),
                 roi_bottom_pct=float(det_cfg.get("roi_bottom_pct", 0.86)),
                 roi_left_pct=float(det_cfg.get("roi_left_pct", 0.04)),
                 roi_right_pct=float(det_cfg.get("roi_right_pct", 0.96)),
+                hsv_lower=det_cfg.get("hsv_lower"),
+                hsv_upper=det_cfg.get("hsv_upper"),
+                gripper_hsv_lower=det_cfg.get("gripper_hsv_lower"),
+                gripper_hsv_upper=det_cfg.get("gripper_hsv_upper"),
                 save_debug_image=bool(det_cfg.get("save_debug_image", True)),
                 debug_image_path=det_cfg.get("debug_image_path", "/tmp/sock_detection.jpg"),
                 debug_raw_path=det_cfg.get("debug_raw_path", "/tmp/sock_raw.jpg"),
                 debug_mask_path=det_cfg.get("debug_mask_path", "/tmp/sock_mask.jpg"),
                 debug_combined_path=det_cfg.get("debug_combined_path", "/tmp/sock_combined.jpg"),
-                enable_web_stream=bool(det_cfg.get("enable_web_stream", False)),
-                web_stream_port=int(det_cfg.get("web_stream_port", 8080)),
+                enable_web_stream=enable_web,
+                web_stream_port=web_port,
             )
             self.planner = VisionGraspPlanner(self.config)
+            if enable_web:
+                dbg_srv = VisionDebugServer.get_instance(web_port)
+                dbg_srv.detector = self.detector
+                dbg_srv.camera = self.camera
+                dbg_srv.planner = self.planner
+                dbg_srv.arm = self.arm
 
     def start(self):
         """Initial check and launch of the control loop."""
@@ -448,6 +463,8 @@ class DemoStateMachine:
 
         self.last_detection = None
         self.target_pick_coords = None
+        if self.camera is not None:
+            self.camera._sim_sock_picked = False
         best = self.planner.execute_scan_sweep(
             arm=self.arm,
             camera=self.camera,
@@ -597,6 +614,8 @@ class DemoStateMachine:
         logger.info("[GRASP] 3. Clamping gripper jaws onto sock (0%%) over %.1fs...", clamp_t)
         clamp_pose = stages["clamp"]
         self.arm.move_to_pose(clamp_pose, duration_s=clamp_t, feedback_cb=lambda _: self.base.hold_lock())
+        if self.arm.dry_run and self.camera is not None:
+            self.camera._sim_sock_picked = True
         time.sleep(0.3)
         self.base.hold_lock()
 
@@ -610,7 +629,10 @@ class DemoStateMachine:
         self.state = DemoState.AUTONOMOUS_PICK_VERIFY
 
     def _handle_autonomous_verify(self, gp: GamepadState):
-        """Case 4 (Suggestion 2): Checks gripper position while elevated to verify that cloth was caught."""
+        """Case 4: Takes a camera image after the gripper closes and lifts to check whether
+        the black sock is still on the floor.
+        - If the sock is NO LONGER on the floor (`det_verify.found == False`), it was picked up -> proceed to basket.
+        - If the sock is STILL on the floor (`det_verify.found == True`), grasp failed -> return to stow position."""
         self.base.hold_lock()
 
         cur_pose = self.arm.get_follower_pose()
@@ -618,27 +640,32 @@ class DemoStateMachine:
         if self.arm.dry_run:
             measured_grip = 25.0
 
-        is_caught = self.planner.verify_grasp(measured_grip) if self.planner else True
-        abort_on_miss = getattr(self.planner, "abort_on_miss", False)
+        logger.info("\n[VERIFY] Capturing post-clamp camera image to check if black sock was picked up off the floor...")
+        if self.planner is not None and hasattr(self.planner, "verify_grasp_with_camera"):
+            is_caught, det_verify = self.planner.verify_grasp_with_camera(
+                arm=self.arm,
+                camera=self.camera,
+                detector=self.detector,
+                feedback_cb=lambda _: self.base.hold_lock(),
+            )
+        else:
+            is_caught = self.planner.verify_grasp(measured_grip) if self.planner else True
+            det_verify = None
+
+        abort_on_miss = getattr(self.planner, "abort_on_miss", True)
 
         if is_caught or not abort_on_miss:
-            if is_caught:
-                logger.info(
-                    f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [GRASP VERIFIED] SUCCESS! Sock securely held (Grip: {measured_grip:.1f}% >= {self.planner.grasp_verification_threshold:.1f}%). <<<{COLOR_RESET}\n"
-                    f"Transporting sock to basket with clamped jaws..."
-                )
-            else:
-                logger.info(
-                    f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP INFO] Grip reading: {measured_grip:.1f}% (Threshold: {self.planner.grasp_verification_threshold:.1f}%). Proceeding to basket with clamped jaws... <<<{COLOR_RESET}\n"
-                )
+            logger.info(
+                f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [GRASP VERIFIED] Floor is clear — black sock was picked up off the floor (Grip: {measured_grip:.1f}%)! <<<{COLOR_RESET}\n"
+                f"Transporting sock to basket with clamped jaws..."
+            )
             self.state = DemoState.AUTONOMOUS_BASKET_DUMP
         else:
+            area_str = f" (Sock still on floor: {det_verify.area:.0f}px)" if (det_verify is not None and det_verify.found) else ""
             logger.warning(
-                f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP MISSED] Gripper is empty (Grip: {measured_grip:.1f}% < {self.planner.grasp_verification_threshold:.1f}%). Aborting as requested. <<<{COLOR_RESET}\n"
-                f"Returning to driving."
+                f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP FAILED] Black sock is STILL on the floor after closing gripper{area_str} (unreachable or missed)! <<<{COLOR_RESET}\n"
+                f"Skipping basket dump -> Returning arm to normal position and waiting for command."
             )
-            cur_pose["gripper.pos"] = 40.0
-            self.arm.move_to_pose(cur_pose, duration_s=0.5, feedback_cb=lambda _: self.base.hold_lock())
             self.state = DemoState.PARKING
 
     def _handle_autonomous_basket(self, gp: GamepadState):

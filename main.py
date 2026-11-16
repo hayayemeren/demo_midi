@@ -30,7 +30,7 @@ from src.arm_controller import ArmController
 from src.base_controller import BaseController
 from src.gamepad import F710Gamepad
 from src.state_machine import DemoStateMachine
-from src.vision_grasp import VisionGraspPlanner, WristCamera, SockDetector
+from src.vision_grasp import VisionGraspPlanner, WristCamera, SockDetector, calibrate_hsv, update_config_hsv
 
 
 def setup_logging(verbose: bool = False):
@@ -127,13 +127,16 @@ def select_case_interactive(default_case: Optional[int] = None) -> int:
     print("  [8] Teach 3-Point Floor Scan Poses (--teach-scan)")
     print("      - Move limp arm to Middle, Left, and Right scan poses with live camera feed")
     print()
+    print("  [9] Vision Debug & Floor Scan Dashboard (./run_demo.sh 9)")
+    print("      - Tune detection constants, trigger 3-point floor scans, and view live/captured streams")
+    print()
     print("  [Q] Quit Demonstration")
     print("=" * 64)
 
     default_prompt = f" [{default_case}]" if default_case in (1, 2, 3, 4) else " [1]"
     while True:
         try:
-            choice = input(f"Enter choice (1, 2, 3, 4, 5, 6, 7, 8, or Q){default_prompt}: ").strip().lower()
+            choice = input(f"Enter choice (1, 2, 3, 4, 5, 6, 7, 8, 9, or Q){default_prompt}: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print("\nExiting.")
             sys.exit(0)
@@ -156,11 +159,13 @@ def select_case_interactive(default_case: Optional[int] = None) -> int:
             return 7
         elif choice in ("8", "teach scan", "scan"):
             return 8
+        elif choice in ("9", "calibrate hsv", "hsv", "debug"):
+            return 9
         elif choice in ("q", "quit", "exit"):
             print("Exiting.")
             sys.exit(0)
         else:
-            print("Invalid selection. Please enter 1, 2, 3, 4, 5, 6, 7, 8, or Q.")
+            print("Invalid selection. Please enter 1, 2, 3, 4, 5, 6, 7, 8, 9, or Q.")
 
 
 def update_config_basket_pose(config_path: str, pose: dict) -> bool:
@@ -557,13 +562,21 @@ def teach_scan(config_path: str, dry_run: bool = False):
             min_area=float(det_cfg.get("min_area", 800.0)),
             max_area=float(det_cfg.get("max_area", 80000.0)),
             contrast_threshold=float(det_cfg.get("contrast_threshold", 35.0)),
+            v_max=int(det_cfg.get("v_max", 75)),
+            max_floor_ratio=float(det_cfg.get("max_floor_ratio", 0.65)),
+            min_solidity=float(det_cfg.get("min_solidity", 0.45)),
             border_margin=int(det_cfg.get("border_margin", 4)),
             roi_top_pct=float(det_cfg.get("roi_top_pct", 0.06)),
             roi_bottom_pct=float(det_cfg.get("roi_bottom_pct", 0.86)),
             roi_left_pct=float(det_cfg.get("roi_left_pct", 0.04)),
             roi_right_pct=float(det_cfg.get("roi_right_pct", 0.96)),
+            hsv_lower=det_cfg.get("hsv_lower"),
+            hsv_upper=det_cfg.get("hsv_upper"),
+            gripper_hsv_lower=det_cfg.get("gripper_hsv_lower"),
+            gripper_hsv_upper=det_cfg.get("gripper_hsv_upper"),
             enable_web_stream=True,
             web_stream_port=int(det_cfg.get("web_stream_port", 8080)),
+            config_path=config_path,
         )
         if camera.connect():
             camera.start_stream(detector=detector)
@@ -686,13 +699,21 @@ def test_pick(config_path: str, dry_run: bool = False):
             min_area=float(det_cfg.get("min_area", 800.0)),
             max_area=float(det_cfg.get("max_area", 80000.0)),
             contrast_threshold=float(det_cfg.get("contrast_threshold", 35.0)),
+            v_max=int(det_cfg.get("v_max", 75)),
+            max_floor_ratio=float(det_cfg.get("max_floor_ratio", 0.65)),
+            min_solidity=float(det_cfg.get("min_solidity", 0.45)),
             border_margin=int(det_cfg.get("border_margin", 4)),
             roi_top_pct=float(det_cfg.get("roi_top_pct", 0.06)),
             roi_bottom_pct=float(det_cfg.get("roi_bottom_pct", 0.86)),
             roi_left_pct=float(det_cfg.get("roi_left_pct", 0.04)),
             roi_right_pct=float(det_cfg.get("roi_right_pct", 0.96)),
+            hsv_lower=det_cfg.get("hsv_lower"),
+            hsv_upper=det_cfg.get("hsv_upper"),
+            gripper_hsv_lower=det_cfg.get("gripper_hsv_lower"),
+            gripper_hsv_upper=det_cfg.get("gripper_hsv_upper"),
             enable_web_stream=True,
             web_stream_port=int(det_cfg.get("web_stream_port", 8080)),
+            config_path=config_path,
         )
         if camera.connect():
             camera.start_stream(detector=detector)
@@ -759,6 +780,8 @@ def test_pick(config_path: str, dry_run: bool = False):
 
         print(f"[TEST] 3. Clamping gripper jaws onto sock (0%) over {clamp_t:.1f}s...")
         arm.move_to_pose(grasp_clamp, duration_s=clamp_t, feedback_cb=lambda _: base.hold_lock())
+        if dry_run and camera is not None:
+            camera._sim_sock_picked = True
         time.sleep(0.3)
         base.hold_lock()
 
@@ -772,20 +795,28 @@ def test_pick(config_path: str, dry_run: bool = False):
         if dry_run:
             measured_grip = 25.0
 
-        print(f"\n>>> Measured gripper aperture: {measured_grip:.1f}% (Verification Threshold: {planner.grasp_verification_threshold:.1f}%) <<<")
-        is_caught = planner.verify_grasp(measured_grip)
+        print("\n[TEST] 4b. Capturing post-clamp camera image to check if black sock was picked up off the floor...")
+        is_caught, det_verify = planner.verify_grasp_with_camera(
+            arm=arm,
+            camera=camera,
+            detector=detector,
+            feedback_cb=lambda _: base.hold_lock(),
+        )
 
         if is_caught:
-            print("[SUCCESS] Cloth securely held between jaws!")
+            print(f"[SUCCESS] Floor is clear — black sock was picked up off the floor! (Grip: {measured_grip:.1f}%)")
+            print("\n[TEST] 5. Moving via compact overhead clearance to rear basket with position-gated release...")
+            deposited = planner.execute_basket_deposit(arm=arm, feedback_cb=lambda _: base.hold_lock())
+            if deposited:
+                print("\n>>> [PASSED] Sock successfully picked from floor and deposited into basket! <<<\n")
+            else:
+                print("\n>>> [ABORTED] Arm did not reach rear basket; gripper kept closed to protect sock! <<<\n")
         else:
-            print(f"[INFO] Grip aperture reading: {measured_grip:.1f}% (Threshold: {planner.grasp_verification_threshold:.1f}%).")
-
-        print("\n[TEST] 5. Moving via compact overhead clearance to rear basket with position-gated release...")
-        deposited = planner.execute_basket_deposit(arm=arm, feedback_cb=lambda _: base.hold_lock())
-        if deposited:
-            print("\n>>> [PASSED] Sock successfully picked from floor and deposited into basket! <<<\n")
-        else:
-            print("\n>>> [ABORTED] Arm did not reach rear basket; gripper kept closed to protect sock! <<<\n")
+            area_info = f" (Sock still on floor: {det_verify.area:.0f}px)" if (det_verify is not None and det_verify.found) else ""
+            print(
+                f"\n>>> [GRASP FAILED] Black sock is STILL on the floor after closing gripper{area_info} (sock unreachable or missed)! <<<\n"
+                f"Skipping basket deposit -> Returning to normal stow position and waiting for command.\n"
+            )
 
         print(f"[TEST] Returning to stow pose over {stow_t:.1f}s...")
         arm.move_to_stow(duration_s=stow_t, feedback_cb=lambda _: base.hold_lock())
@@ -803,9 +834,9 @@ def parse_args():
     parser.add_argument(
         "-C", "--case",
         type=int,
-        choices=[1, 2, 3, 4, 5, 6, 7, 8],
+        choices=[1, 2, 3, 4, 5, 6, 7, 8, 9],
         default=None,
-        help="Demo case to run (1: Leader Arm, 2: Gamepad Arm, 3: Network Teleop, 4: Vision Autonomous Grasp, 5: Teach Basket, 6: Teach Grasp, 7: Test Pick, 8: Teach Scan). If omitted, displays interactive menu."
+        help="Demo case to run (1: Leader Arm, 2: Gamepad Arm, 3: Network Teleop, 4: Vision Autonomous Grasp, 5: Teach Basket, 6: Teach Grasp, 7: Test Pick, 8: Teach Scan, 9: Calibrate HSV). If omitted, displays interactive menu."
     )
     parser.add_argument(
         "-c", "--config",
@@ -836,6 +867,11 @@ def parse_args():
         "--test-pick",
         action="store_true",
         help="Execute a test pick-and-place sequence from floor to basket to verify reach and grip"
+    )
+    parser.add_argument(
+        "--calibrate-hsv",
+        action="store_true",
+        help="Launch live HSV calibration tool showing H, S, and V channels/masks separately with Web Dashboard & CLI"
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -874,11 +910,15 @@ def main():
         test_pick(args.config, dry_run=dry_run)
         return
 
+    if args.calibrate_hsv:
+        calibrate_hsv(args.config, dry_run=dry_run)
+        return
+
     # Determine demonstration case
     case = args.case
     if case is None:
         cfg_case = config.get("case")
-        if cfg_case in (1, 2, 3, 4, 5, 6, 7, 8):
+        if cfg_case in (1, 2, 3, 4, 5, 6, 7, 8, 9):
             case = cfg_case
         else:
             case = select_case_interactive(default_case=1)
@@ -894,6 +934,9 @@ def main():
         return
     elif case == 8:
         teach_scan(args.config, dry_run=dry_run)
+        return
+    elif case == 9:
+        calibrate_hsv(args.config, dry_run=dry_run)
         return
 
     case_names = {

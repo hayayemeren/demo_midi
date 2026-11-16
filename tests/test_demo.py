@@ -1179,6 +1179,203 @@ def test_gamepad_safety_deadzone_and_watchdog():
     assert sm.state == DemoState.BASE_DRIVE
 
 
+def test_hsv_separate_channels_and_calibration():
+    """Verify separate H, S, V channel views, masks, probe readouts, live updates, and config persistence."""
+    import tempfile
+    import yaml
+    from src.vision_grasp import WristCamera, SockDetector, update_config_hsv
+
+    cam = WristCamera(dry_run=True)
+    cam.connect()
+    ok, frame = cam.capture_frame()
+    assert ok is True and frame is not None
+
+    det = SockDetector(
+        mode="hsv",
+        hsv_lower=[0, 0, 0],
+        hsv_upper=[179, 255, 70],
+        gripper_hsv_lower=[75, 70, 70],
+        gripper_hsv_upper=[115, 255, 255],
+        save_debug_image=False,
+    )
+    det.apply_hsv_update({"probe_x": 340, "probe_y": 220})
+    res = det.detect(frame, build_hsv_views=True)
+    assert res.found is True
+    assert res.hsv_h_frame is not None
+    assert res.hsv_s_frame is not None
+    assert res.hsv_v_frame is not None
+    assert res.hsv_sv_inv_frame is not None
+    assert res.hsv_channels_frame is not None
+    assert res.gripper_mask_frame is not None
+
+    hs = res.hsv_stats
+    assert hs["probe_x"] == 340 and hs["probe_y"] == 220
+    assert 0 <= hs["probe_h"] <= 179
+    assert 0 <= hs["probe_s"] <= 255
+    assert 0 <= hs["probe_v"] <= 70
+    assert hs["probe_v_inv"] == 255 - hs["probe_v"]
+    assert hs["probe_sv_inv_raw"] == hs["probe_s"] * hs["probe_v_inv"]
+    assert hs["sock_h_mean"] is not None
+    assert hs["sock_s_mean"] is not None
+    assert hs["sock_v_mean"] is not None
+    assert hs["sock_v_inv_mean"] is not None
+    assert hs["sock_sv_inv_mean"] is not None
+    assert hs["h_pass_pct"] >= hs["hsv_pass_pct"]
+
+    with tempfile.NamedTemporaryFile("w+", suffix=".yaml", delete=False) as tf:
+        tf.write("""# Test HSV config
+case4:
+  detection:
+    mode: "auto"
+    contrast_threshold: 35.0
+    hsv_lower: [0, 0, 0]
+    hsv_upper: [179, 255, 70]
+    gripper_hsv_lower: [75, 70, 70]
+    gripper_hsv_upper: [115, 255, 255]
+""")
+        tmp_path = tf.name
+
+    try:
+        saved = update_config_hsv(
+            config_path=tmp_path,
+            hsv_lower=[10, 20, 5],
+            hsv_upper=[160, 240, 80],
+            gripper_hsv_lower=[80, 60, 60],
+            gripper_hsv_upper=[110, 255, 255],
+            mode="hsv",
+            contrast_threshold=42.0,
+        )
+        assert saved is True
+        with open(tmp_path, "r") as f:
+            parsed = yaml.safe_load(f)
+        d_sec = parsed["case4"]["detection"]
+        assert d_sec["hsv_lower"] == [10, 20, 5]
+        assert d_sec["hsv_upper"] == [160, 240, 80]
+        assert d_sec["gripper_hsv_lower"] == [80, 60, 60]
+        assert d_sec["gripper_hsv_upper"] == [110, 255, 255]
+        assert d_sec["mode"] == "hsv"
+        assert d_sec["contrast_threshold"] == 42.0
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def test_signed_floor_darkness_glare_solidity_and_distance_transform():
+    """Verify Signed Floor-Relative Darkness rejects bright floor glare, Solidity filters thin noise,
+    Distance Transform targets the thickest interior part of an L-shaped sock, and scan sweep locks the snapshot."""
+    import cv2
+    import numpy as np
+    from src.vision_grasp import SockDetector, VisionDebugServer
+
+    # 1. Bright glare spot (intensity 255, area ~5000px) on a floor of intensity 170:
+    # Old abs(I - floor) = 85 > 35 would falsely detect glare!
+    # New signed darkness clip(floor - I, 0, 255) = 0 -> must reject glare completely.
+    glare_frame = np.full((480, 640, 3), 170, dtype=np.uint8)
+    cv2.circle(glare_frame, (320, 240), 42, (255, 255, 255), -1)
+
+    det = SockDetector(
+        mode="auto",
+        contrast_threshold=35.0,
+        v_max=75,
+        max_floor_ratio=0.65,
+        min_solidity=0.45,
+        save_debug_image=False,
+    )
+    res_glare = det.detect(glare_frame)
+    assert res_glare.found is False, "Signed floor-relative darkness must ignore bright floor glare spots"
+
+    # 2. L-shaped dark sock + bright glare spot on the same floor:
+    # Must ignore glare and place grasp target inside the thickest junction of the L-shaped sock.
+    l_sock_frame = glare_frame.copy()
+    cv2.rectangle(l_sock_frame, (180, 180), (225, 310), (20, 20, 20), -1)
+    cv2.rectangle(l_sock_frame, (180, 265), (310, 310), (20, 20, 20), -1)
+
+    res_l = det.detect(l_sock_frame)
+    assert res_l.found is True, "Must detect L-shaped dark sock on floor"
+    gx, gy = int(round(res_l.cx)), int(round(res_l.cy))
+    # Verify the selected grasp point (gx, gy) lies strictly on the dark sock cloth (intensity < 50)
+    assert l_sock_frame[gy, gx, 0] < 50, (
+        f"Distance-Transform grasp point ({gx}, {gy}) must land on dark sock interior, got pixel={l_sock_frame[gy, gx]}"
+    )
+    assert res_l.hsv_stats.get("sock_solidity", 0.0) >= 0.45
+
+    # 3. Verify VisionDebugServer.lock_detection stores captured snapshot
+    VisionDebugServer.lock_detection(
+        annotated_frame=res_l.annotated_frame,
+        label="Unit Test Lock",
+        area=res_l.area,
+        cx=res_l.cx,
+        cy=res_l.cy,
+    )
+    srv = VisionDebugServer.get_instance()
+    assert srv._latest_locked_detection is not None and len(srv._latest_locked_detection) > 1000
+    assert srv._latest_locked_meta.get("label") == "Unit Test Lock"
+
+
+def test_post_clamp_camera_verification_aborts_basket_on_missed_or_unreachable_sock():
+    """Verify that after closing the gripper and lifting:
+    - If the black sock is STILL visible on the floor (missed or unreachable), the robot aborts the basket dump
+      and returns to normal stow position waiting for a command.
+    - If the black sock is NO LONGER on the floor (picked up into the jaws), the robot proceeds to the basket."""
+    import cv2
+    import numpy as np
+    from src.vision_grasp import VisionDebugServer
+
+    cfg = {
+        "dry_run": True,
+        "serial": {"port": "/dev/null"},
+        "motors": {"left_id": 1, "right_id": 2},
+        "arm": {"follower_port": "/dev/null", "interpolation_time_s": 0.01},
+        "gamepad": {"switch_button": "Y"},
+        "case4": {
+            "camera": {"device": "/dev/null"},
+            "detection": {"mode": "auto", "save_debug_image": False},
+        },
+    }
+
+    base = BaseController(cfg, dry_run=True)
+    arm = ArmController(cfg, dry_run=True)
+    gamepad = F710Gamepad()
+    base.connect()
+    arm.connect_follower()
+
+    sm = DemoStateMachine(base=base, arm=arm, gamepad=gamepad, demo_case=4, loop_hz=50.0, config=cfg)
+    sm.running = True
+    sm.camera.connect()
+
+    # 1. Press [Y] -> Scan finds sock -> Align -> Grasp (descends, closes gripper, lifts)
+    sm._handle_base_drive(GamepadState(button_y_pressed=True, connected=True), dt=0.02)
+    assert sm.state == DemoState.AUTONOMOUS_PICK_SCAN
+    sm._handle_autonomous_scan(GamepadState())
+    assert sm.state == DemoState.AUTONOMOUS_PICK_ALIGN
+    sm._handle_autonomous_align(GamepadState())
+    assert sm.state == DemoState.AUTONOMOUS_PICK_GRASP
+    sm._handle_autonomous_grasp(GamepadState())
+    assert sm.state == DemoState.AUTONOMOUS_PICK_VERIFY
+
+    # 2. Simulate post-clamp camera view where grasp MISSED / sock was UNREACHABLE:
+    # The black sock is STILL lying on the floor in front of the gripper!
+    sock_still_on_floor_frame = np.full((480, 640, 3), 170, dtype=np.uint8)
+    cv2.ellipse(sock_still_on_floor_frame, (270, 241), (45, 25), 0, 0, 360, (20, 20, 20), -1)
+    sm.camera.capture_frame = lambda max_staleness_s=0.25, min_timestamp=None: (True, sock_still_on_floor_frame.copy())
+
+    # 3. Verify step sees the black sock is STILL on the floor -> skips AUTONOMOUS_BASKET_DUMP and goes to PARKING
+    sm._handle_autonomous_verify(GamepadState())
+    assert sm.state == DemoState.PARKING, (
+        f"Expected PARKING (abort basket when sock is still on the floor), got {sm.state}"
+    )
+    srv = VisionDebugServer.get_instance()
+    assert "FAIL" in srv._latest_locked_meta.get("label", "").upper()
+
+    # 4. Parking returns arm to normal stow position and unlocks base to wait for next command
+    sm._handle_parking()
+    assert sm.state == DemoState.BASE_DRIVE
+    assert base.is_locked is False
+    for k, v in arm.stow_pose.items():
+        assert abs(arm.sim_follower_pose[k] - v) < 1e-3, f"Joint {k} must return to normal stow position"
+    sm.stop()
+
+
 if __name__ == "__main__":
     test_ddsm_crc8_spec()
     print("  [PASS] test_ddsm_crc8_spec")
@@ -1226,7 +1423,14 @@ if __name__ == "__main__":
     print("  [PASS] test_hover_horizon_rejection_and_floor_anchor")
     test_gamepad_safety_deadzone_and_watchdog()
     print("  [PASS] test_gamepad_safety_deadzone_and_watchdog")
+    test_hsv_separate_channels_and_calibration()
+    print("  [PASS] test_hsv_separate_channels_and_calibration")
+    test_signed_floor_darkness_glare_solidity_and_distance_transform()
+    print("  [PASS] test_signed_floor_darkness_glare_solidity_and_distance_transform")
+    test_post_clamp_camera_verification_aborts_basket_on_missed_or_unreachable_sock()
+    print("  [PASS] test_post_clamp_camera_verification_aborts_basket_on_missed_or_unreachable_sock")
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
+
 
 
 

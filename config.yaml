@@ -178,14 +178,21 @@ case4:
     gripper.pos: 85.0  # Suggestion 2: Tactile / Position grasp verification threshold (%)
   # Empty jaws close to ~4.5%; trapped cloth holds jaws >= 4.8%
   grasp_verification_threshold_pct: 4.8
-  abort_on_miss: false         # If false, always proceeds to basket without dropping on floor
+  abort_on_miss: true          # Verify with camera after gripper closes; if no sock is seen, return to stow pose instead of basket
 
-  # Vision Detection Settings
+  # Vision Detection Settings (Signed Floor-Relative Darkness + Distance-Transform Grasp Targeting)
   detection:
-    mode: "auto"                # "auto", "contrast", or "color"
+    mode: "auto"                # "auto" / "darkness" (Signed Floor-Relative Darkness + Solidity + Distance-Transform)
     min_area: 800.0             # minimum contour area (pixels) - rejects small floor noise
     max_area: 80000.0           # maximum contour area (pixels)
-    contrast_threshold: 35.0    # threshold against median floor background (rejects floor seams diff ~26)
+    contrast_threshold: 35.0    # minimum signed darkness (Floor_Median - Gray >= threshold)
+    v_max: 75                   # maximum sock brightness cap (0-255)
+    max_floor_ratio: 0.65       # adaptive brightness cap ratio relative to floor median (0.20-0.95)
+    min_solidity: 0.45          # minimum contour solidity (Area / ConvexHullArea) to reject thin shadows
+    hsv_lower: [0, 0, 0]        # Legacy HSV lower bound [H_min, S_min, V_min]
+    hsv_upper: [179, 255, 75]   # Legacy HSV upper bound [H_max, S_max, V_max]
+    gripper_hsv_lower: [77, 137, 131]     # Cyan gripper exclusion HSV lower bound [H_min, S_min, V_min]
+    gripper_hsv_upper: [113, 237, 231]   # Cyan gripper exclusion HSV upper bound [H_max, S_max, V_max]
     border_margin: 4            # pixels from ROI edge to reject border vignetting
     roi_top_pct: 0.06           # Active floor ROI top margin
     roi_bottom_pct: 0.86        # Active floor ROI bottom margin (expanded for Left/Right/Near floor coverage)
@@ -196,7 +203,7 @@ case4:
     debug_raw_path: "/tmp/sock_raw.jpg"
     debug_mask_path: "/tmp/sock_mask.jpg"
     debug_combined_path: "/tmp/sock_combined.jpg"
-    enable_web_stream: false    # Web stream disabled to eliminate CPU overhead and latency
+    enable_web_stream: true     # Live Web Debug & Calibration Stream active at http://<robot-ip>:8080/
     web_stream_port: 8080
 
   # Visual Servoing Gains
