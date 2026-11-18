@@ -646,10 +646,10 @@ class DemoStateMachine:
         self.state = DemoState.AUTONOMOUS_PICK_VERIFY
 
     def _handle_autonomous_verify(self, gp: GamepadState):
-        """Case 4: Takes a camera image after the gripper closes and lifts to check whether
-        the black sock is still on the floor.
-        - If the sock is NO LONGER on the floor (`det_verify.found == False`), it was picked up -> proceed to basket.
-        - If the sock is STILL on the floor (`det_verify.found == True`), grasp failed -> return to stow position."""
+        """Case 4: Returns robot arm to initial position (with gripper closed at 0%)
+        and checks with wrist camera whether a black sock is held between the gripper arms.
+        - If a sock IS detected between the gripper arms (`det_verify.found == True`), proceed to basket.
+        - If NO sock is detected between the gripper arms (`det_verify.found == False`), kill pick process and wait for next input."""
         self.base.hold_lock()
 
         cur_pose = self.arm.get_follower_pose()
@@ -657,8 +657,8 @@ class DemoStateMachine:
         if self.arm.dry_run:
             measured_grip = 25.0
 
-        VisionDebugServer.set_stage("VERIFY", "Checking post-clamp camera image for sock on floor...")
-        logger.info("\n[VERIFY] Capturing post-clamp camera image to check if black sock was picked up off the floor...")
+        VisionDebugServer.set_stage("VERIFY", "Returning to initial position & checking for sock between gripper arms...")
+        logger.info("\n[VERIFY] Returning robot arm to initial position and checking if sock is between gripper arms...")
         if self.planner is not None and hasattr(self.planner, "verify_grasp_with_camera"):
             is_caught, det_verify = self.planner.verify_grasp_with_camera(
                 arm=self.arm,
@@ -673,18 +673,18 @@ class DemoStateMachine:
         abort_on_miss = getattr(self.planner, "abort_on_miss", True)
 
         if is_caught or not abort_on_miss:
-            VisionDebugServer.set_stage("BASKET", "Floor clear! Transporting sock to rear basket...")
+            area_str = f"Area: {det_verify.area:.0f}px, " if (det_verify is not None and det_verify.found) else ""
+            VisionDebugServer.set_stage("BASKET", "Sock confirmed between gripper arms! Transporting to rear basket...")
             logger.info(
-                f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [GRASP VERIFIED] Floor is clear — black sock was picked up off the floor (Grip: {measured_grip:.1f}%)! <<<{COLOR_RESET}\n"
+                f"\n{COLOR_BOLD}{COLOR_GREEN}>>> [GRASP VERIFIED] Sock detected between gripper arms at initial position ({area_str}Grip: {measured_grip:.1f}%)! <<<{COLOR_RESET}\n"
                 f"Transporting sock to basket with clamped jaws..."
             )
             self.state = DemoState.AUTONOMOUS_BASKET_DUMP
         else:
-            area_str = f" (Sock still on floor: {det_verify.area:.0f}px)" if (det_verify is not None and det_verify.found) else ""
-            VisionDebugServer.set_stage("STOW", f"Grasp failed (sock still on floor{area_str}) -> Returning to Stow")
+            VisionDebugServer.set_stage("STOW", "Grasp failed (no sock between gripper arms) -> Killing pick & waiting for input")
             logger.warning(
-                f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP FAILED] Black sock is STILL on the floor after closing gripper{area_str} (unreachable or missed)! <<<{COLOR_RESET}\n"
-                f"Skipping basket dump -> Returning arm to normal position and waiting for command."
+                f"\n{COLOR_BOLD}{COLOR_YELLOW}>>> [GRASP FAILED] No sock detected between gripper arms at initial position! <<<{COLOR_RESET}\n"
+                f"Killing pick process (skipping basket dump) -> Returning arm to initial stow position and waiting for next input."
             )
             self.state = DemoState.PARKING
 

@@ -13,11 +13,19 @@ import math
 import os
 import socket
 import socketserver
+import struct
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple, Any
+
+try:
+    import fcntl
+    import termios
+except ImportError:
+    fcntl = None  # type: ignore
+    termios = None  # type: ignore
 
 import cv2
 import numpy as np
@@ -319,8 +327,11 @@ class VisionDebugHandler(http.server.BaseHTTPRequestHandler):
             det = srv.detector
             if det is not None:
                 det.apply_hsv_update(payload)
-                # Re-run detection immediately on cached raw frame so streams reflect slider change right away
-                if srv._latest_raw_ndarray is not None:
+                # Wake background detection worker if streaming; otherwise re-run on cached raw frame
+                if srv.camera is not None and getattr(srv.camera, "_streaming", False) and hasattr(srv.camera, "_detect_event"):
+                    srv.camera._force_detect = True
+                    srv.camera._detect_event.set()
+                elif srv._latest_raw_ndarray is not None:
                     try:
                         det.detect(srv._latest_raw_ndarray.copy())
                     except Exception:
@@ -375,6 +386,8 @@ class VisionDebugServer:
     """Lightweight HTTP server publishing live MJPEG streams, locked sock snapshots, and interactive debug/scan UI."""
     _instance: Optional[VisionDebugServer] = None
     _lock = threading.Lock()
+    _frame_cond = threading.Condition(_lock)
+    _placeholder_locked_bytes: Optional[bytes] = None
 
     def __init__(self, port: int = 8080):
         self.port = port
@@ -390,6 +403,7 @@ class VisionDebugServer:
         self._latest_mask: Optional[bytes] = None
         self._latest_annotated: Optional[bytes] = None
         self._latest_locked_detection: Optional[bytes] = None
+        self._last_auto_lock_time: float = 0.0
         self._latest_locked_meta: Dict[str, Any] = {
             "has_locked": False,
             "label": "No sock locked yet",
@@ -445,6 +459,17 @@ class VisionDebugServer:
                 "updated_at": time.strftime("%H:%M:%S"),
             }
 
+    @staticmethod
+    def _encode_stream_jpeg(frame: np.ndarray, quality: int = 44, grayscale: bool = False) -> bytes:
+        """Encode a camera/debug frame to compact JPEG (~3-5 KB) so 4 concurrent MJPEG streams never saturate Wi-Fi."""
+        img = frame[:, :, 0] if (grayscale and frame.ndim == 3) else frame
+        h, w = img.shape[:2]
+        if w > 400:
+            new_h = max(1, int(round(h * (400.0 / w))))
+            img = cv2.resize(img, (400, new_h), interpolation=cv2.INTER_AREA)
+        _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        return buf.tobytes()
+
     @classmethod
     def lock_detection(
         cls,
@@ -455,6 +480,7 @@ class VisionDebugServer:
         cx: float = 0.0,
         cy: float = 0.0,
         meta: Optional[Dict[str, Any]] = None,
+        save_to_disk: bool = True,
         **kwargs: Any,
     ):
         """Lock and store the exact annotated camera frame when a sock is detected by the gripper/camera."""
@@ -484,14 +510,15 @@ class VisionDebugServer:
             banner = f"CAPTURED SOCK @ {label} [{ts}] | Pos=({int(cx)},{int(cy)}) | Area={int(area)}px"
         cv2.putText(snap, banner, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2, cv2.LINE_AA)
 
-        try:
-            cv2.imwrite("/tmp/last_sock_detection.jpg", snap)
-        except Exception:
-            pass
+        if save_to_disk:
+            try:
+                cv2.imwrite("/tmp/last_sock_detection.jpg", snap)
+            except Exception:
+                pass
 
-        _, buf = cv2.imencode(".jpg", snap, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        with cls._lock:
-            inst._latest_locked_detection = buf.tobytes()
+        snap_bytes = cls._encode_stream_jpeg(snap, quality=46)
+        with cls._frame_cond:
+            inst._latest_locked_detection = snap_bytes
             inst._latest_locked_meta = {
                 "has_locked": True,
                 "label": label,
@@ -502,6 +529,7 @@ class VisionDebugServer:
                 "pan_deg": round(float(coords[1]), 1) if coords is not None else None,
                 "timestamp": ts,
             }
+            cls._frame_cond.notify_all()
 
     def execute_web_scan_action(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Handle interactive Scan, Pose, or Full Pick & Deposit buttons from the Web Debug Screen."""
@@ -643,7 +671,7 @@ class VisionDebugServer:
                 self.arm.move_to_pose(stages["lift"], duration_s=self.planner.lift_duration_s)
                 time.sleep(0.3)
 
-                self.set_stage("VERIFY", "Checking post-clamp camera image for sock on floor...", r_cm=r_t * 100.0, pan_deg=pan_t)
+                self.set_stage("VERIFY", "Returning to initial position & checking for sock between gripper arms...", r_cm=r_t * 100.0, pan_deg=pan_t)
                 is_caught, det_verify = self.planner.verify_grasp_with_camera(
                     arm=self.arm,
                     camera=self.camera,
@@ -651,14 +679,14 @@ class VisionDebugServer:
                 )
 
                 if is_caught:
-                    self.set_stage("BASKET", "Floor clear! Depositing sock into rear basket...", r_cm=r_t * 100.0, pan_deg=pan_t)
+                    self.set_stage("BASKET", "Sock confirmed between gripper arms! Depositing into rear basket...", r_cm=r_t * 100.0, pan_deg=pan_t)
                     deposited = self.planner.execute_basket_deposit(arm=self.arm)
                     self.set_stage("STOW", "Returning arm to normal Stow Pose...")
                     self.arm.move_to_stow(duration_s=self.planner.stow_duration_s)
                     msg = (
-                        f"SUCCESS! Sock picked at {best['label']} (R={r_t*100:.1f}cm, Pan={pan_t:+.1f}°) and deposited into basket!"
+                        f"SUCCESS! Sock picked at {best['label']} (R={r_t*100:.1f}cm, Pan={pan_t:+.1f}°), verified between gripper arms, and deposited into basket!"
                         if deposited
-                        else f"Grasp verified, but basket deposit aborted by safety gate."
+                        else f"Grasp verified between gripper arms, but basket deposit aborted by safety gate."
                     )
                     self.set_stage("IDLE", msg, r_cm=r_t * 100.0, pan_deg=pan_t)
                     return {
@@ -670,9 +698,9 @@ class VisionDebugServer:
                         "message": msg,
                     }
                 else:
-                    self.set_stage("STOW", "Grasp failed (sock still on floor) -> Returning to Stow Pose...")
+                    self.set_stage("STOW", "Grasp failed (no sock between gripper arms) -> Killing pick & waiting for input...")
                     self.arm.move_to_stow(duration_s=self.planner.stow_duration_s)
-                    msg = f"GRASP FAILED: Sock is still on the floor (unreachable or missed). Returned to Stow Pose."
+                    msg = f"GRASP FAILED: No sock detected between gripper arms at initial position. Process terminated; waiting for next input."
                     self.set_stage("IDLE", msg, r_cm=r_t * 100.0, pan_deg=pan_t)
                     return {
                         "ok": True,
@@ -734,42 +762,75 @@ class VisionDebugServer:
         if inst is None or not inst.started:
             return
 
-        with cls._lock:
+        # Encode JPEGs OUTSIDE the lock so active MJPEG stream threads and /status.json are never blocked
+        raw_bytes = None
+        mask_bytes = None
+        ann_bytes = None
+        comb_bytes = None
+        h_bytes = None
+        s_bytes = None
+        v_bytes = None
+        sv_inv_bytes = None
+        chan_bytes = None
+        grip_bytes = None
+
+        if raw_frame is not None:
+            raw_bytes = cls._encode_stream_jpeg(raw_frame, quality=42)
+        if mask_frame is not None:
+            mask_bytes = cls._encode_stream_jpeg(mask_frame, quality=38, grayscale=True)
+        if annotated_frame is not None:
+            ann_bytes = cls._encode_stream_jpeg(annotated_frame, quality=45)
+        if combined_frame is not None:
+            _, buf = cv2.imencode(".jpg", combined_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            comb_bytes = buf.tobytes()
+        if hsv_h_frame is not None:
+            _, buf = cv2.imencode(".jpg", hsv_h_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            h_bytes = buf.tobytes()
+        if hsv_s_frame is not None:
+            _, buf = cv2.imencode(".jpg", hsv_s_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            s_bytes = buf.tobytes()
+        if hsv_v_frame is not None:
+            _, buf = cv2.imencode(".jpg", hsv_v_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            v_bytes = buf.tobytes()
+        if hsv_sv_inv_frame is not None:
+            _, buf = cv2.imencode(".jpg", hsv_sv_inv_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            sv_inv_bytes = buf.tobytes()
+        if hsv_channels_frame is not None:
+            _, buf = cv2.imencode(".jpg", hsv_channels_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            chan_bytes = buf.tobytes()
+        if gripper_mask_frame is not None:
+            _, buf = cv2.imencode(".jpg", gripper_mask_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            grip_bytes = buf.tobytes()
+
+        with cls._frame_cond:
             if meta:
                 inst._latest_meta.update(meta)
             if raw_frame is not None:
                 inst._latest_raw_ndarray = raw_frame
-                _, buf = cv2.imencode(".jpg", raw_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                inst._latest_raw = buf.tobytes()
-            if mask_frame is not None:
-                _, buf = cv2.imencode(".jpg", mask_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                inst._latest_mask = buf.tobytes()
-            if annotated_frame is not None:
-                _, buf = cv2.imencode(".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                inst._latest_annotated = buf.tobytes()
-            if combined_frame is not None:
-                _, buf = cv2.imencode(".jpg", combined_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                inst._latest_combined = buf.tobytes()
-            if hsv_h_frame is not None:
-                _, buf = cv2.imencode(".jpg", hsv_h_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                inst._latest_hsv_h = buf.tobytes()
-            if hsv_s_frame is not None:
-                _, buf = cv2.imencode(".jpg", hsv_s_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                inst._latest_hsv_s = buf.tobytes()
-            if hsv_v_frame is not None:
-                _, buf = cv2.imencode(".jpg", hsv_v_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                inst._latest_hsv_v = buf.tobytes()
-            if hsv_sv_inv_frame is not None:
-                _, buf = cv2.imencode(".jpg", hsv_sv_inv_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                inst._latest_hsv_sv_inv = buf.tobytes()
-            if hsv_channels_frame is not None:
-                _, buf = cv2.imencode(".jpg", hsv_channels_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                inst._latest_hsv_channels = buf.tobytes()
-            if gripper_mask_frame is not None:
-                _, buf = cv2.imencode(".jpg", gripper_mask_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                inst._latest_gripper_mask = buf.tobytes()
+                inst._latest_raw = raw_bytes
+            if mask_bytes is not None:
+                inst._latest_mask = mask_bytes
+            if ann_bytes is not None:
+                inst._latest_annotated = ann_bytes
+            if comb_bytes is not None:
+                inst._latest_combined = comb_bytes
+            elif ann_bytes is not None and inst._latest_combined is None:
+                inst._latest_combined = ann_bytes
+            if h_bytes is not None:
+                inst._latest_hsv_h = h_bytes
+            if s_bytes is not None:
+                inst._latest_hsv_s = s_bytes
+            if v_bytes is not None:
+                inst._latest_hsv_v = v_bytes
+            if sv_inv_bytes is not None:
+                inst._latest_hsv_sv_inv = sv_inv_bytes
+            if chan_bytes is not None:
+                inst._latest_hsv_channels = chan_bytes
+            if grip_bytes is not None:
+                inst._latest_gripper_mask = grip_bytes
+            cls._frame_cond.notify_all()
 
-        # Automatically update the captured sock snapshot whenever a sock is detected
+        # Live in-memory update of the detected sock snapshot on every detected frame (no disk I/O block)
         if meta and meta.get("found") and annotated_frame is not None:
             cls.lock_detection(
                 annotated_frame=annotated_frame,
@@ -777,14 +838,15 @@ class VisionDebugServer:
                 area=float(meta.get("area", 0.0)),
                 cx=float(meta.get("cx", 0.0)),
                 cy=float(meta.get("cy", 0.0)),
+                save_to_disk=False,
             )
 
     def serve_image(self, handler, jpeg_bytes: Optional[bytes], placeholder_label: str):
         if jpeg_bytes is None:
-            blank = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(blank, placeholder_label, (40, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (140, 140, 140), 2)
-            cv2.putText(blank, "Will capture automatically when sock is detected", (40, 265), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 210, 110), 2)
-            _, buf = cv2.imencode(".jpg", blank)
+            blank = np.zeros((360, 480, 3), dtype=np.uint8)
+            cv2.putText(blank, placeholder_label, (30, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (140, 140, 140), 2)
+            cv2.putText(blank, "Will capture automatically when sock is detected", (30, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 210, 110), 1)
+            _, buf = cv2.imencode(".jpg", blank, [cv2.IMWRITE_JPEG_QUALITY, 55])
             jpeg_bytes = buf.tobytes()
 
         handler.send_response(200)
@@ -796,7 +858,22 @@ class VisionDebugServer:
         handler.wfile.write(jpeg_bytes)
 
     def stream_mjpeg(self, handler, stream_type: str = "combined"):
-        """Serve continuous real-time MJPEG video stream over HTTP multipart."""
+        """Serve continuous real-time MJPEG video stream over HTTP multipart with zero TCP send-buffer lag."""
+        sock = getattr(handler, "connection", None)
+        sock_fd = -1
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32768)
+            except Exception:
+                pass
+            try:
+                sock_fd = sock.fileno()
+            except Exception:
+                sock_fd = -1
         try:
             handler.send_response(200)
             handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
@@ -807,43 +884,62 @@ class VisionDebugServer:
         except Exception:
             return
 
+        if VisionDebugServer._placeholder_locked_bytes is None:
+            blank = np.zeros((360, 480, 3), dtype=np.uint8)
+            cv2.putText(blank, "AWAITING SOCK DETECTION...", (30, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (140, 140, 140), 2)
+            cv2.putText(blank, "Snapshot locks automatically when sock is detected", (30, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 210, 110), 1)
+            _, buf = cv2.imencode(".jpg", blank, [cv2.IMWRITE_JPEG_QUALITY, 55])
+            VisionDebugServer._placeholder_locked_bytes = buf.tobytes()
+
         last_bytes = None
-        last_send_time = time.time()
+        last_send_time = 0.0
         while self.started:
             try:
-                with self._lock:
-                    if stream_type == "raw":
-                        cur_bytes = self._latest_raw
-                    elif stream_type == "mask":
-                        cur_bytes = self._latest_mask
-                    elif stream_type == "detection":
-                        cur_bytes = self._latest_annotated
-                    elif stream_type == "last_detected":
-                        cur_bytes = self._latest_locked_detection
-                        if cur_bytes is None:
-                            blank = np.zeros((480, 640, 3), dtype=np.uint8)
-                            cv2.putText(blank, "AWAITING SOCK DETECTION...", (40, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (140, 140, 140), 2)
-                            cv2.putText(blank, "Snapshot locks automatically when sock is detected", (40, 265), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 210, 110), 1)
-                            _, buf = cv2.imencode(".jpg", blank)
-                            cur_bytes = buf.tobytes()
-                    elif stream_type == "hsv_h":
-                        cur_bytes = self._latest_hsv_h
-                    elif stream_type == "hsv_s":
-                        cur_bytes = self._latest_hsv_s
-                    elif stream_type == "hsv_v":
-                        cur_bytes = self._latest_hsv_v
-                    elif stream_type == "hsv_sv_inv":
-                        cur_bytes = self._latest_hsv_sv_inv
-                    elif stream_type == "hsv_channels":
-                        cur_bytes = self._latest_hsv_channels
-                    elif stream_type == "gripper_mask":
-                        cur_bytes = self._latest_gripper_mask
-                    else:
-                        cur_bytes = self._latest_combined
+                # Prevent Linux kernel TCP send buffer bloat over Wi-Fi while allowing 1 RTT Bandwidth-Delay Product (~24 KB)
+                if sock_fd >= 0 and fcntl is not None and termios is not None:
+                    wait_deadline = time.time() + 0.30
+                    while self.started and time.time() < wait_deadline:
+                        try:
+                            outq = struct.unpack("I", fcntl.ioctl(sock_fd, termios.TIOCOUTQ, b"\x00\x00\x00\x00"))[0]
+                            if outq <= 24576:
+                                break
+                        except Exception:
+                            break
+                        time.sleep(0.005)
+
+                with self._frame_cond:
+                    def _get_cur():
+                        if stream_type == "raw":
+                            return self._latest_raw
+                        elif stream_type == "mask":
+                            return self._latest_mask
+                        elif stream_type == "detection":
+                            return self._latest_annotated
+                        elif stream_type == "last_detected":
+                            return self._latest_locked_detection or VisionDebugServer._placeholder_locked_bytes
+                        elif stream_type == "hsv_h":
+                            return self._latest_hsv_h
+                        elif stream_type == "hsv_s":
+                            return self._latest_hsv_s
+                        elif stream_type == "hsv_v":
+                            return self._latest_hsv_v
+                        elif stream_type == "hsv_sv_inv":
+                            return self._latest_hsv_sv_inv
+                        elif stream_type == "hsv_channels":
+                            return self._latest_hsv_channels
+                        elif stream_type == "gripper_mask":
+                            return self._latest_gripper_mask
+                        else:
+                            return self._latest_combined or self._latest_annotated
+
+                    cur_bytes = _get_cur()
+                    if cur_bytes is None or cur_bytes is last_bytes:
+                        self._frame_cond.wait(timeout=0.05)
+                        cur_bytes = _get_cur()
 
                 now = time.time()
-                # Send if new frame or keepalive heartbeat every 0.6s
-                if cur_bytes is not None and (cur_bytes != last_bytes or (now - last_send_time >= 0.6)):
+                # Push immediately when a new frame arrives, or send keepalive every 1.0s
+                if cur_bytes is not None and (cur_bytes is not last_bytes or (now - last_send_time >= 1.0)):
                     last_bytes = cur_bytes
                     last_send_time = now
                     header = (
@@ -853,8 +949,6 @@ class VisionDebugServer:
                     )
                     handler.wfile.write(header + cur_bytes + b"\r\n")
                     handler.wfile.flush()
-
-                time.sleep(0.04)  # ~25 FPS max stream output rate
             except (BrokenPipeError, ConnectionResetError, socket.error):
                 break
             except Exception:
@@ -1074,6 +1168,8 @@ class VisionDebugServer:
 
     <script>
         let slidersInitialized = false;
+        let statusInFlight = false;
+        let sliderDebounceTimer = null;
 
         function syncInput(srcId, dstId) {
             document.getElementById(dstId).value = document.getElementById(srcId).value;
@@ -1109,7 +1205,7 @@ class VisionDebugServer:
             }
         }
 
-        function pushConstantsUpdate(saveToDisk) {
+        function _sendConstantsUpdate(saveToDisk) {
             const vmax = Number(document.getElementById('v-max-num').value || 75);
             const payload = {
                 mode: 'auto',
@@ -1147,6 +1243,16 @@ class VisionDebugServer:
                 }
             })
             .catch(() => {});
+        }
+
+        function pushConstantsUpdate(saveToDisk) {
+            if (saveToDisk) {
+                if (sliderDebounceTimer) clearTimeout(sliderDebounceTimer);
+                _sendConstantsUpdate(true);
+            } else {
+                if (sliderDebounceTimer) clearTimeout(sliderDebounceTimer);
+                sliderDebounceTimer = setTimeout(() => _sendConstantsUpdate(false), 75);
+            }
         }
 
         function runScanAction(payload) {
@@ -1194,6 +1300,8 @@ class VisionDebugServer:
         }
 
         function checkStatus() {
+            if (statusInFlight) return;
+            statusInFlight = true;
             fetch('/status.json')
                 .then(r => r.json())
                 .then(d => {
@@ -1261,7 +1369,8 @@ class VisionDebugServer:
                         }
                     }
                 })
-                .catch(() => {});
+                .catch(() => {})
+                .finally(() => { statusInFlight = false; });
         }
 
         function reloadStreams() {
@@ -1272,7 +1381,7 @@ class VisionDebugServer:
             document.getElementById('img-last-detected').src = '/stream/last_detected?t=' + t;
         }
 
-        setInterval(checkStatus, 300);
+        setInterval(checkStatus, 250);
     </script>
 </body>
 </html>"""
@@ -1329,9 +1438,15 @@ class WristCamera:
         # Live background stream worker & health monitoring
         self._streaming = False
         self._stream_thread: Optional[threading.Thread] = None
+        self._detect_thread: Optional[threading.Thread] = None
+        self._cap_lock = threading.Lock()
         self._frame_lock = threading.Lock()
+        self._detect_event = threading.Event()
+        self._force_detect = False
         self._latest_raw_frame: Optional[np.ndarray] = None
         self._latest_frame_time: float = 0.0
+        self._latest_frame_seq: int = 0
+        self._last_detection_result: Optional[Any] = None
         self._consecutive_failures: int = 0
         self._detector: Optional[Any] = None
         self._target_fps: float = 20.0
@@ -1379,15 +1494,20 @@ class WristCamera:
                 self.cap = cv2.VideoCapture(target, backend)
 
                 if self.cap.isOpened():
-                    try:
-                        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("M", "J", "P", "G"))
-                        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-                            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    except Exception:
-                        pass
                     self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                     self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                    try:
+                        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("M", "J", "P", "G"))
+                    except Exception:
+                        pass
                     self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+                    try:
+                        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+                            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        if os.name == "posix" and isinstance(target, int):
+                            os.system(f"v4l2-ctl -d /dev/video{target} -c exposure_dynamic_framerate=0 >/dev/null 2>&1")
+                    except Exception:
+                        pass
                     # Warm up camera buffer
                     ret = False
                     for _ in range(5):
@@ -1492,21 +1612,28 @@ class WristCamera:
             return True
 
     def _generate_synthetic_frame(self) -> np.ndarray:
-        """Generate a realistic synthetic camera frame with simulated sock (unless already picked up in simulation)."""
+        """Generate a realistic synthetic camera frame with simulated sock on floor or held between gripper arms."""
         frame = np.full((self.height, self.width, 3), 150, dtype=np.uint8)
         noise = np.random.randint(-15, 15, (self.height, self.width, 3), dtype=np.int16)
         frame = np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
         if not getattr(self, "_sim_sock_picked", False):
+            # Simulated sock lying on the floor in front of the gripper
             cv2.ellipse(frame, (340, 220), (45, 25), 20, 0, 360, (30, 30, 40), -1)
+        else:
+            # Simulated sock held between the left and right cyan gripper arms
+            cv2.ellipse(frame, (320, 395), (38, 45), 0, 0, 360, (25, 25, 30), -1)
         cv2.fillPoly(frame, [np.array([[180, 480], [240, 340], [280, 360], [220, 480]])], (180, 150, 0))
         cv2.fillPoly(frame, [np.array([[460, 480], [400, 340], [360, 360], [420, 480]])], (180, 150, 0))
         return frame
 
     def start_stream(self, detector: Optional[Any] = None, target_fps: float = 20.0):
-        """Start continuous background video capture and live detection stream."""
+        """Start continuous background video capture and decoupled live detection stream."""
         if self._streaming and self._stream_thread is not None and self._stream_thread.is_alive():
             if detector is not None:
                 self._detector = detector
+            if self._detect_thread is None or not self._detect_thread.is_alive():
+                self._detect_thread = threading.Thread(target=self._detect_worker, daemon=True)
+                self._detect_thread.start()
             return
 
         if not self.is_opened:
@@ -1519,18 +1646,24 @@ class WristCamera:
         self._streaming = True
         self._stream_thread = threading.Thread(target=self._stream_worker, daemon=True)
         self._stream_thread.start()
+        self._detect_thread = threading.Thread(target=self._detect_worker, daemon=True)
+        self._detect_thread.start()
         logger.info(">>> Wrist camera background live stream worker started (~%.1f FPS) <<<", self._target_fps)
 
     def stop_stream(self):
-        """Stop background capture worker."""
+        """Stop background capture and detection workers."""
         self._streaming = False
+        self._detect_event.set()
         if self._stream_thread and self._stream_thread.is_alive():
             self._stream_thread.join(timeout=1.0)
             self._stream_thread = None
+        if self._detect_thread and self._detect_thread.is_alive():
+            self._detect_thread.join(timeout=1.0)
+            self._detect_thread = None
 
     def _stream_worker(self):
-        """Background thread continuously pulling frames with auto-recovery and live stream updates."""
-        base_interval = 1.0 / max(1.0, self._target_fps)
+        """Dedicated hardware capture thread that continuously drains V4L2 buffer with zero processing lag."""
+        base_interval = 1.0 / max(1.0, max(self._target_fps, 25.0))
         frame_count = 0
         fps_t0 = time.time()
 
@@ -1539,8 +1672,7 @@ class WristCamera:
             frame = None
             ret = False
             web_active = bool(self._detector is not None and getattr(self._detector, "enable_web_stream", False))
-            # Throttle capture to ~10 FPS when web streaming is disabled to avoid saturating the Pi 4 shared USB 2.0 hub
-            interval = base_interval if web_active else max(base_interval, 0.10)
+            interval = base_interval if web_active else max(base_interval, 0.08)
 
             if self.dry_run:
                 frame = self._generate_synthetic_frame()
@@ -1554,7 +1686,8 @@ class WristCamera:
                         time.sleep(0.2)
                         continue
 
-                    ret, frame = self.cap.read()
+                    with self._cap_lock:
+                        ret, frame = self.cap.read()
                 except Exception as e:
                     logger.debug("Camera read exception: %s", e)
                     ret = False
@@ -1566,6 +1699,7 @@ class WristCamera:
                 with self._frame_lock:
                     self._latest_raw_frame = frame
                     self._latest_frame_time = now
+                    self._latest_frame_seq += 1
 
                 frame_count += 1
                 fps_elapsed = now - fps_t0
@@ -1574,26 +1708,66 @@ class WristCamera:
                     frame_count = 0
                     fps_t0 = now
 
-                # Process detection continuously to update the web debugger in real time only if web stream is enabled
                 if web_active:
-                    try:
-                        self._detector.detect(frame)
-                        srv = VisionDebugServer._instance
-                        if srv and srv.started:
-                            with srv._lock:
-                                srv._latest_meta["fps"] = round(self._measured_fps, 1)
-                    except Exception as e:
-                        logger.debug("Background detector stream error: %s", e)
+                    self._detect_event.set()
             else:
                 self._consecutive_failures += 1
                 if self._consecutive_failures >= 8:  # ~0.4s of consecutive drops
                     logger.warning("[CAMERA] Lost %d consecutive frames. Re-establishing camera connection...", self._consecutive_failures)
                     self._reconnect_camera()
 
-            elapsed = time.time() - loop_start
-            sleep_t = interval - elapsed
-            if sleep_t > 0:
-                time.sleep(sleep_t)
+            # On real V4L2 hardware with web_active=True, cap.read() is already paced by the camera sensor clock.
+            # Do not add extra sleep after a successful V4L2 read so the V4L2 buffer stays completely drained.
+            if self.dry_run or not web_active or not ret:
+                elapsed = time.time() - loop_start
+                sleep_t = interval - elapsed
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+
+    def _detect_worker(self):
+        """Asynchronous vision detection worker: always processes the most recent raw frame (zero queue delay)."""
+        last_seq = -1
+        det_count = 0
+        fps_t0 = time.time()
+        det_fps = 0.0
+
+        while self._streaming:
+            self._detect_event.wait(timeout=0.05)
+            self._detect_event.clear()
+            if not self._streaming:
+                break
+
+            web_active = bool(self._detector is not None and getattr(self._detector, "enable_web_stream", False))
+            if not web_active or self._detector is None:
+                time.sleep(0.05)
+                continue
+
+            with self._frame_lock:
+                frame = self._latest_raw_frame
+                seq = self._latest_frame_seq
+                forced = self._force_detect
+                self._force_detect = False
+
+            if frame is None or (seq == last_seq and not forced):
+                continue
+
+            last_seq = seq
+            try:
+                res = self._detector.detect(frame)
+                self._last_detection_result = res
+                det_count += 1
+                now = time.time()
+                fps_elapsed = now - fps_t0
+                if fps_elapsed >= 1.0:
+                    det_fps = det_count / fps_elapsed
+                    det_count = 0
+                    fps_t0 = now
+                srv = VisionDebugServer._instance
+                if srv and srv.started:
+                    with srv._lock:
+                        srv._latest_meta["fps"] = round(det_fps if det_fps > 0 else self._measured_fps, 1)
+            except Exception as e:
+                logger.debug("Background detector stream error: %s", e)
 
     def capture_frame(
         self,
@@ -1624,26 +1798,29 @@ class WristCamera:
                     with self._frame_lock:
                         self._latest_raw_frame = frame
                         self._latest_frame_time = time.time()
+                        self._latest_frame_seq += 1
                     return True, frame.copy()
                 if time.time() >= deadline:
                     break
-                time.sleep(0.02)
+                time.sleep(0.015)
 
             now = time.time()
-            # If still stale/older than min_timestamp, grab directly from hardware
+            # If still stale/older than min_timestamp, grab directly from hardware under _cap_lock
             logger.warning("[CAMERA] Buffered frame is stale (age: %.2fs). Forcing fresh frame grab...", now - self._latest_frame_time)
             if not self.dry_run:
                 if self.cap is None or not self.cap.isOpened():
                     self._reconnect_camera()
                 if self.cap is not None and self.cap.isOpened():
                     try:
-                        for _ in range(4):
-                            self.cap.grab()
-                        ret, frame = self.cap.read()
+                        with self._cap_lock:
+                            for _ in range(2):
+                                self.cap.grab()
+                            ret, frame = self.cap.read()
                         if ret and frame is not None:
                             with self._frame_lock:
                                 self._latest_raw_frame = frame
                                 self._latest_frame_time = time.time()
+                                self._latest_frame_seq += 1
                             return True, frame
                     except Exception as e:
                         logger.debug("Direct read error: %s", e)
@@ -1660,14 +1837,15 @@ class WristCamera:
             if not self.connect():
                 return False, None
 
-        # Flush V4L2 ring buffer so single-shot captures never return pre-motion stale frames
-        for _ in range(5):
-            try:
-                self.cap.grab()
-            except Exception:
-                break
+        with self._cap_lock:
+            # Flush V4L2 ring buffer so single-shot captures never return pre-motion stale frames
+            for _ in range(4):
+                try:
+                    self.cap.grab()
+                except Exception:
+                    break
 
-        ret, frame = self.cap.read()
+            ret, frame = self.cap.read()
         if not ret or frame is None:
             logger.warning("Wrist camera failed to capture frame!")
             return False, None
@@ -1675,6 +1853,7 @@ class WristCamera:
         with self._frame_lock:
             self._latest_raw_frame = frame
             self._latest_frame_time = time.time()
+            self._latest_frame_seq += 1
         return True, frame
 
     def release(self):
@@ -1971,11 +2150,19 @@ class SockDetector:
         blurred = blurred_full[y_min:y_max, x_min:x_max]
 
         # Anchor floor median in the lower 70% of ROI so distant dark horizon/furniture
-        # in upper frames cannot depress the median and light up the floor itself.
+        # in upper frames cannot depress the median, and exclude dark sock pixels (< 80)
+        # when a large close-up sock covers >50% of the floor region.
         floor_region = blurred[int(roi_h * 0.30):, :] if roi_h >= 20 else blurred
-        floor_median = float(np.median(floor_region)) if floor_region.size else 150.0
+        floor_sub = floor_region[::4, ::4] if floor_region.size >= 64 else floor_region
+        bright_floor = floor_sub[floor_sub >= 80]
+        if bright_floor.size >= max(25, int(0.15 * floor_sub.size)):
+            floor_median = float(np.median(bright_floor))
+        elif floor_sub.size:
+            floor_median = float(np.median(floor_sub))
+        else:
+            floor_median = 150.0
         # Signed darkness relative to floor median: only pixels darker than floor produce > 0
-        signed_diff_full = np.clip(floor_median - blurred_full.astype(np.float32), 0.0, 255.0).astype(np.uint8)
+        signed_diff_full = cv2.subtract(int(round(floor_median)), blurred_full)
         signed_diff = signed_diff_full[y_min:y_max, x_min:x_max]
 
         diff = None
@@ -2243,14 +2430,14 @@ class SockDetector:
             "probe_s_max": int(np.max(p_s_patch)),
             "probe_v_min": int(np.min(p_v_patch)),
             "probe_v_max": int(np.max(p_v_patch)),
-            "roi_h_median": round(float(np.median(h_roi)), 1) if h_roi.size else 0.0,
-            "roi_s_median": round(float(np.median(s_roi)), 1) if s_roi.size else 0.0,
-            "roi_v_median": round(float(np.median(v_roi)), 1) if v_roi.size else 0.0,
-            "roi_v_inv_median": round(float(np.median(v_inv_roi)), 1) if v_inv_roi.size else 0.0,
-            "roi_sv_inv_median": round(float(np.median(sv_inv_roi)), 1) if sv_inv_roi.size else 0.0,
-            "roi_h_mean": round(float(np.mean(h_roi)), 1) if h_roi.size else 0.0,
-            "roi_s_mean": round(float(np.mean(s_roi)), 1) if s_roi.size else 0.0,
-            "roi_v_mean": round(float(np.mean(v_roi)), 1) if v_roi.size else 0.0,
+            "roi_h_median": round(float(np.median(h_roi[::4, ::4])), 1) if h_roi.size else 0.0,
+            "roi_s_median": round(float(np.median(s_roi[::4, ::4])), 1) if s_roi.size else 0.0,
+            "roi_v_median": round(float(np.median(v_roi[::4, ::4])), 1) if v_roi.size else 0.0,
+            "roi_v_inv_median": round(float(np.median(v_inv_roi[::4, ::4])), 1) if v_inv_roi.size else 0.0,
+            "roi_sv_inv_median": round(float(np.median(sv_inv_roi[::4, ::4])), 1) if sv_inv_roi.size else 0.0,
+            "roi_h_mean": round(float(np.mean(h_roi[::4, ::4])), 1) if h_roi.size else 0.0,
+            "roi_s_mean": round(float(np.mean(s_roi[::4, ::4])), 1) if s_roi.size else 0.0,
+            "roi_v_mean": round(float(np.mean(v_roi[::4, ::4])), 1) if v_roi.size else 0.0,
             "sock_h_mean": sock_h_mean,
             "sock_s_mean": sock_s_mean,
             "sock_v_mean": sock_v_mean,
@@ -2397,7 +2584,7 @@ class SockDetector:
 
         now = time.time()
         should_save = self.save_debug_image and (force_save or (now - self._last_disk_save_time >= 1.5))
-        if self.enable_web_stream or build_hsv_views or (should_save and self.debug_combined_path):
+        if build_hsv_views or (should_save and self.debug_combined_path):
             p_raw = frame.copy()
             cv2.putText(p_raw, "ACTUAL CAMERA", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
@@ -2488,6 +2675,227 @@ class SockDetector:
                     "angle": round(result.angle, 1),
                     "area": result.area,
                     "hsv_stats": hsv_stats,
+                },
+            )
+
+        return result
+
+    def detect_in_gripper(
+        self,
+        frame: np.ndarray,
+        force_save: bool = True,
+    ) -> DetectionResult:
+        """Check whether a dark sock is held between the two cyan gripper arms at the initial position.
+
+        Inspects the Gripper Jaw Verification Zone (lower-center region between the left and right
+        cyan gripper arms) while masking out the cyan fingers (including their dark M3 screw holes)
+        and requiring substantial overlap with the inner jaw gap core between the two fingers.
+        Objects lying on the floor ahead of the jaw tips (y < 0.63*h) or outside the jaws are ignored.
+        """
+        if frame is None or frame.size == 0:
+            return DetectionResult(found=False)
+
+        h, w = frame.shape[:2]
+        center_x = w / 2.0
+        center_y = h / 2.0
+
+        with self._hsv_lock:
+            contrast_cfg = self.contrast_threshold
+            v_max_cap = self.v_max
+            gh_min, gs_min, gv_min = self.gripper_hsv_lower
+            gh_max, gs_max, gv_max = self.gripper_hsv_upper
+
+        hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred_full = cv2.GaussianBlur(gray_full, (9, 9), 0)
+
+        # 1. Build cyan gripper exclusion mask (configured range U broad cyan range)
+        cyan_cfg = cv2.bitwise_and(
+            self._hue_in_range(hsv_full[:, :, 0], gh_min, gh_max),
+            cv2.bitwise_and(
+                cv2.inRange(hsv_full[:, :, 1], gs_min, gs_max),
+                cv2.inRange(hsv_full[:, :, 2], gv_min, gv_max),
+            ),
+        )
+        cyan_broad = cv2.inRange(hsv_full, np.array([72, 55, 45]), np.array([118, 255, 255]))
+        cyan_raw = cv2.bitwise_or(cyan_cfg, cyan_broad)
+        # Close M3 screw holes inside the cyan plastic fingers and dilate edges slightly
+        k_hole = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))
+        cyan_filled = cv2.morphologyEx(cyan_raw, cv2.MORPH_CLOSE, k_hole, iterations=1)
+        k_dil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        cyan_guard = cv2.dilate(cyan_filled, k_dil, iterations=1)
+
+        # 2. Estimate floor background brightness from non-cyan bright floor pixels
+        #    (immune to large held socks covering >50% of the upper/middle frame)
+        non_cyan_vals = blurred_full[cyan_guard == 0]
+        bright_floor_vals = non_cyan_vals[non_cyan_vals >= 90]
+        if bright_floor_vals.size >= 500:
+            floor_median = float(np.median(bright_floor_vals))
+        elif non_cyan_vals.size > 0:
+            floor_median = max(140.0, float(np.percentile(non_cyan_vals, 85)))
+        else:
+            floor_median = 150.0
+
+        # 3. Between-Gripper-Arms Verification Zone (strictly from jaw tips to bottom between arms)
+        y1, y2 = int(h * 0.63), int(h * 0.97)
+        x1, x2 = int(w * 0.30), int(w * 0.70)
+
+        # Inner jaw gap core strictly between the left and right cyan fingers
+        core_x1 = max(0, int(w * 0.38) - x1)
+        core_x2 = min(x2 - x1, int(w * 0.62) - x1)
+        core_y1 = max(0, int(h * 0.66) - y1)
+        core_y2 = min(y2 - y1, int(h * 0.95) - y1)
+
+        sub_blur = blurred_full[y1:y2, x1:x2]
+        sub_cyan = cyan_guard[y1:y2, x1:x2]
+        dark_diff = np.clip(floor_median - sub_blur.astype(np.float32), 0.0, 255.0)
+
+        eff_contrast = max(45.0, min(float(contrast_cfg) * 0.70, 80.0))
+        v_cap = min(max(int(v_max_cap), 65), int(round(floor_median * 0.45)))
+
+        jaw_mask = ((dark_diff >= eff_contrast) & (sub_blur <= v_cap) & (sub_cyan == 0)).astype(np.uint8) * 255
+        jaw_mask = cv2.morphologyEx(jaw_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        jaw_mask = cv2.morphologyEx(jaw_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+
+        contours, _ = cv2.findContours(jaw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best_cnt = None
+        best_area = 0.0
+        best_center = (0.0, 0.0)
+        best_bbox = (0, 0, 0, 0)
+        best_mean_gray = 0.0
+        best_mean_diff = 0.0
+
+        for cnt in contours:
+            area = float(cv2.contourArea(cnt))
+            if area < 500.0:
+                continue
+            c_mask = np.zeros_like(jaw_mask)
+            cv2.drawContours(c_mask, [cnt], -1, 255, -1)
+            core_overlap = int(np.count_nonzero(c_mask[core_y1:core_y2, core_x1:core_x2]))
+            if core_overlap < 250:
+                continue
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            p_mask = c_mask[by:by + bh, bx:bx + bw]
+            m_gray = float(cv2.mean(sub_blur[by:by + bh, bx:bx + bw], mask=p_mask)[0])
+            m_diff = float(cv2.mean(dark_diff[by:by + bh, bx:bx + bw], mask=p_mask)[0])
+            if m_gray <= 46.0 and m_diff >= eff_contrast:
+                if area > best_area:
+                    M = cv2.moments(cnt)
+                    if M["m00"] > 0:
+                        cx = float(M["m10"] / M["m00"]) + x1
+                        cy = float(M["m01"] / M["m00"]) + y1
+                    else:
+                        cx = float(bx + bw * 0.5 + x1)
+                        cy = float(by + bh * 0.5 + y1)
+                    best_area = area
+                    best_cnt = cnt
+                    best_center = (cx, cy)
+                    best_bbox = (bx + x1, by + y1, bw, bh)
+                    best_mean_gray = m_gray
+                    best_mean_diff = m_diff
+
+        mask_full = np.zeros((h, w), dtype=np.uint8)
+        mask_full[y1:y2, x1:x2] = jaw_mask
+        mask_bgr = cv2.cvtColor(mask_full, cv2.COLOR_GRAY2BGR)
+        cv2.rectangle(mask_bgr, (x1, y1), (x2, y2), (255, 200, 0), 1, cv2.LINE_AA)
+
+        annotated = frame.copy()
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 200, 0), 2, cv2.LINE_AA)
+        cv2.putText(
+            annotated,
+            "GRIPPER JAW CHECK ZONE",
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (255, 200, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+        if best_cnt is not None:
+            cx, cy = best_center
+            bx, by, bw, bh = best_bbox
+            error_x = (cx - center_x) / center_x
+            error_y = (cy - center_y) / center_y
+            cv2.rectangle(annotated, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
+            cv2.circle(annotated, (int(cx), int(cy)), 6, (0, 0, 255), -1)
+            cv2.rectangle(mask_bgr, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
+            cv2.circle(mask_bgr, (int(cx), int(cy)), 6, (0, 0, 255), -1)
+            label = f"SOCK IN GRIPPER: {int(best_area)}px [V:{best_mean_gray:.0f}, Diff:{best_mean_diff:.0f}]"
+            cv2.putText(annotated, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 0), 2)
+            result = DetectionResult(
+                found=True,
+                cx=cx,
+                cy=cy,
+                error_x=error_x,
+                error_y=error_y,
+                area=best_area,
+                bbox=best_bbox,
+                annotated_frame=annotated,
+                raw_frame=frame.copy(),
+                mask_frame=mask_bgr,
+                hsv_stats={
+                    "floor_median": round(floor_median, 1),
+                    "sock_v_mean": round(best_mean_gray, 1),
+                    "sock_dark_diff_mean": round(best_mean_diff, 1),
+                },
+            )
+        else:
+            cv2.putText(
+                annotated,
+                "NO SOCK BETWEEN GRIPPER ARMS",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 0, 255),
+                2,
+            )
+            result = DetectionResult(
+                found=False,
+                annotated_frame=annotated,
+                raw_frame=frame.copy(),
+                mask_frame=mask_bgr,
+                hsv_stats={"floor_median": round(floor_median, 1)},
+            )
+
+        rw, rh = 426, 320
+        p_raw = frame.copy()
+        cv2.putText(p_raw, "ACTUAL CAMERA", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+        p_mask = mask_bgr.copy()
+        cv2.putText(p_mask, "GRIPPER JAW MASK", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+        p_ann = annotated.copy()
+        cv2.putText(p_ann, "GRIPPER VERIFICATION", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+        combined = np.hstack([cv2.resize(p_raw, (rw, rh)), cv2.resize(p_mask, (rw, rh)), cv2.resize(p_ann, (rw, rh))])
+        result.combined_frame = combined
+
+        if self.save_debug_image and force_save:
+            self._last_disk_save_time = time.time()
+            try:
+                if self.debug_image_path:
+                    cv2.imwrite(self.debug_image_path, annotated)
+                if self.debug_raw_path:
+                    cv2.imwrite(self.debug_raw_path, frame)
+                if self.debug_mask_path:
+                    cv2.imwrite(self.debug_mask_path, mask_bgr)
+                if self.debug_combined_path:
+                    cv2.imwrite(self.debug_combined_path, combined)
+            except Exception as e:
+                logger.debug("Error saving gripper verification debug images: %s", e)
+
+        if self.enable_web_stream and VisionDebugServer._instance and VisionDebugServer._instance.started:
+            VisionDebugServer.update(
+                raw_frame=frame,
+                mask_frame=mask_bgr,
+                annotated_frame=annotated,
+                combined_frame=combined,
+                meta={
+                    "found": result.found,
+                    "cx": result.cx,
+                    "cy": result.cy,
+                    "error_x": result.error_x,
+                    "error_y": result.error_y,
+                    "area": result.area,
+                    "hsv_stats": result.hsv_stats,
                 },
             )
 
@@ -2801,68 +3209,98 @@ class VisionGraspPlanner:
         detector: Any,
         feedback_cb: Optional[Callable[[float], None]] = None,
     ) -> Tuple[bool, Optional[DetectionResult]]:
-        """Capture a fresh wrist-camera image after the gripper closes and lifts to verify
-        whether the black sock was picked up off the floor.
+        """Return the robot arm to its initial position (keeping gripper closed at 0%)
+        and capture a fresh wrist-camera image to check whether a sock is held between
+        the two cyan gripper arms.
 
-        Because the wrist camera looks at the floor in front of the cyan gripper jaws while a
-        grasped sock is tucked inside the closed jaws:
-        - If the black sock is STILL detected on the floor (`det_verify.found == True`), the
-          grasp failed (sock was unreachable or missed) -> returns `(False, det_verify)`.
-        - If the black sock is NO LONGER on the floor (`det_verify.found == False`), the sock
-          was successfully picked up off the floor -> returns `(True, det_verify)`.
+        - If a dark sock is detected between the gripper arms (`det_verify.found == True`),
+          the grasp succeeded -> returns `(True, det_verify)`.
+        - If NO sock is detected between the gripper arms (`det_verify.found == False`),
+          the grasp failed -> returns `(False, det_verify)` so the process terminates and
+          waits for the next input without going to the basket.
         """
         is_dry = bool(getattr(arm, "dry_run", False))
+
+        # 1. Return robot arm to the initial position while keeping gripper clamped (0.0%)
+        if arm is not None:
+            base_init = (
+                self.scan_poses.get("center", self.scan_pose)
+                if (self.scan_poses and isinstance(self.scan_poses, dict) and isinstance(self.scan_poses.get("center"), dict))
+                else self.scan_pose
+            )
+            verify_pose = dict(base_init)
+            verify_pose["gripper.pos"] = 0.0
+            return_t = 0.05 if is_dry else max(1.5, float(getattr(self, "scan_move_duration_s", 1.5)))
+            logger.info(
+                "[VERIFY] Returning robot arm to initial position (pan=%.1f°, lift=%.1f°, elbow=%.1f°, gripper=0.0%%) over %.1fs to check if sock is between gripper arms...",
+                float(verify_pose.get("shoulder_pan.pos", 0.0)),
+                float(verify_pose.get("shoulder_lift.pos", -84.6)),
+                float(verify_pose.get("elbow_flex.pos", 20.0)),
+                return_t,
+            )
+            arm.move_to_pose(verify_pose, duration_s=return_t, feedback_cb=feedback_cb)
+
         if camera is None or detector is None:
             cur_pose = arm.get_follower_pose() if arm is not None else {}
             measured_grip = float(cur_pose.get("gripper.pos", 25.0 if is_dry else 0.0))
             return self.verify_grasp(measured_grip), None
 
         if not is_dry:
-            time.sleep(0.30)
+            time.sleep(0.45)
         if feedback_cb is not None:
             feedback_cb(1.0)
 
         camera.ensure_healthy()
-        t_settled = time.time()
-        ok, v_frame = camera.capture_frame(max_staleness_s=0.15, min_timestamp=t_settled if not is_dry else None)
-        if not ok or v_frame is None:
-            logger.warning("[VERIFY CAMERA] Could not capture post-grasp verification frame; falling back to gripper position.")
-            cur_pose = arm.get_follower_pose() if arm is not None else {}
-            measured_grip = float(cur_pose.get("gripper.pos", 25.0 if is_dry else 0.0))
-            return self.verify_grasp(measured_grip), None
+        det_verify: Optional[DetectionResult] = None
+        max_attempts = 1 if is_dry else 2
+        for attempt in range(max_attempts):
+            t_settled = time.time()
+            ok, v_frame = camera.capture_frame(max_staleness_s=0.15, min_timestamp=t_settled if not is_dry else None)
+            if not ok or v_frame is None:
+                if attempt + 1 < max_attempts:
+                    time.sleep(0.20)
+                    continue
+                logger.warning("[VERIFY CAMERA] Could not capture post-grasp verification frame; falling back to gripper position.")
+                cur_pose = arm.get_follower_pose() if arm is not None else {}
+                measured_grip = float(cur_pose.get("gripper.pos", 25.0 if is_dry else 0.0))
+                return self.verify_grasp(measured_grip), None
 
-        det_verify = detector.detect(
-            v_frame,
-            force_save=True,
-            allow_border_touch=False,
-        )
+            if hasattr(detector, "detect_in_gripper"):
+                det_verify = detector.detect_in_gripper(v_frame, force_save=True)
+            else:
+                det_verify = detector.detect(v_frame, force_save=True, allow_border_touch=True)
 
-        if det_verify.found:
-            logger.warning(
-                "[VERIFY CAMERA] Black sock is STILL on the floor after closing gripper (Area=%.0fpx at (%.0f, %.0f))! "
-                "Grasp failed / sock unreachable.",
+            if det_verify.found:
+                break
+            if attempt + 1 < max_attempts:
+                time.sleep(0.20)
+
+        if det_verify is not None and det_verify.found:
+            logger.info(
+                "[VERIFY CAMERA] Sock confirmed between gripper arms at initial position (Area=%.0fpx at (%.0f, %.0f)) -> Proceeding to basket!",
                 det_verify.area, det_verify.cx, det_verify.cy,
             )
             VisionDebugServer.lock_detection(
                 annotated_frame=det_verify.annotated_frame,
-                label="GRASP FAILED (Sock Still on Floor)",
+                label="Grasp Verified (Sock Between Gripper Arms)",
                 area=det_verify.area,
                 cx=det_verify.cx,
                 cy=det_verify.cy,
             )
-            return False, det_verify
+            return True, det_verify
 
-        logger.info(
-            "[VERIFY CAMERA] Floor is clear (black sock is no longer on the floor) -> Sock successfully grasped!"
+        logger.warning(
+            "[VERIFY CAMERA] NO sock detected between gripper arms at initial position! "
+            "Killing pick process and waiting for next input."
         )
         VisionDebugServer.lock_detection(
             annotated_frame=det_verify.annotated_frame,
-            label="Grasp Verified (Sock Picked Up)",
+            label="GRASP FAILED (No Sock Between Gripper Arms)",
             area=0.0,
             cx=0.0,
             cy=0.0,
         )
-        return True, det_verify
+        return False, det_verify
 
     def execute_scan_sweep(
         self,
@@ -3288,12 +3726,17 @@ def calibrate_hsv(
 
     try:
         while True:
-            ok, frame = camera.capture_frame(max_staleness_s=0.35)
-            if ok and frame is not None:
-                res = detector.detect(frame, build_hsv_views=(duration_s is not None))
+            res = None
+            if duration_s is not None:
+                ok, frame = camera.capture_frame(max_staleness_s=0.35)
+                if ok and frame is not None:
+                    res = detector.detect(frame, build_hsv_views=True)
+            else:
+                res = getattr(camera, "_last_detection_result", None)
+
+            if res is not None:
                 hs = res.hsv_stats
                 last_stats = hs
-                # Auto-capture snapshot when a sock transitions to detected or has strong lock in debug mode
                 if res.found and (not prev_found or VisionDebugServer._instance._latest_locked_detection is None):
                     VisionDebugServer.lock_detection(
                         annotated_frame=res.annotated_frame,
@@ -3301,6 +3744,7 @@ def calibrate_hsv(
                         area=res.area,
                         cx=res.cx,
                         cy=res.cy,
+                        save_to_disk=False,
                     )
                 prev_found = res.found
 
@@ -3323,7 +3767,7 @@ def calibrate_hsv(
             if duration_s is not None and (time.time() - t_start) >= duration_s:
                 print()
                 break
-            time.sleep(0.04)
+            time.sleep(0.10 if duration_s is None else 0.04)
     except KeyboardInterrupt:
         print("\n\n[VISION DEBUG] Stopped by user.")
         if sys.stdin.isatty() and duration_s is None:

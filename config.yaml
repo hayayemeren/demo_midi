@@ -103,36 +103,36 @@ case4:
 
   # Observation / Scan Pose: Wrist camera looks down at floor in front of base
   scan_pose:
-    shoulder_pan.pos: -1.5
-    shoulder_lift.pos: -84.6
-    elbow_flex.pos: 20.0
+    shoulder_pan.pos: -6.8
+    shoulder_lift.pos: -60.7
+    elbow_flex.pos: 19.9
     wrist_flex.pos: 96.0
-    wrist_roll.pos: 3.1
-    gripper.pos: 5.1
+    wrist_roll.pos: -0.1
+    gripper.pos: 5.4
 
   # 3-Point Calibrated Floor Scan Poses (Middle, Left, Right)
   scan_poses:
     center:
-      shoulder_pan.pos: -1.5
-      shoulder_lift.pos: -84.6
-      elbow_flex.pos: 20.0
+      shoulder_pan.pos: -6.8
+      shoulder_lift.pos: -60.7
+      elbow_flex.pos: 19.9
       wrist_flex.pos: 96.0
-      wrist_roll.pos: 3.1
-      gripper.pos: 5.1
+      wrist_roll.pos: -0.1
+      gripper.pos: 5.4
     left:
-      shoulder_pan.pos: -73.1
-      shoulder_lift.pos: -84.6
-      elbow_flex.pos: 20.0
+      shoulder_pan.pos: -71.7
+      shoulder_lift.pos: -77.9
+      elbow_flex.pos: 30.6
       wrist_flex.pos: 96.0
-      wrist_roll.pos: 3.1
-      gripper.pos: 5.1
+      wrist_roll.pos: -0.1
+      gripper.pos: 5.3
     right:
-      shoulder_pan.pos: 66.3
-      shoulder_lift.pos: -84.6
-      elbow_flex.pos: 20.0
+      shoulder_pan.pos: 68.9
+      shoulder_lift.pos: -77.9
+      elbow_flex.pos: 30.6
       wrist_flex.pos: 96.0
-      wrist_roll.pos: 3.1
-      gripper.pos: 5.1
+      wrist_roll.pos: -0.1
+      gripper.pos: 5.3
 
   # Multi-angle floor search sweep (shoulder_pan angles in degrees fallback)
   scan_sweep_angles: [0.0, -28.0, 28.0]
@@ -185,9 +185,9 @@ case4:
     mode: "auto"                # "auto" / "darkness" (Signed Floor-Relative Darkness + Solidity + Distance-Transform)
     min_area: 800.0             # minimum contour area (pixels) - rejects small floor noise
     max_area: 80000.0           # maximum contour area (pixels)
-    contrast_threshold: 35.0    # minimum signed darkness (Floor_Median - Gray >= threshold)
+    contrast_threshold: 110.0    # minimum signed darkness (Floor_Median - Gray >= threshold)
     v_max: 75                   # maximum sock brightness cap (0-255)
-    max_floor_ratio: 0.65       # adaptive brightness cap ratio relative to floor median (0.20-0.95)
+    max_floor_ratio: 0.60       # adaptive brightness cap ratio relative to floor median (0.20-0.95)
     min_solidity: 0.45          # minimum contour solidity (Area / ConvexHullArea) to reject thin shadows
     hsv_lower: [0, 0, 0]        # Legacy HSV lower bound [H_min, S_min, V_min]
     hsv_upper: [179, 255, 75]   # Legacy HSV upper bound [H_max, S_max, V_max]

@@ -946,7 +946,7 @@ def test_real_floor_image_and_kinematic_descent():
     if os.path.exists("/tmp/pi_last_raw.jpg"):
         img_raw = cv2.imread("/tmp/pi_last_raw.jpg")
         det_raw = detector.detect(
-            img_raw, allow_border_touch=True, max_area_override=220000.0
+            img_raw, allow_border_touch=True, max_area_override=220000.0, contrast_override=35.0
         )
         assert det_raw.found is True, "Must detect actual black sock beside gripper in /tmp/pi_last_raw.jpg"
         assert det_raw.cy >= 250.0, (
@@ -1326,9 +1326,11 @@ def test_signed_floor_darkness_glare_solidity_and_distance_transform():
 
 def test_post_clamp_camera_verification_aborts_basket_on_missed_or_unreachable_sock():
     """Verify that after closing the gripper and lifting:
-    - If the black sock is STILL visible on the floor (missed or unreachable), the robot aborts the basket dump
-      and returns to normal stow position waiting for a command.
-    - If the black sock is NO LONGER on the floor (picked up into the jaws), the robot proceeds to the basket."""
+    1. The robot arm returns to its initial position (with gripper closed at 0%).
+    2. It checks whether a dark sock is held between the two cyan gripper arms (`detect_in_gripper`).
+    3. If the gripper is empty (or the sock is still lying on the floor ahead of the jaws), it kills/aborts
+       the pick process (skipping basket deposit), returns to stow pose, and waits for the next input.
+    4. If a sock IS detected between the gripper arms, it proceeds to deposit into the basket."""
     import cv2
     import numpy as np
     from src.vision_grasp import VisionDebugServer
@@ -1341,6 +1343,14 @@ def test_post_clamp_camera_verification_aborts_basket_on_missed_or_unreachable_s
         "gamepad": {"switch_button": "Y"},
         "case4": {
             "camera": {"device": "/dev/null"},
+            "scan_pose": {
+                "shoulder_pan.pos": -1.5,
+                "shoulder_lift.pos": -84.6,
+                "elbow_flex.pos": 20.0,
+                "wrist_flex.pos": 96.0,
+                "wrist_roll.pos": 3.1,
+                "gripper.pos": 5.1,
+            },
             "detection": {"mode": "auto", "save_debug_image": False},
         },
     }
@@ -1365,16 +1375,26 @@ def test_post_clamp_camera_verification_aborts_basket_on_missed_or_unreachable_s
     sm._handle_autonomous_grasp(GamepadState())
     assert sm.state == DemoState.AUTONOMOUS_PICK_VERIFY
 
-    # 2. Simulate post-clamp camera view where grasp MISSED / sock was UNREACHABLE:
-    # The black sock is STILL lying on the floor in front of the gripper!
-    sock_still_on_floor_frame = np.full((480, 640, 3), 170, dtype=np.uint8)
+    # 2a. Simulate post-clamp camera view where gripper missed and is completely EMPTY (bare floor + cyan jaws):
+    empty_gripper_frame = np.full((480, 640, 3), 170, dtype=np.uint8)
+    cv2.fillPoly(empty_gripper_frame, [np.array([[180, 480], [240, 340], [280, 360], [220, 480]])], (180, 150, 0))
+    cv2.fillPoly(empty_gripper_frame, [np.array([[460, 480], [400, 340], [360, 360], [420, 480]])], (180, 150, 0))
+    assert sm.detector.detect_in_gripper(empty_gripper_frame, force_save=False).found is False
+
+    # 2b. Simulate post-clamp camera view where sock is STILL lying on the floor ahead of the jaws (NOT between jaws):
+    sock_still_on_floor_frame = empty_gripper_frame.copy()
     cv2.ellipse(sock_still_on_floor_frame, (270, 241), (45, 25), 0, 0, 360, (20, 20, 20), -1)
+    assert sm.detector.detect_in_gripper(sock_still_on_floor_frame, force_save=False).found is False
     sm.camera.capture_frame = lambda max_staleness_s=0.25, min_timestamp=None: (True, sock_still_on_floor_frame.copy())
 
-    # 3. Verify step sees the black sock is STILL on the floor -> skips AUTONOMOUS_BASKET_DUMP and goes to PARKING
+    # 3. Verify step returns arm to initial position (gripper=0%) and sees NO sock between gripper arms ->
+    #    skips AUTONOMOUS_BASKET_DUMP and goes to PARKING
     sm._handle_autonomous_verify(GamepadState())
+    assert abs(arm.sim_follower_pose["shoulder_pan.pos"] - (-1.5)) < 1e-2, "Arm must return to initial position pan"
+    assert abs(arm.sim_follower_pose["shoulder_lift.pos"] - (-84.6)) < 1e-2, "Arm must return to initial position lift"
+    assert abs(arm.sim_follower_pose["gripper.pos"] - 0.0) < 1e-2, "Gripper must remain closed (0%) during verification"
     assert sm.state == DemoState.PARKING, (
-        f"Expected PARKING (abort basket when sock is still on the floor), got {sm.state}"
+        f"Expected PARKING (kill pick when no sock is between gripper arms), got {sm.state}"
     )
     srv = VisionDebugServer.get_instance()
     assert "FAIL" in srv._latest_locked_meta.get("label", "").upper()
@@ -1387,7 +1407,33 @@ def test_post_clamp_camera_verification_aborts_basket_on_missed_or_unreachable_s
     for k, v in arm.stow_pose.items():
         assert abs(arm.sim_follower_pose[k] - v) < 1e-3, f"Joint {k} must return to normal stow position"
 
-    # 5. Verify Web Dashboard 'Run Full Pick & Deposit' button ({action: 'pick'}) and Live Stage Tracker
+    # 5. Verify large draped sock covering >65% of upper/middle frame + between jaws is detected (not poisoned by floor_median)
+    large_draped_sock_frame = empty_gripper_frame.copy()
+    cv2.rectangle(large_draped_sock_frame, (150, 0), (620, 340), (12, 12, 12), -1)
+    cv2.rectangle(large_draped_sock_frame, (255, 300), (355, 479), (12, 12, 12), -1)
+    cv2.fillPoly(large_draped_sock_frame, [np.array([[180, 480], [240, 340], [280, 360], [220, 480]])], (180, 150, 0))
+    cv2.fillPoly(large_draped_sock_frame, [np.array([[460, 480], [400, 340], [360, 360], [420, 480]])], (180, 150, 0))
+    res_draped = sm.detector.detect_in_gripper(large_draped_sock_frame, force_save=False)
+    assert res_draped.found is True, "Large held sock covering upper frame must be detected between gripper arms"
+    assert res_draped.hsv_stats.get("floor_median", 0) >= 140.0
+
+    # 5b. Verify real captured images (empty gripper vs sock held between gripper arms) if present on disk
+    for empty_path in ("sock_raw.jpg", "/tmp/pi_debug/sock_raw.jpg"):
+        if os.path.exists(empty_path):
+            img_e = cv2.imread(empty_path)
+            if img_e is not None:
+                res_e = sm.detector.detect_in_gripper(img_e, force_save=False)
+                assert res_e.found is False, f"Expected NO sock between gripper arms in {empty_path}, got area={res_e.area}"
+
+    for held_path in ("/tmp/live_pi_cam.jpg", "/tmp/now_check.jpg", "/tmp/pi_live_bug/tmp/sock_raw.jpg"):
+        if os.path.exists(held_path):
+            img_h = cv2.imread(held_path)
+            if img_h is not None:
+                res_h = sm.detector.detect_in_gripper(img_h, force_save=False)
+                assert res_h.found is True, f"Expected sock detected between gripper arms in {held_path}"
+                assert res_h.area >= 3000.0
+
+    # 6. Verify Web Dashboard 'Run Full Pick & Deposit' button ({action: 'pick'}) and Live Stage Tracker
     srv.arm = arm
     srv.camera = WristCamera(dry_run=True)
     srv.camera.connect()

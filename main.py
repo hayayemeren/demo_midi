@@ -795,7 +795,7 @@ def test_pick(config_path: str, dry_run: bool = False):
         if dry_run:
             measured_grip = 25.0
 
-        print("\n[TEST] 4b. Capturing post-clamp camera image to check if black sock was picked up off the floor...")
+        print("\n[TEST] 4b. Returning arm to initial position and checking if sock is held between gripper arms...")
         is_caught, det_verify = planner.verify_grasp_with_camera(
             arm=arm,
             camera=camera,
@@ -804,7 +804,8 @@ def test_pick(config_path: str, dry_run: bool = False):
         )
 
         if is_caught:
-            print(f"[SUCCESS] Floor is clear — black sock was picked up off the floor! (Grip: {measured_grip:.1f}%)")
+            area_info = f"{det_verify.area:.0f}px, " if (det_verify is not None and det_verify.found) else ""
+            print(f"[SUCCESS] Sock confirmed between gripper arms at initial position! ({area_info}Grip: {measured_grip:.1f}%)")
             print("\n[TEST] 5. Moving via compact overhead clearance to rear basket with position-gated release...")
             deposited = planner.execute_basket_deposit(arm=arm, feedback_cb=lambda _: base.hold_lock())
             if deposited:
@@ -812,10 +813,9 @@ def test_pick(config_path: str, dry_run: bool = False):
             else:
                 print("\n>>> [ABORTED] Arm did not reach rear basket; gripper kept closed to protect sock! <<<\n")
         else:
-            area_info = f" (Sock still on floor: {det_verify.area:.0f}px)" if (det_verify is not None and det_verify.found) else ""
             print(
-                f"\n>>> [GRASP FAILED] Black sock is STILL on the floor after closing gripper{area_info} (sock unreachable or missed)! <<<\n"
-                f"Skipping basket deposit -> Returning to normal stow position and waiting for command.\n"
+                "\n>>> [GRASP FAILED] No sock detected between gripper arms at initial position! <<<\n"
+                "Killing pick process (skipping basket deposit) -> Returning to initial stow position and waiting for next input.\n"
             )
 
         print(f"[TEST] Returning to stow pose over {stow_t:.1f}s...")
